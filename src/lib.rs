@@ -37,6 +37,7 @@
 //! ```
 
 pub mod core;
+pub mod discovery;
 pub mod encryption;
 pub mod gateway;
 pub mod proxy;
@@ -50,6 +51,7 @@ pub use core::types::{
     CapabilityExclusion, ClientSession, EncryptionMode, JsonRpcError, JsonRpcErrorResponse,
     JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, ServerInfo,
 };
+pub use discovery::ServerAnnouncement;
 pub use relay::RelayPool;
 pub use transport::client::{NostrClientTransport, NostrClientTransportConfig};
 pub use transport::server::{IncomingRequest, NostrServerTransport, NostrServerTransportConfig};
