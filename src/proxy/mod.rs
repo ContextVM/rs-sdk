@@ -69,3 +69,42 @@ impl NostrMCPProxy {
         self.is_running
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::types::*;
+    use crate::transport::client::NostrClientTransportConfig;
+    use std::time::Duration;
+
+    #[test]
+    fn test_proxy_config_construction() {
+        let keys = nostr_sdk::Keys::generate();
+        let server_pubkey = keys.public_key().to_hex();
+
+        let nostr_config = NostrClientTransportConfig {
+            relay_urls: vec!["wss://relay.example.com".to_string()],
+            server_pubkey: server_pubkey.clone(),
+            encryption_mode: EncryptionMode::Required,
+            is_stateless: true,
+            timeout: Duration::from_secs(60),
+        };
+
+        let config = ProxyConfig { nostr_config };
+
+        assert_eq!(config.nostr_config.relay_urls, vec!["wss://relay.example.com"]);
+        assert_eq!(config.nostr_config.server_pubkey, server_pubkey);
+        assert_eq!(config.nostr_config.encryption_mode, EncryptionMode::Required);
+        assert!(config.nostr_config.is_stateless);
+        assert_eq!(config.nostr_config.timeout, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn test_proxy_config_with_defaults() {
+        let config = ProxyConfig {
+            nostr_config: NostrClientTransportConfig::default(),
+        };
+        assert!(!config.nostr_config.is_stateless);
+        assert_eq!(config.nostr_config.encryption_mode, EncryptionMode::Optional);
+    }
+}

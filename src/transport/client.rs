@@ -226,3 +226,77 @@ impl NostrClientTransport {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::types::*;
+
+    #[test]
+    fn test_config_defaults() {
+        let config = NostrClientTransportConfig::default();
+        assert_eq!(config.relay_urls, vec!["wss://relay.damus.io".to_string()]);
+        assert!(config.server_pubkey.is_empty());
+        assert_eq!(config.encryption_mode, EncryptionMode::Optional);
+        assert!(!config.is_stateless);
+        assert_eq!(config.timeout, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn test_stateless_config() {
+        let config = NostrClientTransportConfig {
+            is_stateless: true,
+            ..Default::default()
+        };
+        assert!(config.is_stateless);
+    }
+
+    #[test]
+    fn test_stateless_emulated_initialize_response_shape() {
+        // Verify the emulated response has the expected structure
+        let request_id = serde_json::json!(1);
+        let response = JsonRpcMessage::Response(JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: request_id.clone(),
+            result: serde_json::json!({
+                "protocolVersion": "2025-03-26",
+                "serverInfo": {
+                    "name": "Emulated-Stateless-Server",
+                    "version": "1.0.0"
+                },
+                "capabilities": {
+                    "tools": { "listChanged": true },
+                    "prompts": { "listChanged": true },
+                    "resources": { "subscribe": true, "listChanged": true }
+                }
+            }),
+        });
+        assert!(response.is_response());
+        assert_eq!(response.id(), Some(&serde_json::json!(1)));
+
+        if let JsonRpcMessage::Response(r) = &response {
+            assert!(r.result.get("capabilities").is_some());
+            assert!(r.result.get("serverInfo").is_some());
+            let server_info = r.result.get("serverInfo").unwrap();
+            assert_eq!(server_info.get("name").unwrap().as_str().unwrap(), "Emulated-Stateless-Server");
+        }
+    }
+
+    #[test]
+    fn test_stateless_mode_initialize_request_detection() {
+        let init_req = JsonRpcMessage::Request(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: serde_json::json!(1),
+            method: "initialize".to_string(),
+            params: None,
+        });
+        assert_eq!(init_req.method(), Some("initialize"));
+
+        let init_notif = JsonRpcMessage::Notification(JsonRpcNotification {
+            jsonrpc: "2.0".to_string(),
+            method: "notifications/initialized".to_string(),
+            params: None,
+        });
+        assert_eq!(init_notif.method(), Some("notifications/initialized"));
+    }
+}

@@ -581,3 +581,156 @@ impl NostrServerTransport {
         cleaned
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::thread;
+
+    // ── Session management ──────────────────────────────────────
+
+    #[test]
+    fn test_client_session_creation() {
+        let session = ClientSession::new(true);
+        assert!(!session.is_initialized);
+        assert!(session.is_encrypted);
+        assert!(session.pending_requests.is_empty());
+        assert!(session.event_to_progress_token.is_empty());
+    }
+
+    #[test]
+    fn test_client_session_update_activity() {
+        let mut session = ClientSession::new(false);
+        let first = session.last_activity;
+        thread::sleep(Duration::from_millis(10));
+        session.update_activity();
+        assert!(session.last_activity > first);
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_sessions_removes_expired() {
+        let sessions = Arc::new(RwLock::new(HashMap::new()));
+        let event_to_client = Arc::new(RwLock::new(HashMap::new()));
+
+        // Insert a session with an old activity time
+        let mut session = ClientSession::new(false);
+        session.pending_requests.insert("evt1".to_string(), serde_json::json!(1));
+        sessions.write().await.insert("pubkey1".to_string(), session);
+        event_to_client.write().await.insert("evt1".to_string(), "pubkey1".to_string());
+
+        // With a long timeout, nothing should be cleaned
+        let cleaned = NostrServerTransport::cleanup_sessions(
+            &sessions, &event_to_client, Duration::from_secs(300),
+        ).await;
+        assert_eq!(cleaned, 0);
+        assert_eq!(sessions.read().await.len(), 1);
+
+        // With zero timeout, it should be cleaned
+        thread::sleep(Duration::from_millis(5));
+        let cleaned = NostrServerTransport::cleanup_sessions(
+            &sessions, &event_to_client, Duration::from_millis(1),
+        ).await;
+        assert_eq!(cleaned, 1);
+        assert!(sessions.read().await.is_empty());
+        assert!(event_to_client.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_preserves_active_sessions() {
+        let sessions = Arc::new(RwLock::new(HashMap::new()));
+        let event_to_client = Arc::new(RwLock::new(HashMap::new()));
+
+        let session = ClientSession::new(false);
+        sessions.write().await.insert("active".to_string(), session);
+
+        let cleaned = NostrServerTransport::cleanup_sessions(
+            &sessions, &event_to_client, Duration::from_secs(300),
+        ).await;
+        assert_eq!(cleaned, 0);
+        assert_eq!(sessions.read().await.len(), 1);
+    }
+
+    // ── Request ID correlation ──────────────────────────────────
+
+    #[test]
+    fn test_pending_request_tracking() {
+        let mut session = ClientSession::new(false);
+        session.pending_requests.insert("event_abc".to_string(), serde_json::json!(42));
+        assert_eq!(session.pending_requests.get("event_abc"), Some(&serde_json::json!(42)));
+    }
+
+    #[test]
+    fn test_progress_token_tracking() {
+        let mut session = ClientSession::new(false);
+        session.event_to_progress_token.insert("evt1".to_string(), "token1".to_string());
+        session.pending_requests.insert("token1".to_string(), serde_json::json!("evt1"));
+        assert_eq!(session.event_to_progress_token.get("evt1"), Some(&"token1".to_string()));
+    }
+
+    // ── Authorization (is_capability_excluded) ──────────────────
+
+    #[test]
+    fn test_initialize_always_excluded() {
+        assert!(NostrServerTransport::is_capability_excluded(&[], "initialize", None));
+        assert!(NostrServerTransport::is_capability_excluded(&[], "notifications/initialized", None));
+    }
+
+    #[test]
+    fn test_method_excluded_without_name() {
+        let exclusions = vec![CapabilityExclusion {
+            method: "tools/list".to_string(),
+            name: None,
+        }];
+        assert!(NostrServerTransport::is_capability_excluded(&exclusions, "tools/list", None));
+        assert!(NostrServerTransport::is_capability_excluded(&exclusions, "tools/list", Some("anything")));
+    }
+
+    #[test]
+    fn test_method_excluded_with_name() {
+        let exclusions = vec![CapabilityExclusion {
+            method: "tools/call".to_string(),
+            name: Some("get_weather".to_string()),
+        }];
+        assert!(NostrServerTransport::is_capability_excluded(&exclusions, "tools/call", Some("get_weather")));
+        assert!(!NostrServerTransport::is_capability_excluded(&exclusions, "tools/call", Some("other_tool")));
+        assert!(!NostrServerTransport::is_capability_excluded(&exclusions, "tools/call", None));
+    }
+
+    #[test]
+    fn test_non_excluded_method() {
+        let exclusions = vec![CapabilityExclusion {
+            method: "tools/list".to_string(),
+            name: None,
+        }];
+        assert!(!NostrServerTransport::is_capability_excluded(&exclusions, "tools/call", None));
+        assert!(!NostrServerTransport::is_capability_excluded(&exclusions, "resources/list", None));
+    }
+
+    #[test]
+    fn test_empty_exclusions_non_init_method() {
+        assert!(!NostrServerTransport::is_capability_excluded(&[], "tools/list", None));
+        assert!(!NostrServerTransport::is_capability_excluded(&[], "tools/call", Some("x")));
+    }
+
+    // ── Encryption mode enforcement ─────────────────────────────
+
+    #[test]
+    fn test_encryption_mode_default() {
+        let config = NostrServerTransportConfig::default();
+        assert_eq!(config.encryption_mode, EncryptionMode::Optional);
+    }
+
+    // ── Config defaults ─────────────────────────────────────────
+
+    #[test]
+    fn test_config_defaults() {
+        let config = NostrServerTransportConfig::default();
+        assert_eq!(config.relay_urls, vec!["wss://relay.damus.io".to_string()]);
+        assert!(!config.is_public_server);
+        assert!(config.allowed_public_keys.is_empty());
+        assert!(config.excluded_capabilities.is_empty());
+        assert_eq!(config.cleanup_interval, Duration::from_secs(60));
+        assert_eq!(config.session_timeout, Duration::from_secs(300));
+        assert!(config.server_info.is_none());
+    }
+}

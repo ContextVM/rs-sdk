@@ -1,7 +1,7 @@
 //! ContextVM protocol constants
 //!
 //! Event kinds and tag names matching the ContextVM specification.
-//! See: https://contextvm.org
+//! See: <https://contextvm.org>
 
 /// ContextVM messages (ephemeral events, kind 25910)
 pub const CTXVM_MESSAGES_KIND: u16 = 25910;

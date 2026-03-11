@@ -152,3 +152,81 @@ async fn fetch_list(
         .cloned()
         .unwrap_or_default())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::types::ServerInfo;
+
+    #[test]
+    fn test_server_info_serialization() {
+        let info = ServerInfo {
+            name: Some("Test Server".to_string()),
+            version: Some("1.0.0".to_string()),
+            about: Some("A test MCP server".to_string()),
+            website: Some("https://example.com".to_string()),
+            picture: Some("https://example.com/pic.png".to_string()),
+        };
+
+        let json = serde_json::to_string(&info).unwrap();
+        let parsed: ServerInfo = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.name, Some("Test Server".to_string()));
+        assert_eq!(parsed.version, Some("1.0.0".to_string()));
+        assert_eq!(parsed.about, Some("A test MCP server".to_string()));
+        assert_eq!(parsed.website, Some("https://example.com".to_string()));
+        assert_eq!(parsed.picture, Some("https://example.com/pic.png".to_string()));
+    }
+
+    #[test]
+    fn test_server_info_default() {
+        let info = ServerInfo::default();
+        assert!(info.name.is_none());
+        assert!(info.version.is_none());
+        assert!(info.about.is_none());
+        assert!(info.website.is_none());
+        assert!(info.picture.is_none());
+    }
+
+    #[test]
+    fn test_server_info_partial_serialization() {
+        let info = ServerInfo {
+            name: Some("Minimal".to_string()),
+            ..Default::default()
+        };
+
+        let json = serde_json::to_string(&info).unwrap();
+        // Optional fields should be skipped
+        assert!(!json.contains("version"));
+        assert!(!json.contains("about"));
+        assert!(json.contains("Minimal"));
+    }
+
+    #[test]
+    fn test_server_info_deserialization_from_empty() {
+        let info: ServerInfo = serde_json::from_str("{}").unwrap();
+        assert!(info.name.is_none());
+    }
+
+    #[test]
+    fn test_server_announcement_struct() {
+        let keys = nostr_sdk::Keys::generate();
+        let pubkey = keys.public_key();
+
+        let announcement = ServerAnnouncement {
+            pubkey: pubkey.to_hex(),
+            pubkey_parsed: pubkey,
+            server_info: ServerInfo {
+                name: Some("Test".to_string()),
+                ..Default::default()
+            },
+            event_id: EventId::from_hex(
+                "0000000000000000000000000000000000000000000000000000000000000001",
+            ).unwrap(),
+            created_at: Timestamp::now(),
+        };
+
+        assert_eq!(announcement.pubkey, pubkey.to_hex());
+        assert_eq!(announcement.server_info.name, Some("Test".to_string()));
+    }
+}

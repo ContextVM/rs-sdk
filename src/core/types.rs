@@ -7,14 +7,17 @@ use std::time::Instant;
 // ── Encryption mode ─────────────────────────────────────────────────
 
 /// Encryption mode for transport communication.
+///
+/// Controls whether MCP messages are sent as plaintext kind 25910 events
+/// or wrapped in NIP-59 gift wraps (kind 1059) for end-to-end encryption.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum EncryptionMode {
-    /// Encrypt messages if the incoming message was encrypted.
+    /// Encrypt responses only when the incoming request was encrypted (mirror mode).
     Optional,
-    /// Enforce encryption for all messages.
+    /// Enforce encryption for all messages; reject plaintext.
     Required,
-    /// Disable encryption entirely.
+    /// Disable encryption entirely; all messages are plaintext kind 25910.
     Disabled,
 }
 
@@ -27,16 +30,24 @@ impl Default for EncryptionMode {
 // ── Server info ─────────────────────────────────────────────────────
 
 /// Server information for announcements (kind 11316).
+///
+/// Published as the content of a replaceable Nostr event so that clients
+/// can discover the server's identity and metadata.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ServerInfo {
+    /// Human-readable server name.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Server software version string.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    /// URL to the server's avatar or logo image.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub picture: Option<String>,
+    /// Server's website URL.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub website: Option<String>,
+    /// Short description of the server's purpose.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub about: Option<String>,
 }
@@ -59,6 +70,7 @@ pub struct ClientSession {
 }
 
 impl ClientSession {
+    /// Create a new client session, recording whether the initial message was encrypted.
     pub fn new(is_encrypted: bool) -> Self {
         Self {
             is_initialized: false,
@@ -69,6 +81,7 @@ impl ClientSession {
         }
     }
 
+    /// Touch the session, updating [`last_activity`](Self::last_activity) to now.
     pub fn update_activity(&mut self) {
         self.last_activity = Instant::now();
     }
@@ -80,55 +93,83 @@ impl ClientSession {
 // no official Rust MCP SDK. These are wire-compatible with the MCP spec.
 
 /// A JSON-RPC 2.0 message (request, response, notification, or error).
+///
+/// This is the primary message type exchanged between MCP clients and servers.
+/// Deserialized using `#[serde(untagged)]` to match any of the four variants.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum JsonRpcMessage {
+    /// A request expecting a response (has `id` and `method`).
     Request(JsonRpcRequest),
+    /// A successful response (has `id` and `result`).
     Response(JsonRpcResponse),
+    /// An error response (has `id` and `error`).
     ErrorResponse(JsonRpcErrorResponse),
+    /// A notification (has `method`, no `id`, no response expected).
     Notification(JsonRpcNotification),
 }
 
 /// A JSON-RPC 2.0 request.
+///
+/// Contains a method name and an optional params object. The `id` field
+/// is used to correlate the response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcRequest {
+    /// Must be `"2.0"`.
     pub jsonrpc: String,
+    /// Request identifier for response correlation.
     pub id: serde_json::Value,
+    /// The RPC method name (e.g., `"tools/list"`, `"tools/call"`).
     pub method: String,
+    /// Optional method parameters.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<serde_json::Value>,
 }
 
-/// A JSON-RPC 2.0 response (success).
+/// A JSON-RPC 2.0 successful response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcResponse {
+    /// Must be `"2.0"`.
     pub jsonrpc: String,
+    /// The request ID this response corresponds to.
     pub id: serde_json::Value,
+    /// The result payload.
     pub result: serde_json::Value,
 }
 
 /// A JSON-RPC 2.0 error response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcErrorResponse {
+    /// Must be `"2.0"`.
     pub jsonrpc: String,
+    /// The request ID this error corresponds to.
     pub id: serde_json::Value,
+    /// The error object describing what went wrong.
     pub error: JsonRpcError,
 }
 
 /// A JSON-RPC 2.0 error object.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcError {
+    /// Numeric error code (e.g., `-32600` for invalid request).
     pub code: i64,
+    /// Human-readable error message.
     pub message: String,
+    /// Optional additional error data.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<serde_json::Value>,
 }
 
-/// A JSON-RPC 2.0 notification (no id, no response expected).
+/// A JSON-RPC 2.0 notification (no `id`, no response expected).
+///
+/// Used for one-way messages like `notifications/initialized`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcNotification {
+    /// Must be `"2.0"`.
     pub jsonrpc: String,
+    /// The notification method name.
     pub method: String,
+    /// Optional notification parameters.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<serde_json::Value>,
 }
