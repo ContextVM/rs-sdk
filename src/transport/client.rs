@@ -182,10 +182,26 @@ impl NostrClientTransport {
                 // Handle gift-wrapped events
                 let (actual_event_content, actual_pubkey, e_tag) =
                     if event.kind == Kind::Custom(GIFT_WRAP_KIND) {
-                        match encryption::decrypt_gift_wrap(&client, &event).await {
-                            Ok(rumor) => {
-                                let e_tag = serializers::get_tag_value(&rumor.tags, "e");
-                                (rumor.content, rumor.pubkey, e_tag)
+                        // Single-layer NIP-44 decrypt (matches JS/TS SDK)
+                        let signer = match client.signer().await {
+                            Ok(s) => s,
+                            Err(e) => {
+                                tracing::error!("Failed to get signer: {e}");
+                                continue;
+                            }
+                        };
+                        match encryption::decrypt_gift_wrap_single_layer(&signer, &event).await {
+                            Ok(decrypted_json) => {
+                                match serde_json::from_str::<Event>(&decrypted_json) {
+                                    Ok(inner) => {
+                                        let e_tag = serializers::get_tag_value(&inner.tags, "e");
+                                        (inner.content, inner.pubkey, e_tag)
+                                    }
+                                    Err(e) => {
+                                        tracing::error!("Failed to parse inner event: {e}");
+                                        continue;
+                                    }
+                                }
                             }
                             Err(e) => {
                                 tracing::error!("Failed to decrypt gift wrap: {e}");

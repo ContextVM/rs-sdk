@@ -3,6 +3,7 @@
 //! Provides NIP-44 encryption/decryption and NIP-59 gift wrapping.
 //! The actual gift wrapping is done via nostr-sdk's Client for full NIP-59 compliance.
 
+use crate::core::constants::GIFT_WRAP_KIND;
 use crate::core::error::{Error, Result};
 use nostr_sdk::prelude::*;
 
@@ -36,9 +37,57 @@ where
         .map_err(|e| Error::Decryption(e.to_string()))
 }
 
-/// Decrypt a NIP-59 gift-wrapped event using the Client.
+/// Decrypt a single-layer NIP-44 gift wrap (kind 1059).
 ///
-/// Returns the decrypted content string from the inner rumor event.
+/// This matches the ContextVM JS/TS SDK's encryption scheme:
+/// - The gift wrap event has NIP-44 encrypted content (single layer)
+/// - Decrypt using recipient's key + event's pubkey (ephemeral sender)
+/// - Returns the decrypted plaintext content string
+pub async fn decrypt_gift_wrap_single_layer<T>(
+    signer: &T,
+    event: &Event,
+) -> Result<String>
+where
+    T: NostrSigner,
+{
+    let sender_pubkey = event.pubkey;
+    decrypt_nip44(signer, &sender_pubkey, &event.content).await
+}
+
+/// Create a single-layer NIP-44 gift wrap (kind 1059).
+///
+/// Matches the ContextVM JS/TS SDK's `encryptMessage`:
+/// 1. Generate ephemeral keypair
+/// 2. NIP-44 encrypt plaintext using ephemeral_secret + recipient_pubkey
+/// 3. Build kind 1059 event with `p` tag pointing to recipient
+/// 4. Sign with ephemeral key
+pub async fn gift_wrap_single_layer<T>(
+    _signer: &T,
+    recipient: &PublicKey,
+    plaintext: &str,
+) -> Result<Event>
+where
+    T: NostrSigner,
+{
+    let ephemeral = Keys::generate();
+
+    let encrypted = encrypt_nip44(&ephemeral, recipient, plaintext).await?;
+
+    let builder = EventBuilder::new(Kind::Custom(GIFT_WRAP_KIND), encrypted)
+        .tag(Tag::public_key(*recipient));
+
+    builder
+        .sign_with_keys(&ephemeral)
+        .map_err(|e| Error::Encryption(e.to_string()))
+}
+
+// Legacy NIP-59 functions kept for reference but deprecated.
+
+/// Decrypt a full NIP-59 gift-wrapped event using the Client.
+///
+/// **Deprecated**: Use `decrypt_gift_wrap_single_layer` for ContextVM interop.
+/// This expects the full NIP-59 two-layer scheme (gift wrap → seal → rumor).
+#[deprecated(note = "Use decrypt_gift_wrap_single_layer for ContextVM compatibility")]
 pub async fn decrypt_gift_wrap(client: &Client, event: &Event) -> Result<UnsignedEvent> {
     let unwrapped = client
         .unwrap_gift_wrap(event)
@@ -47,9 +96,10 @@ pub async fn decrypt_gift_wrap(client: &Client, event: &Event) -> Result<Unsigne
     Ok(unwrapped.rumor)
 }
 
-/// Create and publish a NIP-59 gift-wrapped event.
+/// Create and publish a full NIP-59 gift-wrapped event.
 ///
-/// Wraps an unsigned event (rumor) in a gift wrap addressed to the recipient.
+/// **Deprecated**: Use `gift_wrap_single_layer` for ContextVM compatibility.
+#[deprecated(note = "Use gift_wrap_single_layer for ContextVM compatibility")]
 pub async fn gift_wrap(
     client: &Client,
     recipient: &PublicKey,
@@ -82,5 +132,137 @@ mod tests {
             .unwrap();
 
         assert_eq!(plaintext, decrypted);
+    }
+
+    /// Create a gift wrap event the same way the JS/TS SDK does:
+    /// single-layer NIP-44 encryption with an ephemeral key.
+    ///
+    /// JS SDK `encryptMessage`:
+    ///   1. Generate ephemeral keypair
+    ///   2. NIP-44 encrypt the plaintext using ephemeral_secret + recipient_pubkey
+    ///   3. Build kind 1059 event with encrypted content, `p` tag = recipient
+    ///   4. Sign with ephemeral key
+    async fn create_js_style_gift_wrap(
+        plaintext: &str,
+        recipient: &PublicKey,
+    ) -> (Event, Keys) {
+        let ephemeral = Keys::generate();
+
+        // Single-layer NIP-44 encrypt
+        let encrypted = encrypt_nip44(&ephemeral, recipient, plaintext)
+            .await
+            .unwrap();
+
+        // Build kind 1059 event
+        let builder = EventBuilder::new(Kind::Custom(1059), encrypted)
+            .tag(Tag::public_key(*recipient));
+
+        let event = builder.sign_with_keys(&ephemeral).unwrap();
+        (event, ephemeral)
+    }
+
+    #[tokio::test]
+    async fn test_decrypt_js_style_gift_wrap() {
+        // Simulates exactly what the JS SDK does:
+        // 1. Create a signed Nostr event containing the MCP message
+        // 2. JSON.stringify that event
+        // 3. Encrypt that JSON string in a gift wrap
+        let client_keys = Keys::generate();
+        let server_keys = Keys::generate();
+
+        let mcp_content = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+
+        // Step 1: JS SDK creates a signed event (kind 25910 = CTXVM_MESSAGES_KIND)
+        let inner_event = EventBuilder::new(Kind::Custom(25910), mcp_content)
+            .tag(Tag::public_key(server_keys.public_key()))
+            .sign_with_keys(&client_keys)
+            .unwrap();
+
+        // Step 2: JSON.stringify the signed event
+        let inner_json = serde_json::to_string(&inner_event).unwrap();
+
+        // Step 3: Encrypt as a gift wrap
+        let (gift_wrap, _ephemeral) =
+            create_js_style_gift_wrap(&inner_json, &server_keys.public_key()).await;
+
+        assert_eq!(gift_wrap.kind, Kind::Custom(1059));
+
+        // Decrypt using our function — should get back the inner event JSON
+        let decrypted = decrypt_gift_wrap_single_layer(&server_keys, &gift_wrap)
+            .await
+            .unwrap();
+
+        // Parse the decrypted JSON as a Nostr event
+        let parsed: Event = serde_json::from_str(&decrypted).unwrap();
+        assert_eq!(parsed.pubkey, client_keys.public_key());
+        assert_eq!(parsed.content, mcp_content);
+    }
+
+    #[tokio::test]
+    async fn test_gift_wrap_roundtrip_single_layer() {
+        let sender_keys = Keys::generate();
+        let recipient_keys = Keys::generate();
+
+        // Simulate the full flow: create inner event, stringify, gift wrap, decrypt
+        let mcp_content = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+        let inner_event = EventBuilder::new(Kind::Custom(25910), mcp_content)
+            .tag(Tag::public_key(recipient_keys.public_key()))
+            .sign_with_keys(&sender_keys)
+            .unwrap();
+        let inner_json = serde_json::to_string(&inner_event).unwrap();
+
+        // Encrypt (Rust SDK sending)
+        let gift_wrap_event =
+            gift_wrap_single_layer(&sender_keys, &recipient_keys.public_key(), &inner_json)
+                .await
+                .unwrap();
+
+        assert_eq!(gift_wrap_event.kind, Kind::Custom(1059));
+
+        // Decrypt
+        let decrypted = decrypt_gift_wrap_single_layer(&recipient_keys, &gift_wrap_event)
+            .await
+            .unwrap();
+
+        let parsed: Event = serde_json::from_str(&decrypted).unwrap();
+        assert_eq!(parsed.pubkey, sender_keys.public_key());
+        assert_eq!(parsed.content, mcp_content);
+    }
+
+    #[tokio::test]
+    async fn test_gift_wrap_has_correct_tags() {
+        let sender_keys = Keys::generate();
+        let recipient_keys = Keys::generate();
+
+        let gift_wrap_event =
+            gift_wrap_single_layer(&sender_keys, &recipient_keys.public_key(), "test")
+                .await
+                .unwrap();
+
+        // Should have a p tag pointing to the recipient
+        let p_tags: Vec<_> = gift_wrap_event
+            .tags
+            .iter()
+            .filter(|t| t.kind() == TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::P)))
+            .collect();
+        assert_eq!(p_tags.len(), 1);
+
+        let p_value = p_tags[0].clone().to_vec();
+        assert_eq!(p_value[1], recipient_keys.public_key().to_hex());
+    }
+
+    #[tokio::test]
+    async fn test_gift_wrap_uses_ephemeral_key() {
+        let sender_keys = Keys::generate();
+        let recipient_keys = Keys::generate();
+
+        let gift_wrap_event =
+            gift_wrap_single_layer(&sender_keys, &recipient_keys.public_key(), "test")
+                .await
+                .unwrap();
+
+        // The gift wrap event should NOT be signed by the sender's key
+        // (it uses an ephemeral key, like the JS SDK)
+        assert_ne!(gift_wrap_event.pubkey, sender_keys.public_key());
     }
 }

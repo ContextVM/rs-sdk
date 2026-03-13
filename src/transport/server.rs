@@ -434,13 +434,32 @@ impl NostrServerTransport {
                             tracing::warn!("Received encrypted message but encryption is disabled");
                             continue;
                         }
-                        match encryption::decrypt_gift_wrap(&client, &event).await {
-                            Ok(rumor) => (
-                                rumor.content,
-                                rumor.pubkey.to_hex(),
-                                event.id.to_hex(),
-                                true,
-                            ),
+                        // Single-layer NIP-44 decrypt (matches JS/TS SDK)
+                        let signer = match client.signer().await {
+                            Ok(s) => s,
+                            Err(e) => {
+                                tracing::error!("Failed to get signer: {e}");
+                                continue;
+                            }
+                        };
+                        match encryption::decrypt_gift_wrap_single_layer(&signer, &event).await {
+                            Ok(decrypted_json) => {
+                                // The decrypted content is JSON of the inner signed event.
+                                // Use the INNER event's ID for correlation — the client
+                                // registers the inner event ID in its correlation store.
+                                match serde_json::from_str::<Event>(&decrypted_json) {
+                                    Ok(inner) => (
+                                        inner.content,
+                                        inner.pubkey.to_hex(),
+                                        inner.id.to_hex(),
+                                        true,
+                                    ),
+                                    Err(e) => {
+                                        tracing::error!("Failed to parse inner event: {e}");
+                                        continue;
+                                    }
+                                }
+                            }
                             Err(e) => {
                                 tracing::error!("Failed to decrypt: {e}");
                                 continue;

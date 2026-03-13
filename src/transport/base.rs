@@ -115,15 +115,16 @@ impl BaseTransport {
         let event = self.create_signed_event(message, kind, tags).await?;
 
         if should_encrypt {
-            // Gift wrap the event for the recipient
-            let rumor = UnsignedEvent::new(
-                event.pubkey,
-                event.created_at,
-                event.kind,
-                event.tags.clone(),
-                event.content.clone(),
-            );
-            let event_id = encryption::gift_wrap(self.relay_pool.client(), recipient, rumor).await?;
+            // Single-layer gift wrap: JSON.stringify(signedEvent) → NIP-44 encrypt
+            // This matches the JS/TS SDK's encryptMessage(JSON.stringify(event), recipient)
+            let event_json = serde_json::to_string(&event)
+                .map_err(|e| Error::Encryption(e.to_string()))?;
+            let signer = self.relay_pool.client().signer().await
+                .map_err(|e| Error::Encryption(e.to_string()))?;
+            let gift_wrap_event = encryption::gift_wrap_single_layer(
+                &signer, recipient, &event_json,
+            ).await?;
+            let event_id = self.relay_pool.publish_event(&gift_wrap_event).await?;
             tracing::debug!(event_id = %event_id, "Sent encrypted MCP message");
             Ok(event_id)
         } else {
