@@ -221,7 +221,7 @@ tracing-subscriber = "0.3"
     - Unit test: rejects events from wrong server pubkey
 
 - [x] **2.4** Implement `NostrServerTransport`
-  - Config: relay_urls, encryption_mode, server_info, is_public_server, allowed_public_keys, excluded_capabilities, cleanup_interval_ms, session_timeout_ms
+  - Config: relay_urls, encryption_mode, server_info, is_announced_server, allowed_public_keys, excluded_capabilities, cleanup_interval_ms, session_timeout_ms
   - Implements `Transport` trait
   - Features:
     - Subscribe to events targeting server pubkey

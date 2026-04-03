@@ -17,6 +17,7 @@ use crate::core::types::*;
 use crate::encryption;
 use crate::relay::RelayPool;
 use crate::transport::base::BaseTransport;
+use rmcp::model::ProtocolVersion;
 
 /// Configuration for the client transport.
 pub struct NostrClientTransportConfig {
@@ -153,7 +154,7 @@ impl NostrClientTransport {
             jsonrpc: "2.0".to_string(),
             id: request_id.clone(),
             result: serde_json::json!({
-                "protocolVersion": "2025-03-26",
+                "protocolVersion": ProtocolVersion::LATEST.to_string(),
                 "serverInfo": {
                     "name": "Emulated-Stateless-Server",
                     "version": "1.0.0"
@@ -181,7 +182,9 @@ impl NostrClientTransport {
             if let RelayPoolNotification::Event { event, .. } = notification {
                 // Handle gift-wrapped events
                 let (actual_event_content, actual_pubkey, e_tag) =
-                    if event.kind == Kind::Custom(GIFT_WRAP_KIND) {
+                    if event.kind == Kind::Custom(GIFT_WRAP_KIND)
+                        || event.kind == Kind::Custom(EPHEMERAL_GIFT_WRAP_KIND)
+                    {
                         // Single-layer NIP-44 decrypt (matches JS/TS SDK)
                         let signer = match client.signer().await {
                             Ok(s) => s,
@@ -246,7 +249,6 @@ impl NostrClientTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::types::*;
 
     #[test]
     fn test_config_defaults() {
@@ -275,7 +277,7 @@ mod tests {
             jsonrpc: "2.0".to_string(),
             id: request_id.clone(),
             result: serde_json::json!({
-                "protocolVersion": "2025-03-26",
+                "protocolVersion": ProtocolVersion::LATEST.to_string(),
                 "serverInfo": {
                     "name": "Emulated-Stateless-Server",
                     "version": "1.0.0"

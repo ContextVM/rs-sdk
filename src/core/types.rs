@@ -10,21 +10,16 @@ use std::time::Instant;
 ///
 /// Controls whether MCP messages are sent as plaintext kind 25910 events
 /// or wrapped in NIP-59 gift wraps (kind 1059) for end-to-end encryption.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum EncryptionMode {
     /// Encrypt responses only when the incoming request was encrypted (mirror mode).
+    #[default]
     Optional,
     /// Enforce encryption for all messages; reject plaintext.
     Required,
     /// Disable encryption entirely; all messages are plaintext kind 25910.
     Disabled,
-}
-
-impl Default for EncryptionMode {
-    fn default() -> Self {
-        Self::Optional
-    }
 }
 
 // ── Server info ─────────────────────────────────────────────────────

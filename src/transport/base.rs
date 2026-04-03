@@ -60,21 +60,29 @@ impl BaseTransport {
     pub async fn subscribe_for_pubkey(&self, pubkey: &PublicKey) -> Result<()> {
         let p_tag = pubkey.to_hex();
 
-        // Ephemeral ContextVM messages — safe to use since:now()
         let ephemeral_filter = Filter::new()
             .kind(Kind::Custom(CTXVM_MESSAGES_KIND))
             .custom_tag(SingleLetterTag::lowercase(Alphabet::P), p_tag.clone())
             .since(Timestamp::now());
 
-        // NIP-59 gift wraps — timestamps are randomized (up to ±48h or more),
-        // so we must NOT use since:now(). Limit to recent window instead.
-        let two_days_ago = Timestamp::from(Timestamp::now().as_u64().saturating_sub(2 * 24 * 3600));
+        let now = Timestamp::now();
         let gift_wrap_filter = Filter::new()
             .kind(Kind::Custom(GIFT_WRAP_KIND))
-            .custom_tag(SingleLetterTag::lowercase(Alphabet::P), p_tag)
-            .since(two_days_ago);
+            .custom_tag(SingleLetterTag::lowercase(Alphabet::P), p_tag.clone())
+            .since(now);
 
-        self.relay_pool.subscribe(vec![ephemeral_filter, gift_wrap_filter]).await
+        let ephemeral_gift_wrap_filter = Filter::new()
+            .kind(Kind::Custom(EPHEMERAL_GIFT_WRAP_KIND))
+            .custom_tag(SingleLetterTag::lowercase(Alphabet::P), p_tag)
+            .since(now);
+
+        self.relay_pool
+            .subscribe(vec![
+                ephemeral_filter,
+                gift_wrap_filter,
+                ephemeral_gift_wrap_filter,
+            ])
+            .await
     }
 
     /// Convert a Nostr event to an MCP message with validation.
@@ -101,7 +109,8 @@ impl BaseTransport {
 
     /// Send an MCP message to a recipient, optionally encrypting.
     ///
-    /// Returns the event ID of the published event.
+    /// Returns the signed MCP event ID.
+    /// When encrypted, this is the inner signed event ID.
     pub async fn send_mcp_message(
         &self,
         message: &JsonRpcMessage,
@@ -113,6 +122,7 @@ impl BaseTransport {
         let should_encrypt = self.should_encrypt(kind, is_encrypted);
 
         let event = self.create_signed_event(message, kind, tags).await?;
+        let signed_event_id = event.id;
 
         if should_encrypt {
             // Single-layer gift wrap: JSON.stringify(signedEvent) → NIP-44 encrypt
@@ -124,14 +134,18 @@ impl BaseTransport {
             let gift_wrap_event = encryption::gift_wrap_single_layer(
                 &signer, recipient, &event_json,
             ).await?;
-            let event_id = self.relay_pool.publish_event(&gift_wrap_event).await?;
-            tracing::debug!(event_id = %event_id, "Sent encrypted MCP message");
-            Ok(event_id)
+            self.relay_pool.publish_event(&gift_wrap_event).await?;
+            tracing::debug!(
+                signed_event_id = %signed_event_id,
+                envelope_id = %gift_wrap_event.id,
+                "Sent encrypted MCP message"
+            );
         } else {
-            let event_id = self.relay_pool.publish_event(&event).await?;
-            tracing::debug!(event_id = %event_id, "Sent unencrypted MCP message");
-            Ok(event_id)
+            self.relay_pool.publish_event(&event).await?;
+            tracing::debug!(signed_event_id = %signed_event_id, "Sent unencrypted MCP message");
         }
+
+        Ok(signed_event_id)
     }
 
     /// Determine whether a message should be encrypted.
@@ -163,7 +177,6 @@ impl BaseTransport {
 mod tests {
     use super::*;
     use crate::core::types::*;
-    use nostr_sdk::prelude::*;
 
     // Test should_encrypt logic without constructing full BaseTransport
     fn should_encrypt(mode: EncryptionMode, kind: u16, is_encrypted: Option<bool>) -> bool {

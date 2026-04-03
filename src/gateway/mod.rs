@@ -98,7 +98,7 @@ mod tests {
                 version: Some("1.0.0".to_string()),
                 ..Default::default()
             }),
-            is_public_server: true,
+            is_announced_server: true,
             allowed_public_keys: vec!["abc123".to_string()],
             excluded_capabilities: vec![],
             cleanup_interval: Duration::from_secs(120),
@@ -109,7 +109,7 @@ mod tests {
 
         assert_eq!(config.nostr_config.relay_urls, vec!["wss://relay.example.com"]);
         assert_eq!(config.nostr_config.encryption_mode, EncryptionMode::Required);
-        assert!(config.nostr_config.is_public_server);
+        assert!(config.nostr_config.is_announced_server);
         assert_eq!(config.nostr_config.allowed_public_keys.len(), 1);
         assert!(config.nostr_config.server_info.as_ref().unwrap().name.as_ref().unwrap() == "Test Gateway");
     }
@@ -120,6 +120,6 @@ mod tests {
             nostr_config: NostrServerTransportConfig::default(),
         };
         assert_eq!(config.nostr_config.encryption_mode, EncryptionMode::Optional);
-        assert!(!config.nostr_config.is_public_server);
+        assert!(!config.nostr_config.is_announced_server);
     }
 }

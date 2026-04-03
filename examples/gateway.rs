@@ -25,7 +25,7 @@ async fn main() -> contextvm_sdk::Result<()> {
                 about: Some("A simple echo tool exposed via ContextVM".to_string()),
                 ..Default::default()
             }),
-            is_public_server: true,
+            is_announced_server: true,
             ..Default::default()
         },
     };
