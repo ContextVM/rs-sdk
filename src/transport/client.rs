@@ -161,7 +161,7 @@ impl NostrClientTransport {
             jsonrpc: "2.0".to_string(),
             id: request_id.clone(),
             result: serde_json::json!({
-                "protocolVersion": crate::core::constants::MCP_PROTOCOL_VERSION,
+                "protocolVersion": crate::core::constants::mcp_protocol_version(),
                 "serverInfo": {
                     "name": "Emulated-Stateless-Server",
                     "version": "1.0.0"
@@ -284,7 +284,7 @@ mod tests {
             jsonrpc: "2.0".to_string(),
             id: request_id.clone(),
             result: serde_json::json!({
-                "protocolVersion": crate::core::constants::MCP_PROTOCOL_VERSION,
+                "protocolVersion": crate::core::constants::mcp_protocol_version(),
                 "serverInfo": {
                     "name": "Emulated-Stateless-Server",
                     "version": "1.0.0"

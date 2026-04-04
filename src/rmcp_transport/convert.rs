@@ -4,6 +4,7 @@
 //! compatibility and avoid fragile hand-mapping between evolving type systems.
 
 use crate::core::types::JsonRpcMessage;
+use crate::util::logger;
 
 /// Convert internal JSON-RPC message into rmcp server RX message.
 ///
@@ -12,8 +13,33 @@ use crate::core::types::JsonRpcMessage;
 pub fn internal_to_rmcp_server_rx(
     msg: &JsonRpcMessage,
 ) -> Option<rmcp::service::RxJsonRpcMessage<rmcp::RoleServer>> {
-    let value = serde_json::to_value(msg).ok()?;
-    serde_json::from_value(value).ok()
+    let direction = "internal_to_rmcp_server_rx";
+    let target = "contextvm_sdk::rmcp_transport::convert";
+    let value = match serde_json::to_value(msg) {
+        Ok(value) => value,
+        Err(error) => {
+            logger::error_with_target(
+                target,
+                format!(
+                    "{direction}: failed to serialize message into intermediate JSON: {error}"
+                ),
+            );
+            return None;
+        }
+    };
+
+    match serde_json::from_value(value.clone()) {
+        Ok(parsed) => Some(parsed),
+        Err(error) => {
+            logger::error_with_target(
+                target,
+                format!(
+                    "{direction}: failed to parse converted JSON payload: {error}; payload={value:?}"
+                ),
+            );
+            None
+        }
+    }
 }
 
 /// Convert internal JSON-RPC message into rmcp client RX message.
@@ -23,24 +49,99 @@ pub fn internal_to_rmcp_server_rx(
 pub fn internal_to_rmcp_client_rx(
     msg: &JsonRpcMessage,
 ) -> Option<rmcp::service::RxJsonRpcMessage<rmcp::RoleClient>> {
-    let value = serde_json::to_value(msg).ok()?;
-    serde_json::from_value(value).ok()
+    let direction = "internal_to_rmcp_client_rx";
+    let target = "contextvm_sdk::rmcp_transport::convert";
+    let value = match serde_json::to_value(msg) {
+        Ok(value) => value,
+        Err(error) => {
+            logger::error_with_target(
+                target,
+                format!(
+                    "{direction}: failed to serialize message into intermediate JSON: {error}"
+                ),
+            );
+            return None;
+        }
+    };
+
+    match serde_json::from_value(value.clone()) {
+        Ok(parsed) => Some(parsed),
+        Err(error) => {
+            logger::error_with_target(
+                target,
+                format!(
+                    "{direction}: failed to parse converted JSON payload: {error}; payload={value:?}"
+                ),
+            );
+            None
+        }
+    }
 }
 
 /// Convert rmcp server TX message back into internal JSON-RPC.
 pub fn rmcp_server_tx_to_internal(
     msg: rmcp::service::TxJsonRpcMessage<rmcp::RoleServer>,
 ) -> Option<JsonRpcMessage> {
-    let value = serde_json::to_value(msg).ok()?;
-    serde_json::from_value(value).ok()
+    let direction = "rmcp_server_tx_to_internal";
+    let target = "contextvm_sdk::rmcp_transport::convert";
+    let value = match serde_json::to_value(msg) {
+        Ok(value) => value,
+        Err(error) => {
+            logger::error_with_target(
+                target,
+                format!(
+                    "{direction}: failed to serialize message into intermediate JSON: {error}"
+                ),
+            );
+            return None;
+        }
+    };
+
+    match serde_json::from_value(value.clone()) {
+        Ok(parsed) => Some(parsed),
+        Err(error) => {
+            logger::error_with_target(
+                target,
+                format!(
+                    "{direction}: failed to parse converted JSON payload: {error}; payload={value:?}"
+                ),
+            );
+            None
+        }
+    }
 }
 
 /// Convert rmcp client TX message back into internal JSON-RPC.
 pub fn rmcp_client_tx_to_internal(
     msg: rmcp::service::TxJsonRpcMessage<rmcp::RoleClient>,
 ) -> Option<JsonRpcMessage> {
-    let value = serde_json::to_value(msg).ok()?;
-    serde_json::from_value(value).ok()
+    let direction = "rmcp_client_tx_to_internal";
+    let target = "contextvm_sdk::rmcp_transport::convert";
+    let value = match serde_json::to_value(msg) {
+        Ok(value) => value,
+        Err(error) => {
+            logger::error_with_target(
+                target,
+                format!(
+                    "{direction}: failed to serialize message into intermediate JSON: {error}"
+                ),
+            );
+            return None;
+        }
+    };
+
+    match serde_json::from_value(value.clone()) {
+        Ok(parsed) => Some(parsed),
+        Err(error) => {
+            logger::error_with_target(
+                target,
+                format!(
+                    "{direction}: failed to parse converted JSON payload: {error}; payload={value:?}"
+                ),
+            );
+            None
+        }
+    }
 }
 
 #[cfg(all(test, feature = "rmcp"))]

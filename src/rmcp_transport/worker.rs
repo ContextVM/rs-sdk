@@ -7,6 +7,7 @@ use std::collections::HashMap;
 
 use crate::core::error::Result;
 use crate::core::types::JsonRpcMessage;
+use crate::util::logger;
 use crate::transport::client::{NostrClientTransport, NostrClientTransportConfig};
 use crate::transport::server::{NostrServerTransport, NostrServerTransportConfig};
 use rmcp::transport::worker::{Worker, WorkerContext, WorkerQuitReason};

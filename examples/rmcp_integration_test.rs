@@ -17,7 +17,7 @@
 //!   cargo run --example rmcp_integration_test --features rmcp -- all wss://relay.primal.net
 
 use anyhow::{anyhow, bail, Context, Result};
-use contextvm_sdk::core::constants::MCP_PROTOCOL_VERSION;
+use contextvm_sdk::core::constants::mcp_protocol_version;
 use contextvm_sdk::core::types::{
     EncryptionMode, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest,
     ServerInfo as CtxServerInfo,
@@ -359,7 +359,7 @@ async fn run_hybrid_relay_case(relay_url: &str) -> Result<()> {
             id: init_id.clone(),
             method: "initialize".to_string(),
             params: Some(serde_json::json!({
-                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "protocolVersion": mcp_protocol_version(),
                 "capabilities": {
                     "tools": {},
                     "resources": {}
@@ -654,7 +654,7 @@ fn assert_initialize_shape(response: &JsonRpcMessage) -> Result<()> {
     let JsonRpcMessage::Response(resp) = response else {
         bail!("expected initialize response, got {response:?}");
     };
-
+    let expected_protocol = mcp_protocol_version();
     let protocol = resp
         .result
         .get("protocolVersion")
@@ -663,7 +663,7 @@ fn assert_initialize_shape(response: &JsonRpcMessage) -> Result<()> {
 
     if !is_supported_protocol(protocol) {
         bail!(
-            "unexpected protocolVersion in initialize response: expected one of [{MCP_PROTOCOL_VERSION}, {}], got {protocol}",
+            "unexpected protocolVersion in initialize response: expected one of [{expected_protocol}, {}], got {protocol}",
             ProtocolVersion::LATEST
         );
     }
@@ -676,7 +676,7 @@ fn assert_initialize_shape(response: &JsonRpcMessage) -> Result<()> {
 }
 
 fn is_supported_protocol(protocol: &str) -> bool {
-    protocol == MCP_PROTOCOL_VERSION || protocol == ProtocolVersion::LATEST.to_string()
+    protocol == mcp_protocol_version() || protocol == ProtocolVersion::LATEST.to_string()
 }
 
 fn assert_error_response(response: &JsonRpcMessage) -> Result<()> {

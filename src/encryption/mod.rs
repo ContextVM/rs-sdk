@@ -111,6 +111,8 @@ pub async fn gift_wrap(
 
 #[cfg(test)]
 mod tests {
+    use crate::core::constants::KIND_GIFT_WRAP;
+
     use super::*;
 
     #[tokio::test]
@@ -139,7 +141,10 @@ mod tests {
     ///   2. NIP-44 encrypt the plaintext using ephemeral_secret + recipient_pubkey
     ///   3. Build kind 1059 event with encrypted content, `p` tag = recipient
     ///   4. Sign with ephemeral key
-    async fn create_js_style_gift_wrap(plaintext: &str, recipient: &PublicKey) -> (Event, Keys) {
+    async fn create_simple_gift_wrap(
+        plaintext: &str,
+        recipient: &PublicKey,
+    ) -> (Event, Keys) {
         let ephemeral = Keys::generate();
 
         // Single-layer NIP-44 encrypt
@@ -148,8 +153,8 @@ mod tests {
             .unwrap();
 
         // Build kind 1059 event
-        let builder =
-            EventBuilder::new(Kind::Custom(1059), encrypted).tag(Tag::public_key(*recipient));
+        let builder = EventBuilder::new(Kind::from(KIND_GIFT_WRAP), encrypted)
+            .tag(Tag::public_key(*recipient));
 
         let event = builder.sign_with_keys(&ephemeral).unwrap();
         (event, ephemeral)
@@ -177,7 +182,7 @@ mod tests {
 
         // Step 3: Encrypt as a gift wrap
         let (gift_wrap, _ephemeral) =
-            create_js_style_gift_wrap(&inner_json, &server_keys.public_key()).await;
+            create_simple_gift_wrap(&inner_json, &server_keys.public_key()).await;
 
         assert_eq!(gift_wrap.kind, Kind::Custom(1059));
 

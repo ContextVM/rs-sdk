@@ -33,6 +33,7 @@ pub const RESOURCETEMPLATES_LIST_KIND: u16 = 11319;
 /// Prompts list (addressable, kind 11320)
 pub const PROMPTS_LIST_KIND: u16 = 11320;
 
+pub const KIND_GIFT_WRAP: u16 = 1059;
 /// Nostr tag constants
 pub mod tags {
     /// Public key tag
@@ -73,7 +74,6 @@ pub const MAX_MESSAGE_SIZE: usize = 1024 * 1024;
 ///
 /// Matches the `protocolVersion` field of the `InitializeResult` JSON-RPC response.
 /// Keep this in sync with the MCP spec and rmcp's `ProtocolVersion::LATEST`.
-pub const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
 
 /// Default LRU cache size for deduplication
 pub const DEFAULT_LRU_SIZE: usize = 5000;
@@ -108,6 +108,21 @@ pub const UNENCRYPTED_KINDS: &[u16] = &[
     RESOURCETEMPLATES_LIST_KIND,
     PROMPTS_LIST_KIND,
 ];
+
+
+#[cfg(feature = "rmcp")]
+pub fn mcp_protocol_version() -> &'static str {
+    use std::sync::OnceLock;
+    static VERSION: OnceLock<String> = OnceLock::new();
+    VERSION
+        .get_or_init(|| rmcp::model::ProtocolVersion::LATEST.to_string())
+        .as_str()
+}
+
+#[cfg(not(feature = "rmcp"))]
+pub const fn mcp_protocol_version() -> &'static str {
+    "2025-11-25"
+}
 
 #[cfg(test)]
 mod tests {
