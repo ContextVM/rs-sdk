@@ -222,3 +222,278 @@ pub struct CapabilityExclusion {
     /// Optional capability name for method-specific exclusions (e.g., "get_weather").
     pub name: Option<String>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::thread;
+    use std::time::Duration;
+
+    #[test]
+    fn test_encryption_mode_serde_roundtrip_optional() {
+        let mode = EncryptionMode::Optional;
+        let s = serde_json::to_string(&mode).unwrap();
+        assert_eq!(s, "\"optional\"");
+        let parsed: EncryptionMode = serde_json::from_str(&s).unwrap();
+        assert_eq!(parsed, mode);
+    }
+
+    #[test]
+    fn test_encryption_mode_serde_roundtrip_required() {
+        let mode = EncryptionMode::Required;
+        let s = serde_json::to_string(&mode).unwrap();
+        assert_eq!(s, "\"required\"");
+        let parsed: EncryptionMode = serde_json::from_str(&s).unwrap();
+        assert_eq!(parsed, mode);
+    }
+
+    #[test]
+    fn test_encryption_mode_serde_roundtrip_disabled() {
+        let mode = EncryptionMode::Disabled;
+        let s = serde_json::to_string(&mode).unwrap();
+        assert_eq!(s, "\"disabled\"");
+        let parsed: EncryptionMode = serde_json::from_str(&s).unwrap();
+        assert_eq!(parsed, mode);
+    }
+
+    fn assert_json_rpc_roundtrip(msg: &JsonRpcMessage) {
+        let wire = serde_json::to_string(msg).unwrap();
+        let parsed: JsonRpcMessage = serde_json::from_str(&wire).unwrap();
+        let before = serde_json::to_value(msg).unwrap();
+        let after = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn test_json_rpc_message_serde_roundtrip_request() {
+        let msg = JsonRpcMessage::Request(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: json!(42),
+            method: "tools/list".to_string(),
+            params: Some(json!({ "cursor": null })),
+        });
+        assert_json_rpc_roundtrip(&msg);
+    }
+
+    #[test]
+    fn test_json_rpc_message_serde_roundtrip_request_without_params() {
+        let msg = JsonRpcMessage::Request(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: json!("req-id"),
+            method: "ping".to_string(),
+            params: None,
+        });
+        assert_json_rpc_roundtrip(&msg);
+    }
+
+    #[test]
+    fn test_json_rpc_message_serde_roundtrip_response() {
+        let msg = JsonRpcMessage::Response(JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: json!(1),
+            result: json!({ "tools": [] }),
+        });
+        assert_json_rpc_roundtrip(&msg);
+    }
+
+    #[test]
+    fn test_json_rpc_message_serde_roundtrip_error_response() {
+        let msg = JsonRpcMessage::ErrorResponse(JsonRpcErrorResponse {
+            jsonrpc: "2.0".to_string(),
+            id: json!(99),
+            error: JsonRpcError {
+                code: -32600,
+                message: "Invalid Request".to_string(),
+                data: Some(json!({ "hint": "fix it" })),
+            },
+        });
+        assert_json_rpc_roundtrip(&msg);
+    }
+
+    #[test]
+    fn test_json_rpc_message_serde_roundtrip_notification() {
+        let msg = JsonRpcMessage::Notification(JsonRpcNotification {
+            jsonrpc: "2.0".to_string(),
+            method: "notifications/initialized".to_string(),
+            params: None,
+        });
+        assert_json_rpc_roundtrip(&msg);
+    }
+
+    #[test]
+    fn test_json_rpc_message_type_predicates() {
+        let req = JsonRpcMessage::Request(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: json!(1),
+            method: "m".to_string(),
+            params: None,
+        });
+        let res = JsonRpcMessage::Response(JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: json!(1),
+            result: json!(null),
+        });
+        let err = JsonRpcMessage::ErrorResponse(JsonRpcErrorResponse {
+            jsonrpc: "2.0".to_string(),
+            id: json!(1),
+            error: JsonRpcError {
+                code: -1,
+                message: "e".to_string(),
+                data: None,
+            },
+        });
+        let notif = JsonRpcMessage::Notification(JsonRpcNotification {
+            jsonrpc: "2.0".to_string(),
+            method: "n".to_string(),
+            params: None,
+        });
+
+        assert!(req.is_request());
+        assert!(res.is_response());
+        assert!(err.is_error());
+        assert!(notif.is_notification());
+    }
+
+    #[test]
+    fn test_json_rpc_error_data_none_omitted() {
+        let err = JsonRpcError {
+            code: -32600,
+            message: "bad".to_string(),
+            data: None,
+        };
+        let json_str = serde_json::to_string(&err).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        let obj = value.as_object().expect("error object");
+        assert!(
+            !obj.contains_key("data"),
+            "expected data omitted when None, got: {json_str}"
+        );
+    }
+
+    #[test]
+    fn test_json_rpc_message_method() {
+        let req = JsonRpcMessage::Request(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: json!(0),
+            method: "tools/call".to_string(),
+            params: None,
+        });
+        let res = JsonRpcMessage::Response(JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: json!(0),
+            result: json!(null),
+        });
+        let err = JsonRpcMessage::ErrorResponse(JsonRpcErrorResponse {
+            jsonrpc: "2.0".to_string(),
+            id: json!(0),
+            error: JsonRpcError {
+                code: 0,
+                message: "e".to_string(),
+                data: None,
+            },
+        });
+        let notif = JsonRpcMessage::Notification(JsonRpcNotification {
+            jsonrpc: "2.0".to_string(),
+            method: "notifications/progress".to_string(),
+            params: None,
+        });
+
+        assert_eq!(req.method(), Some("tools/call"));
+        assert_eq!(res.method(), None);
+        assert_eq!(err.method(), None);
+        assert_eq!(notif.method(), Some("notifications/progress"));
+    }
+
+    #[test]
+    fn test_json_rpc_message_id() {
+        let req = JsonRpcMessage::Request(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: json!("abc"),
+            method: "m".to_string(),
+            params: None,
+        });
+        let res = JsonRpcMessage::Response(JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: json!(7),
+            result: json!(null),
+        });
+        let err = JsonRpcMessage::ErrorResponse(JsonRpcErrorResponse {
+            jsonrpc: "2.0".to_string(),
+            id: json!([1, 2]),
+            error: JsonRpcError {
+                code: 0,
+                message: "e".to_string(),
+                data: None,
+            },
+        });
+        let notif = JsonRpcMessage::Notification(JsonRpcNotification {
+            jsonrpc: "2.0".to_string(),
+            method: "n".to_string(),
+            params: None,
+        });
+
+        assert_eq!(req.id(), Some(&json!("abc")));
+        assert_eq!(res.id(), Some(&json!(7)));
+        assert_eq!(err.id(), Some(&json!([1, 2])));
+        assert_eq!(notif.id(), None);
+    }
+
+    #[test]
+    fn test_server_info_serde_all_fields_present() {
+        let info = ServerInfo {
+            name: Some("Test Server".to_string()),
+            version: Some("1.0.0".to_string()),
+            picture: Some("https://example.com/p.png".to_string()),
+            website: Some("https://example.com".to_string()),
+            about: Some("About text".to_string()),
+        };
+        let json_str = serde_json::to_string(&info).unwrap();
+        let parsed: ServerInfo = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(parsed.name, info.name);
+        assert_eq!(parsed.version, info.version);
+        assert_eq!(parsed.picture, info.picture);
+        assert_eq!(parsed.website, info.website);
+        assert_eq!(parsed.about, info.about);
+    }
+
+    #[test]
+    fn test_server_info_serde_optional_fields_omitted() {
+        let info = ServerInfo {
+            name: None,
+            version: None,
+            picture: None,
+            website: None,
+            about: None,
+        };
+        let json_str = serde_json::to_string(&info).unwrap();
+        assert_eq!(json_str, "{}");
+    }
+
+    #[test]
+    fn test_client_session_new_initial_state_encrypted() {
+        let session = ClientSession::new(true);
+        assert!(!session.is_initialized);
+        assert!(session.is_encrypted);
+        assert!(session.pending_requests.is_empty());
+        assert!(session.event_to_progress_token.is_empty());
+    }
+
+    #[test]
+    fn test_client_session_new_initial_state_plaintext() {
+        let session = ClientSession::new(false);
+        assert!(!session.is_initialized);
+        assert!(!session.is_encrypted);
+        assert!(session.pending_requests.is_empty());
+        assert!(session.event_to_progress_token.is_empty());
+    }
+
+    #[test]
+    fn test_client_session_update_activity() {
+        let mut session = ClientSession::new(false);
+        let first = session.last_activity;
+        thread::sleep(Duration::from_millis(10));
+        session.update_activity();
+        assert!(session.last_activity > first);
+    }
+}
