@@ -127,6 +127,7 @@ mod tests {
             excluded_capabilities: vec![],
             cleanup_interval: Duration::from_secs(120),
             session_timeout: Duration::from_secs(600),
+            log_file_path: None,
         };
 
         let config = GatewayConfig { nostr_config };

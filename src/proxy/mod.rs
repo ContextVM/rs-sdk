@@ -112,6 +112,7 @@ mod tests {
             encryption_mode: EncryptionMode::Required,
             is_stateless: true,
             timeout: Duration::from_secs(60),
+            log_file_path: None,
         };
 
         let config = ProxyConfig { nostr_config };
