@@ -141,10 +141,7 @@ mod tests {
     ///   2. NIP-44 encrypt the plaintext using ephemeral_secret + recipient_pubkey
     ///   3. Build kind 1059 event with encrypted content, `p` tag = recipient
     ///   4. Sign with ephemeral key
-    async fn create_simple_gift_wrap(
-        plaintext: &str,
-        recipient: &PublicKey,
-    ) -> (Event, Keys) {
+    async fn create_simple_gift_wrap(plaintext: &str, recipient: &PublicKey) -> (Event, Keys) {
         let ephemeral = Keys::generate();
 
         // Single-layer NIP-44 encrypt
