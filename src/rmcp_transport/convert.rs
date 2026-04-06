@@ -4,7 +4,8 @@
 //! compatibility and avoid fragile hand-mapping between evolving type systems.
 
 use crate::core::types::JsonRpcMessage;
-use crate::util::logger;
+
+const LOG_TARGET: &str = "contextvm_sdk::rmcp_transport::convert";
 
 /// Convert internal JSON-RPC message into rmcp server RX message.
 ///
@@ -14,15 +15,14 @@ pub fn internal_to_rmcp_server_rx(
     msg: &JsonRpcMessage,
 ) -> Option<rmcp::service::RxJsonRpcMessage<rmcp::RoleServer>> {
     let direction = "internal_to_rmcp_server_rx";
-    let target = "contextvm_sdk::rmcp_transport::convert";
     let value = match serde_json::to_value(msg) {
         Ok(value) => value,
         Err(error) => {
-            logger::error_with_target(
-                target,
-                format!(
-                    "{direction}: failed to serialize message into intermediate JSON: {error}"
-                ),
+            tracing::error!(
+                target: LOG_TARGET,
+                direction = direction,
+                error = %error,
+                "Failed to serialize message into intermediate JSON"
             );
             return None;
         }
@@ -31,11 +31,12 @@ pub fn internal_to_rmcp_server_rx(
     match serde_json::from_value(value.clone()) {
         Ok(parsed) => Some(parsed),
         Err(error) => {
-            logger::error_with_target(
-                target,
-                format!(
-                    "{direction}: failed to parse converted JSON payload: {error}; payload={value:?}"
-                ),
+            tracing::error!(
+                target: LOG_TARGET,
+                direction = direction,
+                error = %error,
+                payload = ?value,
+                "Failed to parse converted JSON payload"
             );
             None
         }
@@ -50,15 +51,14 @@ pub fn internal_to_rmcp_client_rx(
     msg: &JsonRpcMessage,
 ) -> Option<rmcp::service::RxJsonRpcMessage<rmcp::RoleClient>> {
     let direction = "internal_to_rmcp_client_rx";
-    let target = "contextvm_sdk::rmcp_transport::convert";
     let value = match serde_json::to_value(msg) {
         Ok(value) => value,
         Err(error) => {
-            logger::error_with_target(
-                target,
-                format!(
-                    "{direction}: failed to serialize message into intermediate JSON: {error}"
-                ),
+            tracing::error!(
+                target: LOG_TARGET,
+                direction = direction,
+                error = %error,
+                "Failed to serialize message into intermediate JSON"
             );
             return None;
         }
@@ -67,11 +67,12 @@ pub fn internal_to_rmcp_client_rx(
     match serde_json::from_value(value.clone()) {
         Ok(parsed) => Some(parsed),
         Err(error) => {
-            logger::error_with_target(
-                target,
-                format!(
-                    "{direction}: failed to parse converted JSON payload: {error}; payload={value:?}"
-                ),
+            tracing::error!(
+                target: LOG_TARGET,
+                direction = direction,
+                error = %error,
+                payload = ?value,
+                "Failed to parse converted JSON payload"
             );
             None
         }
@@ -83,15 +84,14 @@ pub fn rmcp_server_tx_to_internal(
     msg: rmcp::service::TxJsonRpcMessage<rmcp::RoleServer>,
 ) -> Option<JsonRpcMessage> {
     let direction = "rmcp_server_tx_to_internal";
-    let target = "contextvm_sdk::rmcp_transport::convert";
     let value = match serde_json::to_value(msg) {
         Ok(value) => value,
         Err(error) => {
-            logger::error_with_target(
-                target,
-                format!(
-                    "{direction}: failed to serialize message into intermediate JSON: {error}"
-                ),
+            tracing::error!(
+                target: LOG_TARGET,
+                direction = direction,
+                error = %error,
+                "Failed to serialize message into intermediate JSON"
             );
             return None;
         }
@@ -100,11 +100,12 @@ pub fn rmcp_server_tx_to_internal(
     match serde_json::from_value(value.clone()) {
         Ok(parsed) => Some(parsed),
         Err(error) => {
-            logger::error_with_target(
-                target,
-                format!(
-                    "{direction}: failed to parse converted JSON payload: {error}; payload={value:?}"
-                ),
+            tracing::error!(
+                target: LOG_TARGET,
+                direction = direction,
+                error = %error,
+                payload = ?value,
+                "Failed to parse converted JSON payload"
             );
             None
         }
@@ -116,15 +117,14 @@ pub fn rmcp_client_tx_to_internal(
     msg: rmcp::service::TxJsonRpcMessage<rmcp::RoleClient>,
 ) -> Option<JsonRpcMessage> {
     let direction = "rmcp_client_tx_to_internal";
-    let target = "contextvm_sdk::rmcp_transport::convert";
     let value = match serde_json::to_value(msg) {
         Ok(value) => value,
         Err(error) => {
-            logger::error_with_target(
-                target,
-                format!(
-                    "{direction}: failed to serialize message into intermediate JSON: {error}"
-                ),
+            tracing::error!(
+                target: LOG_TARGET,
+                direction = direction,
+                error = %error,
+                "Failed to serialize message into intermediate JSON"
             );
             return None;
         }
@@ -133,11 +133,12 @@ pub fn rmcp_client_tx_to_internal(
     match serde_json::from_value(value.clone()) {
         Ok(parsed) => Some(parsed),
         Err(error) => {
-            logger::error_with_target(
-                target,
-                format!(
-                    "{direction}: failed to parse converted JSON payload: {error}; payload={value:?}"
-                ),
+            tracing::error!(
+                target: LOG_TARGET,
+                direction = direction,
+                error = %error,
+                payload = ?value,
+                "Failed to parse converted JSON payload"
             );
             None
         }

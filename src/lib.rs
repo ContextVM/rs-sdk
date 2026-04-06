@@ -44,10 +44,10 @@ pub mod proxy;
 pub mod relay;
 pub mod signer;
 pub mod transport;
-pub mod util;
 
 #[cfg(feature = "rmcp")]
 pub mod rmcp_transport;
+mod util;
 
 // Re-export commonly used types
 pub use core::error::{Error, Result};
