@@ -8,6 +8,17 @@ pub fn validate_message_size(content: &str) -> bool {
     content.len() <= MAX_MESSAGE_SIZE
 }
 
+/// Validate size and structure, then parse into a [`JsonRpcMessage`].
+pub fn validate_and_parse(content: &str) -> Option<JsonRpcMessage> {
+    if !validate_message_size(content) {
+        tracing::warn!("Message size validation failed: {} bytes", content.len());
+        return None;
+    }
+
+    let value: serde_json::Value = serde_json::from_str(content).ok()?;
+    validate_message(&value)
+}
+
 /// Validate that a JSON value is a well-formed JSON-RPC 2.0 message.
 ///
 /// Checks:
@@ -60,5 +71,31 @@ mod tests {
         assert!(validate_message_size("hello"));
         let big = "x".repeat(MAX_MESSAGE_SIZE + 1);
         assert!(!validate_message_size(&big));
+    }
+
+    #[test]
+    fn test_validate_and_parse_valid_request() {
+        let content = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+        let msg = validate_and_parse(content).unwrap();
+        assert!(msg.is_request());
+        assert_eq!(msg.method(), Some("tools/list"));
+    }
+
+    #[test]
+    fn test_validate_and_parse_rejects_oversized() {
+        let padding = "x".repeat(MAX_MESSAGE_SIZE);
+        let content = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"{}"}}"#, padding);
+        assert!(validate_and_parse(&content).is_none());
+    }
+
+    #[test]
+    fn test_validate_and_parse_rejects_invalid_version() {
+        let content = r#"{"jsonrpc":"1.0","id":1,"method":"test"}"#;
+        assert!(validate_and_parse(content).is_none());
+    }
+
+    #[test]
+    fn test_validate_and_parse_rejects_invalid_json() {
+        assert!(validate_and_parse("not json").is_none());
     }
 }

@@ -33,7 +33,6 @@ pub const RESOURCETEMPLATES_LIST_KIND: u16 = 11319;
 /// Prompts list (addressable, kind 11320)
 pub const PROMPTS_LIST_KIND: u16 = 11320;
 
-pub const KIND_GIFT_WRAP: u16 = 1059;
 /// Nostr tag constants
 pub mod tags {
     /// Public key tag
@@ -69,11 +68,6 @@ pub mod tags {
 
 /// Maximum message size (1MB)
 pub const MAX_MESSAGE_SIZE: usize = 1024 * 1024;
-
-/// MCP protocol version string used in initialize responses.
-///
-/// Matches the `protocolVersion` field of the `InitializeResult` JSON-RPC response.
-/// Keep this in sync with the MCP spec and rmcp's `ProtocolVersion::LATEST`.
 
 /// Default LRU cache size for deduplication
 pub const DEFAULT_LRU_SIZE: usize = 5000;
@@ -123,6 +117,19 @@ pub const fn mcp_protocol_version() -> &'static str {
     "2025-11-25"
 }
 
+// Compile-time range checks (NIP-01 kind ranges).
+// Placed at module level so violations are caught in every build, not just `cargo test`.
+const _: () = {
+    // Ephemeral events: 20000 <= kind < 30000
+    assert!(EPHEMERAL_GIFT_WRAP_KIND >= 20000);
+    assert!(EPHEMERAL_GIFT_WRAP_KIND < 30000);
+    assert!(CTXVM_MESSAGES_KIND >= 20000);
+    assert!(CTXVM_MESSAGES_KIND < 30000);
+    // Replaceable events: 10000 <= kind < 20000
+    assert!(RELAY_LIST_METADATA_KIND >= 10000);
+    assert!(RELAY_LIST_METADATA_KIND < 20000);
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,27 +162,6 @@ mod tests {
             tags::SUPPORT_ENCRYPTION_EPHEMERAL,
             "support_encryption_ephemeral"
         );
-    }
-
-    #[test]
-    fn test_ephemeral_gift_wrap_in_ephemeral_range() {
-        // NIP-01: ephemeral events are 20000 <= kind < 30000
-        assert!(EPHEMERAL_GIFT_WRAP_KIND >= 20000);
-        assert!(EPHEMERAL_GIFT_WRAP_KIND < 30000);
-    }
-
-    #[test]
-    fn test_ctxvm_messages_in_ephemeral_range() {
-        // NIP-01: ephemeral events are 20000 <= kind < 30000
-        assert!(CTXVM_MESSAGES_KIND >= 20000);
-        assert!(CTXVM_MESSAGES_KIND < 30000);
-    }
-
-    #[test]
-    fn test_relay_list_metadata_in_replaceable_range() {
-        // NIP-01: replaceable events are 10000 <= kind < 20000
-        assert!(RELAY_LIST_METADATA_KIND >= 10000);
-        assert!(RELAY_LIST_METADATA_KIND < 20000);
     }
 
     #[test]

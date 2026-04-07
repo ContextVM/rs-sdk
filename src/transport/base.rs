@@ -89,17 +89,7 @@ impl BaseTransport {
 
     /// Convert a Nostr event to an MCP message with validation.
     pub fn convert_event_to_mcp(&self, content: &str) -> Option<JsonRpcMessage> {
-        if !validation::validate_message_size(content) {
-            tracing::warn!(
-                target: LOG_TARGET,
-                content_size_bytes = content.len(),
-                "Message size validation failed"
-            );
-            return None;
-        }
-
-        let value: serde_json::Value = serde_json::from_str(content).ok()?;
-        validation::validate_message(&value)
+        validation::validate_and_parse(content)
     }
 
     /// Create a signed Nostr event for an MCP message.
