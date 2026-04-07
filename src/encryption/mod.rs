@@ -264,4 +264,45 @@ mod tests {
         // (it uses an ephemeral key, like the JS SDK)
         assert_ne!(gift_wrap_event.pubkey, sender_keys.public_key());
     }
+
+    /// Regression: gift-wrapped inner events with a tampered pubkey must be
+    /// caught by `Event::verify()`.
+    #[tokio::test]
+    async fn test_forged_inner_event_detected_by_verify() {
+        let real_sender = Keys::generate();
+        let impersonated = Keys::generate();
+        let recipient = Keys::generate();
+
+        let mcp_content = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+
+        // Step 1: build a legitimately signed inner event
+        let inner_event = EventBuilder::new(Kind::Custom(25910), mcp_content)
+            .tag(Tag::public_key(recipient.public_key()))
+            .sign_with_keys(&real_sender)
+            .unwrap();
+
+        // Step 2: tamper the pubkey (keep original, now-invalid, signature)
+        let mut forged_json: serde_json::Value =
+            serde_json::to_value(&inner_event).unwrap();
+        forged_json["pubkey"] =
+            serde_json::Value::String(impersonated.public_key().to_hex());
+        let forged_str = serde_json::to_string(&forged_json).unwrap();
+
+        // Step 3: gift-wrap the forged payload
+        let (gift_wrap, _) =
+            create_simple_gift_wrap(&forged_str, &recipient.public_key()).await;
+
+        // Decrypt + parse both succeed — the forgery is syntactically valid
+        let decrypted = decrypt_gift_wrap_single_layer(&recipient, &gift_wrap)
+            .await
+            .unwrap();
+        let parsed: Event = serde_json::from_str(&decrypted).unwrap();
+        assert_eq!(parsed.pubkey, impersonated.public_key());
+
+        // Signature verification catches the tampered pubkey
+        assert!(
+            parsed.verify().is_err(),
+            "forged inner event must fail signature verification"
+        );
+    }
 }

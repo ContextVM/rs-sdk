@@ -506,12 +506,20 @@ impl NostrServerTransport {
                             // Use the INNER event's ID for correlation — the client
                             // registers the inner event ID in its correlation store.
                             match serde_json::from_str::<Event>(&decrypted_json) {
-                                Ok(inner) => (
-                                    inner.content,
-                                    inner.pubkey.to_hex(),
-                                    inner.id.to_hex(),
-                                    true,
-                                ),
+                                Ok(inner) => {
+                                    if let Err(e) = inner.verify() {
+                                        tracing::warn!(
+                                            "Inner event signature verification failed: {e}"
+                                        );
+                                        continue;
+                                    }
+                                    (
+                                        inner.content,
+                                        inner.pubkey.to_hex(),
+                                        inner.id.to_hex(),
+                                        true,
+                                    )
+                                }
                                 Err(e) => {
                                     tracing::error!("Failed to parse inner event: {e}");
                                     continue;

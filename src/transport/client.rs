@@ -204,6 +204,10 @@ impl NostrClientTransport {
                         Ok(decrypted_json) => {
                             match serde_json::from_str::<Event>(&decrypted_json) {
                                 Ok(inner) => {
+                                    if let Err(e) = inner.verify() {
+                                        tracing::warn!("Inner event signature verification failed: {e}");
+                                        continue;
+                                    }
                                     let e_tag = serializers::get_tag_value(&inner.tags, "e");
                                     (inner.content, inner.pubkey, e_tag)
                                 }
