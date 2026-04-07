@@ -1,0 +1,44 @@
+name: Integration Tests
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  integration:
+    name: Integration tests (local relay)
+    runs-on: ubuntu-latest
+
+    services:
+      nostr-relay:
+        image: scsibug/nostr-rs-relay:0.8.9
+        ports:
+          - 8080:8080
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Wait for relay
+        run: |
+          for i in $(seq 1 30); do
+            nc -z localhost 8080 2>/dev/null && exit 0
+            sleep 1
+          done
+          echo "Relay not ready after 30s" && exit 1
+
+      - name: Run integration example (all scenarios)
+        env:
+          CTXVM_RELAY_URL: ws://localhost:8080
+        run: cargo run --example rmcp_integration_test --features rmcp -- all
