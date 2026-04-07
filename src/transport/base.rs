@@ -11,6 +11,8 @@ use crate::core::validation;
 use crate::encryption;
 use crate::relay::RelayPool;
 
+const LOG_TARGET: &str = "contextvm_sdk::transport::base";
+
 /// Shared transport logic for both client and server.
 ///
 /// Handles relay connectivity, event signing/publishing, encryption decisions,
@@ -88,7 +90,11 @@ impl BaseTransport {
     /// Convert a Nostr event to an MCP message with validation.
     pub fn convert_event_to_mcp(&self, content: &str) -> Option<JsonRpcMessage> {
         if !validation::validate_message_size(content) {
-            tracing::warn!("Message size validation failed: {} bytes", content.len());
+            tracing::warn!(
+                target: LOG_TARGET,
+                content_size_bytes = content.len(),
+                "Message size validation failed"
+            );
             return None;
         }
 
@@ -139,13 +145,18 @@ impl BaseTransport {
                 encryption::gift_wrap_single_layer(&signer, recipient, &event_json).await?;
             self.relay_pool.publish_event(&gift_wrap_event).await?;
             tracing::debug!(
+                target: LOG_TARGET,
                 signed_event_id = %signed_event_id,
                 envelope_id = %gift_wrap_event.id,
                 "Sent encrypted MCP message"
             );
         } else {
             self.relay_pool.publish_event(&event).await?;
-            tracing::debug!(signed_event_id = %signed_event_id, "Sent unencrypted MCP message");
+            tracing::debug!(
+                target: LOG_TARGET,
+                signed_event_id = %signed_event_id,
+                "Sent unencrypted MCP message"
+            );
         }
 
         Ok(signed_event_id)
