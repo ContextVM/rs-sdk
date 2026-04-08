@@ -23,6 +23,7 @@ nostr-sdk = { version = "0.43", features = ["nip59"] }
 
 # Logging
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Optional MCP integration (Rust equivalent to TS @modelcontextprotocol/sdk)
 rmcp = { version = "0.16.0", features = ["server", "client", "macros", "transport-worker"], optional = true }
@@ -34,6 +35,5 @@ rmcp = ["dep:rmcp"]
 
 [dev-dependencies]
 tokio-test = "0.4"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 schemars = "0.8"

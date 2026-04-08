@@ -19,6 +19,10 @@ use crate::encryption;
 use crate::relay::RelayPool;
 use crate::transport::base::BaseTransport;
 
+use crate::util::tracing_setup;
+
+const LOG_TARGET: &str = "contextvm_sdk::transport::client";
+
 /// Configuration for the client transport.
 pub struct NostrClientTransportConfig {
     /// Relay URLs to connect to.
@@ -31,6 +35,8 @@ pub struct NostrClientTransportConfig {
     pub is_stateless: bool,
     /// Response timeout (default: 30s).
     pub timeout: Duration,
+    /// Optional log file path. Logs always go to stdout and are also appended here when set.
+    pub log_file_path: Option<String>,
 }
 
 impl Default for NostrClientTransportConfig {
@@ -41,6 +47,7 @@ impl Default for NostrClientTransportConfig {
             encryption_mode: EncryptionMode::Optional,
             is_stateless: false,
             timeout: Duration::from_secs(30),
+            log_file_path: None,
         }
     }
 }
@@ -63,12 +70,35 @@ impl NostrClientTransport {
     where
         T: IntoNostrSigner,
     {
-        let server_pubkey = PublicKey::from_hex(&config.server_pubkey)
-            .map_err(|e| Error::Other(format!("Invalid server pubkey: {e}")))?;
+        tracing_setup::init_tracer(config.log_file_path.as_deref())?;
 
-        let relay_pool = Arc::new(RelayPool::new(signer).await?);
+        let server_pubkey = PublicKey::from_hex(&config.server_pubkey).map_err(|error| {
+            tracing::error!(
+                target: LOG_TARGET,
+                error = %error,
+                server_pubkey = %config.server_pubkey,
+                "Invalid server pubkey"
+            );
+            Error::Other(format!("Invalid server pubkey: {error}"))
+        })?;
+
+        let relay_pool = Arc::new(RelayPool::new(signer).await.map_err(|error| {
+            tracing::error!(
+                target: LOG_TARGET,
+                error = %error,
+                "Failed to initialize relay pool for client transport"
+            );
+            error
+        })?);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
+        tracing::info!(
+            target: LOG_TARGET,
+            relay_count = config.relay_urls.len(),
+            stateless = config.is_stateless,
+            encryption_mode = ?config.encryption_mode,
+            "Created client transport"
+        );
         Ok(Self {
             base: BaseTransport {
                 relay_pool,
@@ -85,12 +115,44 @@ impl NostrClientTransport {
 
     /// Connect and start listening for responses.
     pub async fn start(&mut self) -> Result<()> {
-        self.base.connect(&self.config.relay_urls).await?;
+        self.base
+            .connect(&self.config.relay_urls)
+            .await
+            .map_err(|error| {
+                tracing::error!(
+                    target: LOG_TARGET,
+                    error = %error,
+                    "Failed to connect client transport to relays"
+                );
+                error
+            })?;
 
-        let pubkey = self.base.get_public_key().await?;
-        tracing::info!(pubkey = %pubkey.to_hex(), "Client transport started");
+        let pubkey = self.base.get_public_key().await.map_err(|error| {
+            tracing::error!(
+                target: LOG_TARGET,
+                error = %error,
+                "Failed to fetch client transport public key"
+            );
+            error
+        })?;
+        tracing::info!(
+            target: LOG_TARGET,
+            pubkey = %pubkey.to_hex(),
+            "Client transport started"
+        );
 
-        self.base.subscribe_for_pubkey(&pubkey).await?;
+        self.base
+            .subscribe_for_pubkey(&pubkey)
+            .await
+            .map_err(|error| {
+                tracing::error!(
+                    target: LOG_TARGET,
+                    error = %error,
+                    pubkey = %pubkey.to_hex(),
+                    "Failed to subscribe client transport for pubkey"
+                );
+                error
+            })?;
 
         // Spawn event loop
         let client = self.base.relay_pool.client().clone();
@@ -103,6 +165,11 @@ impl NostrClientTransport {
             Self::event_loop(client, pending, server_pubkey, tx, encryption_mode).await;
         });
 
+        tracing::info!(
+            target: LOG_TARGET,
+            relay_count = self.config.relay_urls.len(),
+            "Client transport event loop spawned"
+        );
         Ok(())
     }
 
@@ -138,7 +205,17 @@ impl NostrClientTransport {
                 tags,
                 None,
             )
-            .await?;
+            .await
+            .map_err(|error| {
+                tracing::error!(
+                    target: LOG_TARGET,
+                    error = %error,
+                    server_pubkey = %self.server_pubkey.to_hex(),
+                    method = ?message.method(),
+                    "Failed to send client message"
+                );
+                error
+            })?;
 
         if matches!(message, JsonRpcMessage::Request(_)) {
             self.pending_requests
@@ -147,6 +224,12 @@ impl NostrClientTransport {
                 .insert(event_id.to_hex());
         }
 
+        tracing::debug!(
+            target: LOG_TARGET,
+            event_id = %event_id.to_hex(),
+            method = ?message.method(),
+            "Sent client message"
+        );
         Ok(())
     }
 
@@ -196,8 +279,12 @@ impl NostrClientTransport {
                     // Single-layer NIP-44 decrypt (matches JS/TS SDK)
                     let signer = match client.signer().await {
                         Ok(s) => s,
-                        Err(e) => {
-                            tracing::error!("Failed to get signer: {e}");
+                        Err(error) => {
+                            tracing::error!(
+                                target: LOG_TARGET,
+                                error = %error,
+                                "Failed to get signer"
+                            );
                             continue;
                         }
                     };
@@ -212,14 +299,22 @@ impl NostrClientTransport {
                                     let e_tag = serializers::get_tag_value(&inner.tags, "e");
                                     (inner.content, inner.pubkey, e_tag)
                                 }
-                                Err(e) => {
-                                    tracing::error!("Failed to parse inner event: {e}");
+                                Err(error) => {
+                                    tracing::error!(
+                                        target: LOG_TARGET,
+                                        error = %error,
+                                        "Failed to parse inner event"
+                                    );
                                     continue;
                                 }
                             }
                         }
-                        Err(e) => {
-                            tracing::error!("Failed to decrypt gift wrap: {e}");
+                        Err(error) => {
+                            tracing::error!(
+                                target: LOG_TARGET,
+                                error = %error,
+                                "Failed to decrypt gift wrap"
+                            );
                             continue;
                         }
                     }
@@ -230,7 +325,12 @@ impl NostrClientTransport {
 
                 // Verify it's from our server
                 if actual_pubkey != server_pubkey {
-                    tracing::debug!("Skipping event from unexpected pubkey");
+                    tracing::debug!(
+                        target: LOG_TARGET,
+                        event_pubkey = %actual_pubkey.to_hex(),
+                        expected_pubkey = %server_pubkey.to_hex(),
+                        "Skipping event from unexpected pubkey"
+                    );
                     continue;
                 }
 
@@ -238,7 +338,11 @@ impl NostrClientTransport {
                 if let Some(ref correlated_id) = e_tag {
                     let is_pending = pending.read().await.contains(correlated_id.as_str());
                     if !is_pending {
-                        tracing::warn!(e_tag = %correlated_id, "Response for unknown request");
+                        tracing::warn!(
+                            target: LOG_TARGET,
+                            correlated_event_id = %correlated_id,
+                            "Response for unknown request"
+                        );
                         continue;
                     }
                 }
@@ -270,6 +374,7 @@ mod tests {
         assert_eq!(config.encryption_mode, EncryptionMode::Optional);
         assert!(!config.is_stateless);
         assert_eq!(config.timeout, Duration::from_secs(30));
+        assert!(config.log_file_path.is_none());
     }
 
     #[test]

@@ -103,7 +103,6 @@ pub const UNENCRYPTED_KINDS: &[u16] = &[
     PROMPTS_LIST_KIND,
 ];
 
-
 #[cfg(feature = "rmcp")]
 pub fn mcp_protocol_version() -> &'static str {
     use std::sync::OnceLock;

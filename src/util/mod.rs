@@ -1,3 +1,1 @@
-//! Small shared helpers (logging wrappers, etc.).
-
-pub mod logger;
+pub mod tracing_setup;
