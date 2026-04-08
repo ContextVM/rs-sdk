@@ -6,8 +6,8 @@
 
 use rmcp::{
     handler::server::router::tool::ToolRouter, handler::server::wrapper::Parameters, model::*,
-    schemars, tool, tool_handler, tool_router, ClientHandler, RoleServer, ServerHandler,
-    ServiceExt, service::RequestContext,
+    schemars, service::RequestContext, tool, tool_handler, tool_router, ClientHandler, RoleServer,
+    ServerHandler, ServiceExt,
 };
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -102,7 +102,7 @@ impl ServerHandler for DemoServer {
     ) -> Result<ListResourcesResult, ErrorData> {
         Ok(ListResourcesResult {
             resources: vec![
-                RawResource::new("demo://readme", "Demo README".to_string()).no_annotation(),
+                RawResource::new("demo://readme", "Demo README".to_string()).no_annotation()
             ],
             next_cursor: None,
             meta: None,

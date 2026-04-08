@@ -29,5 +29,14 @@ jobs:
       - name: Test
         run: cargo test --all --all-features
 
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all --all-features -- -D warnings
+
+      - name: Doc check
+        run: cargo doc --no-deps --all-features
+
       - name: Build
         run: cargo build --verbose

@@ -95,10 +95,11 @@ fn ctxvm_initialize_response_has_kind_e_tag_and_result_protocol_version() {
         params: Some(serde_json::json!({})),
     });
     let recipient_tags = BaseTransport::create_recipient_tags(&server_pk);
-    let request_event = serializers::mcp_to_nostr_event(&init_req, CTXVM_MESSAGES_KIND, recipient_tags)
-        .expect("request event for response correlation should serialize")
-        .sign_with_keys(&client_keys)
-        .expect("sign request event for correlation");
+    let request_event =
+        serializers::mcp_to_nostr_event(&init_req, CTXVM_MESSAGES_KIND, recipient_tags)
+            .expect("request event for response correlation should serialize")
+            .sign_with_keys(&client_keys)
+            .expect("sign request event for correlation");
 
     let init_resp = JsonRpcMessage::Response(JsonRpcResponse {
         jsonrpc: "2.0".to_string(),
@@ -449,8 +450,7 @@ fn ctxvm_server_announcement_has_kind_and_required_tags() {
     assert!(
         event.tags.iter().any(|t| {
             let parts = t.clone().to_vec();
-            parts.len() == 1
-                && parts.first().map(|s| s.as_str()) == Some(tags::SUPPORT_ENCRYPTION)
+            parts.len() == 1 && parts.first().map(|s| s.as_str()) == Some(tags::SUPPORT_ENCRYPTION)
         }),
         "support_encryption must be present as a single-element tag"
     );
