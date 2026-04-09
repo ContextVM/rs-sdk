@@ -265,17 +265,32 @@ impl NostrClientTransport {
         pending: Arc<RwLock<HashSet<String>>>,
         server_pubkey: PublicKey,
         tx: tokio::sync::mpsc::UnboundedSender<JsonRpcMessage>,
-        _encryption_mode: EncryptionMode,
+        encryption_mode: EncryptionMode,
     ) {
         let mut notifications = client.notifications();
 
         while let Ok(notification) = notifications.recv().await {
             if let RelayPoolNotification::Event { event, .. } = notification {
+                let is_gift_wrap = is_gift_wrap_kind(&event.kind);
+
+                // Enforce mode before decrypt/parse.
+                if violates_encryption_policy(&event.kind, &encryption_mode) {
+                    if is_gift_wrap {
+                        tracing::warn!(
+                            event_id = %event.id.to_hex(),
+                            "Received encrypted response but encryption is disabled"
+                        );
+                    } else {
+                        tracing::warn!(
+                            event_id = %event.id.to_hex(),
+                            "Received unencrypted response but encryption is required"
+                        );
+                    }
+                    continue;
+                }
+
                 // Handle gift-wrapped events
-                let (actual_event_content, actual_pubkey, e_tag) = if event.kind
-                    == Kind::Custom(GIFT_WRAP_KIND)
-                    || event.kind == Kind::Custom(EPHEMERAL_GIFT_WRAP_KIND)
-                {
+                let (actual_event_content, actual_pubkey, e_tag) = if is_gift_wrap {
                     // Single-layer NIP-44 decrypt (matches JS/TS SDK)
                     let signer = match client.signer().await {
                         Ok(s) => s,
@@ -362,6 +377,20 @@ impl NostrClientTransport {
     }
 }
 
+#[inline]
+fn is_gift_wrap_kind(kind: &Kind) -> bool {
+    *kind == Kind::Custom(GIFT_WRAP_KIND) || *kind == Kind::Custom(EPHEMERAL_GIFT_WRAP_KIND)
+}
+
+/// Returns `true` when the inbound event kind violates the configured encryption
+/// policy and must be dropped before any further processing.
+#[inline]
+fn violates_encryption_policy(kind: &Kind, mode: &EncryptionMode) -> bool {
+    let is_gift_wrap = is_gift_wrap_kind(kind);
+    (is_gift_wrap && *mode == EncryptionMode::Disabled)
+        || (!is_gift_wrap && *mode == EncryptionMode::Required)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -436,5 +465,79 @@ mod tests {
             params: None,
         });
         assert_eq!(init_notif.method(), Some("notifications/initialized"));
+    }
+
+    #[test]
+    fn test_gift_wrap_kind_detection() {
+        assert!(is_gift_wrap_kind(&Kind::Custom(GIFT_WRAP_KIND)));
+        assert!(is_gift_wrap_kind(&Kind::Custom(EPHEMERAL_GIFT_WRAP_KIND)));
+        assert!(!is_gift_wrap_kind(&Kind::Custom(CTXVM_MESSAGES_KIND)));
+    }
+
+    #[test]
+    fn test_required_mode_drops_plaintext() {
+        let plaintext_kind = Kind::Custom(CTXVM_MESSAGES_KIND);
+        assert!(
+            violates_encryption_policy(&plaintext_kind, &EncryptionMode::Required),
+            "Required mode must reject plaintext (non-gift-wrap) events"
+        );
+    }
+
+    #[test]
+    fn test_disabled_mode_drops_encrypted() {
+        assert!(
+            violates_encryption_policy(&Kind::Custom(GIFT_WRAP_KIND), &EncryptionMode::Disabled),
+            "Disabled mode must reject gift-wrap events"
+        );
+        assert!(
+            violates_encryption_policy(
+                &Kind::Custom(EPHEMERAL_GIFT_WRAP_KIND),
+                &EncryptionMode::Disabled
+            ),
+            "Disabled mode must reject ephemeral gift-wrap events"
+        );
+    }
+
+    #[test]
+    fn test_optional_mode_accepts_all() {
+        let plaintext = Kind::Custom(CTXVM_MESSAGES_KIND);
+        let gift_wrap = Kind::Custom(GIFT_WRAP_KIND);
+        let ephemeral = Kind::Custom(EPHEMERAL_GIFT_WRAP_KIND);
+        assert!(!violates_encryption_policy(
+            &plaintext,
+            &EncryptionMode::Optional
+        ));
+        assert!(!violates_encryption_policy(
+            &gift_wrap,
+            &EncryptionMode::Optional
+        ));
+        assert!(!violates_encryption_policy(
+            &ephemeral,
+            &EncryptionMode::Optional
+        ));
+    }
+
+    #[test]
+    fn test_required_mode_accepts_encrypted() {
+        assert!(
+            !violates_encryption_policy(&Kind::Custom(GIFT_WRAP_KIND), &EncryptionMode::Required),
+            "Required mode must accept gift-wrap events"
+        );
+        assert!(
+            !violates_encryption_policy(
+                &Kind::Custom(EPHEMERAL_GIFT_WRAP_KIND),
+                &EncryptionMode::Required
+            ),
+            "Required mode must accept ephemeral gift-wrap events"
+        );
+    }
+
+    #[test]
+    fn test_disabled_mode_accepts_plaintext() {
+        let plaintext = Kind::Custom(CTXVM_MESSAGES_KIND);
+        assert!(
+            !violates_encryption_policy(&plaintext, &EncryptionMode::Disabled),
+            "Disabled mode must accept plaintext events"
+        );
     }
 }
