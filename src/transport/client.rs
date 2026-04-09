@@ -293,7 +293,9 @@ impl NostrClientTransport {
                             match serde_json::from_str::<Event>(&decrypted_json) {
                                 Ok(inner) => {
                                     if let Err(e) = inner.verify() {
-                                        tracing::warn!("Inner event signature verification failed: {e}");
+                                        tracing::warn!(
+                                            "Inner event signature verification failed: {e}"
+                                        );
                                         continue;
                                     }
                                     let e_tag = serializers::get_tag_value(&inner.tags, "e");
@@ -348,9 +350,7 @@ impl NostrClientTransport {
                 }
 
                 // Parse MCP message
-                if let Some(mcp_msg) =
-                    validation::validate_and_parse(&actual_event_content)
-                {
+                if let Some(mcp_msg) = validation::validate_and_parse(&actual_event_content) {
                     // Clean up pending request
                     if let Some(ref correlated_id) = e_tag {
                         pending.write().await.remove(correlated_id.as_str());

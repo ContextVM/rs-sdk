@@ -279,15 +279,12 @@ mod tests {
             .unwrap();
 
         // Step 2: tamper the pubkey (keep original, now-invalid, signature)
-        let mut forged_json: serde_json::Value =
-            serde_json::to_value(&inner_event).unwrap();
-        forged_json["pubkey"] =
-            serde_json::Value::String(impersonated.public_key().to_hex());
+        let mut forged_json: serde_json::Value = serde_json::to_value(&inner_event).unwrap();
+        forged_json["pubkey"] = serde_json::Value::String(impersonated.public_key().to_hex());
         let forged_str = serde_json::to_string(&forged_json).unwrap();
 
         // Step 3: gift-wrap the forged payload
-        let (gift_wrap, _) =
-            create_simple_gift_wrap(&forged_str, &recipient.public_key()).await;
+        let (gift_wrap, _) = create_simple_gift_wrap(&forged_str, &recipient.public_key()).await;
 
         // Decrypt + parse both succeed — the forgery is syntactically valid
         let decrypted = decrypt_gift_wrap_single_layer(&recipient, &gift_wrap)
