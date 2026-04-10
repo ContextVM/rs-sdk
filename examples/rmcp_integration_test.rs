@@ -101,7 +101,10 @@ impl Mode {
     }
 
     fn run_cep19_notification_matrix(self) -> bool {
-        matches!(self, Self::Cep19NotificationMatrix | Self::Cep19All | Self::All)
+        matches!(
+            self,
+            Self::Cep19NotificationMatrix | Self::Cep19All | Self::All
+        )
     }
 }
 
@@ -698,7 +701,9 @@ async fn run_single_cep19_response_case(relay_url: &str, case: Cep19ResponseCase
             DemoServer::new(),
         )
         .await
-        .with_context(|| format!("failed to start CEP-19 matrix server on relay {relay_url_owned}"))?;
+        .with_context(|| {
+            format!("failed to start CEP-19 matrix server on relay {relay_url_owned}")
+        })?;
 
         let _ = server
             .waiting()
@@ -779,7 +784,10 @@ async fn run_single_cep19_response_case(relay_url: &str, case: Cep19ResponseCase
             assert_no_response_for_id(&mut rx, &init_id, CEP19_NEGATIVE_WAIT, case.name).await?;
         }
 
-        proxy.stop().await.context("failed to stop CEP-19 matrix proxy")?;
+        proxy
+            .stop()
+            .await
+            .context("failed to stop CEP-19 matrix proxy")?;
         Ok(())
     }
     .await;
@@ -829,7 +837,10 @@ async fn run_cep19_learning_case(relay_url: &str) -> Result<()> {
 
     let init_id = serde_json::json!("cep19-learning-init");
     client
-        .send(&initialize_request(init_id.clone(), "cep19-learning-client"))
+        .send(&initialize_request(
+            init_id.clone(),
+            "cep19-learning-client",
+        ))
         .await?;
     let incoming_init = receive_server_request(
         &mut server_phase1_rx,
@@ -954,11 +965,7 @@ async fn run_single_cep19_notification_case(
 
     let mut server = NostrServerTransport::new(
         server_keys,
-        server_transport_config_with_modes(
-            relay_url,
-            EncryptionMode::Optional,
-            case.server_mode,
-        ),
+        server_transport_config_with_modes(relay_url, EncryptionMode::Optional, case.server_mode),
     )
     .await?;
     server.start().await?;
@@ -977,9 +984,9 @@ async fn run_single_cep19_notification_case(
     )
     .await?;
     client.start().await?;
-    let mut client_rx = client.take_message_receiver().ok_or_else(|| {
-        anyhow!("failed to acquire client receiver in CEP-19 notification case")
-    })?;
+    let mut client_rx = client
+        .take_message_receiver()
+        .ok_or_else(|| anyhow!("failed to acquire client receiver in CEP-19 notification case"))?;
 
     let init_id = serde_json::json!(format!("cep19-notif-init-{}", case.name));
     client
@@ -988,13 +995,12 @@ async fn run_single_cep19_notification_case(
             "cep19-notification-matrix-client",
         ))
         .await?;
-    let incoming_init =
-        receive_server_request(
-            &mut server_rx,
-            "CEP-19 notification matrix initialize request",
-            "initialize",
-        )
-        .await?;
+    let incoming_init = receive_server_request(
+        &mut server_rx,
+        "CEP-19 notification matrix initialize request",
+        "initialize",
+    )
+    .await?;
     server
         .send_response(&incoming_init.event_id, initialize_result_response())
         .await?;
@@ -1014,13 +1020,12 @@ async fn run_single_cep19_notification_case(
 
     let tools_id = serde_json::json!(format!("cep19-notif-tools-{}", case.name));
     client.send(&tools_list_request(tools_id.clone())).await?;
-    let incoming_tools =
-        receive_server_request(
-            &mut server_rx,
-            "CEP-19 notification matrix tools/list request",
-            "tools/list",
-        )
-        .await?;
+    let incoming_tools = receive_server_request(
+        &mut server_rx,
+        "CEP-19 notification matrix tools/list request",
+        "tools/list",
+    )
+    .await?;
 
     server
         .send_notification(
@@ -1068,11 +1073,7 @@ async fn run_single_cep19_notification_case(
 }
 
 fn server_config(relay_url: &str) -> GatewayConfig {
-    server_config_with_modes(
-        relay_url,
-        EncryptionMode::Optional,
-        GiftWrapMode::Optional,
-    )
+    server_config_with_modes(relay_url, EncryptionMode::Optional, GiftWrapMode::Optional)
 }
 
 fn server_config_with_modes(
@@ -1337,7 +1338,8 @@ async fn wait_for_client_message_with_id(
             .await
             .with_context(|| format!("timed out waiting for client message during {stage}"))?;
 
-        let msg = maybe_msg.ok_or_else(|| anyhow!("client response channel closed during {stage}"))?;
+        let msg =
+            maybe_msg.ok_or_else(|| anyhow!("client response channel closed during {stage}"))?;
 
         if msg.id() == Some(expected_id) {
             return Ok(msg);
@@ -1368,7 +1370,8 @@ async fn wait_for_response_and_track_notification(
         let maybe_msg = timeout(remaining, rx.recv())
             .await
             .context("timed out while waiting for tracked response")?;
-        let msg = maybe_msg.ok_or_else(|| anyhow!("client channel closed while tracking response"))?;
+        let msg =
+            maybe_msg.ok_or_else(|| anyhow!("client channel closed while tracking response"))?;
 
         if msg.method() == Some(notification_method) {
             saw_notification = true;

@@ -295,8 +295,7 @@ impl NostrClientTransport {
                 let outer_kind = event.kind.as_u16();
                 // Handle gift-wrapped events
                 let (actual_event_content, actual_pubkey, e_tag, verified_tags, event_kind) =
-                    if outer_kind == GIFT_WRAP_KIND || outer_kind == EPHEMERAL_GIFT_WRAP_KIND
-                    {
+                    if outer_kind == GIFT_WRAP_KIND || outer_kind == EPHEMERAL_GIFT_WRAP_KIND {
                         let event_kind = outer_kind;
                         if !Self::accepts_encrypted_event(
                             encryption_mode,

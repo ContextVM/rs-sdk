@@ -825,8 +825,7 @@ impl NostrServerTransport {
             if let RelayPoolNotification::Event { event, .. } = notification {
                 let outer_kind = event.kind.as_u16();
                 let (content, sender_pubkey, event_id, is_encrypted, incoming_gift_wrap_kind) =
-                    if outer_kind == GIFT_WRAP_KIND || outer_kind == EPHEMERAL_GIFT_WRAP_KIND
-                    {
+                    if outer_kind == GIFT_WRAP_KIND || outer_kind == EPHEMERAL_GIFT_WRAP_KIND {
                         let event_kind = outer_kind;
                         if !gift_wrap_mode.allows_kind(event_kind) {
                             tracing::warn!(
