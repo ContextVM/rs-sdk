@@ -4,12 +4,19 @@
 //! 1) local rmcp transport (in-process duplex)
 //! 2) hybrid relay mode (rmcp server + legacy JSON-RPC client)
 //! 3) full rmcp over relays (rmcp server + rmcp client)
+//! 4) CEP-19 response mode matrix (persistent/ephemeral/optional combinations)
+//! 5) CEP-19 optional-mode learning upgrade path
+//! 6) CEP-19 notification mode matrix
 //!
 //! Run:
 //!   cargo run --example rmcp_integration_test --features rmcp
 //!   cargo run --example rmcp_integration_test --features rmcp -- local
 //!   cargo run --example rmcp_integration_test --features rmcp -- hybrid
 //!   cargo run --example rmcp_integration_test --features rmcp -- relay-rmcp
+//!   cargo run --example rmcp_integration_test --features rmcp -- cep19-response-matrix
+//!   cargo run --example rmcp_integration_test --features rmcp -- cep19-learning
+//!   cargo run --example rmcp_integration_test --features rmcp -- cep19-notification-matrix
+//!   cargo run --example rmcp_integration_test --features rmcp -- cep19-all
 //!   cargo run --example rmcp_integration_test --features rmcp -- all
 //!
 //! Optional relay override:
@@ -19,14 +26,16 @@
 use anyhow::{anyhow, bail, Context, Result};
 use contextvm_sdk::core::constants::mcp_protocol_version;
 use contextvm_sdk::core::types::{
-    EncryptionMode, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest,
-    ServerInfo as CtxServerInfo,
+    EncryptionMode, GiftWrapMode, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest,
+    JsonRpcResponse, ServerInfo as CtxServerInfo,
 };
 use contextvm_sdk::gateway::{GatewayConfig, NostrMCPGateway};
 use contextvm_sdk::proxy::{NostrMCPProxy, ProxyConfig};
 use contextvm_sdk::signer;
-use contextvm_sdk::transport::client::NostrClientTransportConfig;
-use contextvm_sdk::transport::server::NostrServerTransportConfig;
+use contextvm_sdk::transport::client::{NostrClientTransport, NostrClientTransportConfig};
+use contextvm_sdk::transport::server::{
+    IncomingRequest, NostrServerTransport, NostrServerTransportConfig,
+};
 use rmcp::{
     handler::server::wrapper::Parameters, model::*, schemars, service::RequestContext, tool,
     tool_handler, tool_router, ClientHandler, RoleServer, ServerHandler, ServiceExt,
@@ -40,12 +49,17 @@ const DEFAULT_RELAY_URL: &str = "wss://relay.primal.net";
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
 const RELAY_WARMUP: Duration = Duration::from_secs(2);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
+const CEP19_NEGATIVE_WAIT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Local,
     Hybrid,
     RelayRmcp,
+    Cep19ResponseMatrix,
+    Cep19Learning,
+    Cep19NotificationMatrix,
+    Cep19All,
     All,
 }
 
@@ -55,8 +69,14 @@ impl Mode {
             "local" => Ok(Self::Local),
             "hybrid" => Ok(Self::Hybrid),
             "relay-rmcp" => Ok(Self::RelayRmcp),
+            "cep19-response-matrix" => Ok(Self::Cep19ResponseMatrix),
+            "cep19-learning" => Ok(Self::Cep19Learning),
+            "cep19-notification-matrix" => Ok(Self::Cep19NotificationMatrix),
+            "cep19-all" => Ok(Self::Cep19All),
             "all" => Ok(Self::All),
-            other => bail!("Unknown mode '{other}'. Use one of: local | hybrid | relay-rmcp | all"),
+            other => bail!(
+                "Unknown mode '{other}'. Use one of: local | hybrid | relay-rmcp | cep19-response-matrix | cep19-learning | cep19-notification-matrix | cep19-all | all"
+            ),
         }
     }
 
@@ -70,6 +90,18 @@ impl Mode {
 
     fn run_relay_rmcp(self) -> bool {
         matches!(self, Self::RelayRmcp | Self::All)
+    }
+
+    fn run_cep19_response_matrix(self) -> bool {
+        matches!(self, Self::Cep19ResponseMatrix | Self::Cep19All | Self::All)
+    }
+
+    fn run_cep19_learning(self) -> bool {
+        matches!(self, Self::Cep19Learning | Self::Cep19All | Self::All)
+    }
+
+    fn run_cep19_notification_matrix(self) -> bool {
+        matches!(self, Self::Cep19NotificationMatrix | Self::Cep19All | Self::All)
     }
 }
 
@@ -233,6 +265,18 @@ async fn main() -> Result<()> {
 
     if mode.run_relay_rmcp() {
         run_relay_rmcp_case(&relay_url).await?;
+    }
+
+    if mode.run_cep19_response_matrix() {
+        run_cep19_response_matrix_case(&relay_url).await?;
+    }
+
+    if mode.run_cep19_learning() {
+        run_cep19_learning_case(&relay_url).await?;
+    }
+
+    if mode.run_cep19_notification_matrix() {
+        run_cep19_notification_matrix_case(&relay_url).await?;
     }
 
     println!("\nAll selected integration scenarios passed.");
@@ -570,11 +614,477 @@ async fn run_relay_rmcp_case(relay_url: &str) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct Cep19ResponseCase {
+    name: &'static str,
+    server_mode: GiftWrapMode,
+    client_mode: GiftWrapMode,
+    expect_success: bool,
+}
+
+#[derive(Clone, Copy)]
+struct Cep19NotificationCase {
+    name: &'static str,
+    server_mode: GiftWrapMode,
+    client_mode: GiftWrapMode,
+    expect_notification: bool,
+}
+
+async fn run_cep19_response_matrix_case(relay_url: &str) -> Result<()> {
+    println!("[cep19-response-matrix] start");
+
+    let cases = [
+        Cep19ResponseCase {
+            name: "persistent-persistent",
+            server_mode: GiftWrapMode::Persistent,
+            client_mode: GiftWrapMode::Persistent,
+            expect_success: true,
+        },
+        Cep19ResponseCase {
+            name: "ephemeral-ephemeral",
+            server_mode: GiftWrapMode::Ephemeral,
+            client_mode: GiftWrapMode::Ephemeral,
+            expect_success: true,
+        },
+        Cep19ResponseCase {
+            name: "persistent-server-ephemeral-client",
+            server_mode: GiftWrapMode::Persistent,
+            client_mode: GiftWrapMode::Ephemeral,
+            expect_success: false,
+        },
+        Cep19ResponseCase {
+            name: "ephemeral-server-persistent-client",
+            server_mode: GiftWrapMode::Ephemeral,
+            client_mode: GiftWrapMode::Persistent,
+            expect_success: false,
+        },
+        Cep19ResponseCase {
+            name: "optional-server-persistent-client",
+            server_mode: GiftWrapMode::Optional,
+            client_mode: GiftWrapMode::Persistent,
+            expect_success: true,
+        },
+        Cep19ResponseCase {
+            name: "optional-server-ephemeral-client",
+            server_mode: GiftWrapMode::Optional,
+            client_mode: GiftWrapMode::Ephemeral,
+            expect_success: true,
+        },
+    ];
+
+    for case in cases {
+        run_single_cep19_response_case(relay_url, case).await?;
+    }
+
+    println!("[cep19-response-matrix] pass");
+    Ok(())
+}
+
+async fn run_single_cep19_response_case(relay_url: &str, case: Cep19ResponseCase) -> Result<()> {
+    println!(
+        "[cep19-response-matrix] case={} server_mode={:?} client_mode={:?}",
+        case.name, case.server_mode, case.client_mode
+    );
+
+    let server_keys = signer::generate();
+    let server_pubkey_hex = server_keys.public_key().to_hex();
+
+    let relay_url_owned = relay_url.to_string();
+    let server_mode = case.server_mode;
+    let server_task = tokio::spawn(async move {
+        let server = NostrMCPGateway::serve_handler(
+            server_keys,
+            server_config_with_modes(&relay_url_owned, EncryptionMode::Optional, server_mode),
+            DemoServer::new(),
+        )
+        .await
+        .with_context(|| format!("failed to start CEP-19 matrix server on relay {relay_url_owned}"))?;
+
+        let _ = server
+            .waiting()
+            .await
+            .map_err(|e| anyhow!("CEP-19 matrix server exited with error: {e}"))?;
+
+        Err(anyhow!("CEP-19 matrix server stopped unexpectedly"))
+    });
+
+    sleep(RELAY_WARMUP).await;
+
+    if server_task.is_finished() {
+        let res = server_task
+            .await
+            .map_err(|e| anyhow!("CEP-19 matrix server task join error: {e}"))?;
+        return res.context("CEP-19 matrix server ended before client startup");
+    }
+
+    let outcome: Result<()> = async {
+        let mut proxy = timeout(
+            STARTUP_TIMEOUT,
+            NostrMCPProxy::new(
+                signer::generate(),
+                client_config_with_modes(
+                    relay_url,
+                    server_pubkey_hex.clone(),
+                    EncryptionMode::Optional,
+                    case.client_mode,
+                ),
+            ),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "timed out creating CEP-19 matrix proxy client after {:?}",
+                STARTUP_TIMEOUT
+            )
+        })?
+        .context("failed to create CEP-19 matrix proxy client")?;
+
+        let mut rx = timeout(STARTUP_TIMEOUT, proxy.start())
+            .await
+            .with_context(|| {
+                format!(
+                    "timed out starting CEP-19 matrix proxy transport after {:?}",
+                    STARTUP_TIMEOUT
+                )
+            })?
+            .context("failed to start CEP-19 matrix proxy")?;
+
+        let init_id = serde_json::json!(format!("cep19-response-init-{}", case.name));
+        let init_request = initialize_request(init_id.clone(), "cep19-response-matrix-client");
+
+        if case.expect_success {
+            let init_response =
+                send_legacy_request_and_wait(&proxy, &mut rx, init_request, &init_id).await?;
+            assert_initialize_shape(&init_response)?;
+
+            proxy
+                .send(&initialized_notification())
+                .await
+                .context("failed to send initialized notification")?;
+
+            let tools_id = serde_json::json!(format!("cep19-response-tools-{}", case.name));
+            let tools_response = send_legacy_request_and_wait(
+                &proxy,
+                &mut rx,
+                tools_list_request(tools_id.clone()),
+                &tools_id,
+            )
+            .await?;
+            let _ = extract_tools_list(&tools_response)?;
+        } else {
+            proxy
+                .send(&init_request)
+                .await
+                .context("failed to send initialize request in negative CEP-19 case")?;
+            assert_no_response_for_id(&mut rx, &init_id, CEP19_NEGATIVE_WAIT, case.name).await?;
+        }
+
+        proxy.stop().await.context("failed to stop CEP-19 matrix proxy")?;
+        Ok(())
+    }
+    .await;
+
+    server_task.abort();
+    if server_task.is_finished() {
+        let _ = server_task.await;
+    }
+
+    outcome.with_context(|| format!("CEP-19 response matrix case '{}' failed", case.name))
+}
+
+async fn run_cep19_learning_case(relay_url: &str) -> Result<()> {
+    println!("[cep19-learning] start");
+
+    let server_keys = signer::generate();
+    let server_pubkey_hex = server_keys.public_key().to_hex();
+
+    let mut server_phase1 = NostrServerTransport::new(
+        server_keys.clone(),
+        server_transport_config_with_modes(
+            relay_url,
+            EncryptionMode::Optional,
+            GiftWrapMode::Optional,
+        ),
+    )
+    .await?;
+    server_phase1.start().await?;
+    let mut server_phase1_rx = server_phase1
+        .take_message_receiver()
+        .ok_or_else(|| anyhow!("failed to acquire server phase 1 receiver"))?;
+
+    let mut client = NostrClientTransport::new(
+        signer::generate(),
+        client_transport_config_with_modes(
+            relay_url,
+            server_pubkey_hex.clone(),
+            EncryptionMode::Optional,
+            GiftWrapMode::Optional,
+        ),
+    )
+    .await?;
+    client.start().await?;
+    let mut client_rx = client
+        .take_message_receiver()
+        .ok_or_else(|| anyhow!("failed to acquire client receiver in CEP-19 learning case"))?;
+
+    let init_id = serde_json::json!("cep19-learning-init");
+    client
+        .send(&initialize_request(init_id.clone(), "cep19-learning-client"))
+        .await?;
+    let incoming_init = receive_server_request(
+        &mut server_phase1_rx,
+        "CEP-19 learning phase 1 initialize request",
+        "initialize",
+    )
+    .await?;
+    server_phase1
+        .send_response(&incoming_init.event_id, initialize_result_response())
+        .await?;
+
+    let init_response = wait_for_client_message_with_id(
+        &mut client_rx,
+        &init_id,
+        IO_TIMEOUT,
+        "CEP-19 learning phase 1 initialize response",
+    )
+    .await?;
+    assert_initialize_shape(&init_response)?;
+
+    if !client.server_supports_ephemeral_encryption() {
+        bail!(
+            "CEP-19 learning case failed: optional-mode client did not learn server ephemeral support"
+        );
+    }
+
+    server_phase1.close().await?;
+    sleep(RELAY_WARMUP).await;
+
+    let mut server_phase2 = NostrServerTransport::new(
+        server_keys,
+        server_transport_config_with_modes(
+            relay_url,
+            EncryptionMode::Optional,
+            GiftWrapMode::Ephemeral,
+        ),
+    )
+    .await?;
+    server_phase2.start().await?;
+    let mut server_phase2_rx = server_phase2
+        .take_message_receiver()
+        .ok_or_else(|| anyhow!("failed to acquire server phase 2 receiver"))?;
+
+    let tools_id = serde_json::json!("cep19-learning-tools");
+    client.send(&tools_list_request(tools_id.clone())).await?;
+
+    let incoming_tools = receive_server_request(
+        &mut server_phase2_rx,
+        "CEP-19 learning phase 2 tools/list request",
+        "tools/list",
+    )
+    .await?;
+    server_phase2
+        .send_response(&incoming_tools.event_id, tools_list_response())
+        .await?;
+
+    let tools_response = wait_for_client_message_with_id(
+        &mut client_rx,
+        &tools_id,
+        IO_TIMEOUT,
+        "CEP-19 learning phase 2 tools/list response",
+    )
+    .await?;
+    let _ = extract_tools_list(&tools_response)?;
+
+    server_phase2.close().await?;
+    client.close().await?;
+
+    println!("[cep19-learning] pass");
+    Ok(())
+}
+
+async fn run_cep19_notification_matrix_case(relay_url: &str) -> Result<()> {
+    println!("[cep19-notification-matrix] start");
+
+    let cases = [
+        Cep19NotificationCase {
+            name: "optional-server-ephemeral-client",
+            server_mode: GiftWrapMode::Optional,
+            client_mode: GiftWrapMode::Ephemeral,
+            expect_notification: false,
+        },
+        Cep19NotificationCase {
+            name: "optional-server-persistent-client",
+            server_mode: GiftWrapMode::Optional,
+            client_mode: GiftWrapMode::Persistent,
+            expect_notification: true,
+        },
+        Cep19NotificationCase {
+            name: "ephemeral-server-ephemeral-client",
+            server_mode: GiftWrapMode::Ephemeral,
+            client_mode: GiftWrapMode::Ephemeral,
+            expect_notification: true,
+        },
+        Cep19NotificationCase {
+            name: "persistent-server-persistent-client",
+            server_mode: GiftWrapMode::Persistent,
+            client_mode: GiftWrapMode::Persistent,
+            expect_notification: true,
+        },
+    ];
+
+    for case in cases {
+        run_single_cep19_notification_case(relay_url, case).await?;
+    }
+
+    println!("[cep19-notification-matrix] pass");
+    Ok(())
+}
+
+async fn run_single_cep19_notification_case(
+    relay_url: &str,
+    case: Cep19NotificationCase,
+) -> Result<()> {
+    println!(
+        "[cep19-notification-matrix] case={} server_mode={:?} client_mode={:?}",
+        case.name, case.server_mode, case.client_mode
+    );
+
+    let server_keys = signer::generate();
+    let server_pubkey_hex = server_keys.public_key().to_hex();
+
+    let mut server = NostrServerTransport::new(
+        server_keys,
+        server_transport_config_with_modes(
+            relay_url,
+            EncryptionMode::Optional,
+            case.server_mode,
+        ),
+    )
+    .await?;
+    server.start().await?;
+    let mut server_rx = server
+        .take_message_receiver()
+        .ok_or_else(|| anyhow!("failed to acquire server receiver in CEP-19 notification case"))?;
+
+    let mut client = NostrClientTransport::new(
+        signer::generate(),
+        client_transport_config_with_modes(
+            relay_url,
+            server_pubkey_hex,
+            EncryptionMode::Optional,
+            case.client_mode,
+        ),
+    )
+    .await?;
+    client.start().await?;
+    let mut client_rx = client.take_message_receiver().ok_or_else(|| {
+        anyhow!("failed to acquire client receiver in CEP-19 notification case")
+    })?;
+
+    let init_id = serde_json::json!(format!("cep19-notif-init-{}", case.name));
+    client
+        .send(&initialize_request(
+            init_id.clone(),
+            "cep19-notification-matrix-client",
+        ))
+        .await?;
+    let incoming_init =
+        receive_server_request(
+            &mut server_rx,
+            "CEP-19 notification matrix initialize request",
+            "initialize",
+        )
+        .await?;
+    server
+        .send_response(&incoming_init.event_id, initialize_result_response())
+        .await?;
+    let init_response = wait_for_client_message_with_id(
+        &mut client_rx,
+        &init_id,
+        IO_TIMEOUT,
+        "CEP-19 notification matrix initialize response",
+    )
+    .await?;
+    assert_initialize_shape(&init_response)?;
+
+    client
+        .send(&initialized_notification())
+        .await
+        .context("failed to send initialized notification in CEP-19 notification matrix")?;
+
+    let tools_id = serde_json::json!(format!("cep19-notif-tools-{}", case.name));
+    client.send(&tools_list_request(tools_id.clone())).await?;
+    let incoming_tools =
+        receive_server_request(
+            &mut server_rx,
+            "CEP-19 notification matrix tools/list request",
+            "tools/list",
+        )
+        .await?;
+
+    server
+        .send_notification(
+            &incoming_tools.client_pubkey,
+            &payment_required_notification(),
+            Some(&incoming_tools.event_id),
+        )
+        .await?;
+    server
+        .send_response(&incoming_tools.event_id, tools_list_response())
+        .await?;
+
+    let (tools_response, mut saw_notification) = wait_for_response_and_track_notification(
+        &mut client_rx,
+        &tools_id,
+        "notifications/payment_required",
+        IO_TIMEOUT,
+    )
+    .await?;
+    let _ = extract_tools_list(&tools_response)?;
+
+    if case.expect_notification && !saw_notification {
+        saw_notification = wait_for_notification_method(
+            &mut client_rx,
+            "notifications/payment_required",
+            Duration::from_secs(5),
+        )
+        .await?;
+    }
+
+    if saw_notification != case.expect_notification {
+        bail!(
+            "CEP-19 notification matrix case '{}' expected notification_seen={} but got {}",
+            case.name,
+            case.expect_notification,
+            saw_notification
+        );
+    }
+
+    server.close().await?;
+    client.close().await?;
+
+    println!("[cep19-notification-matrix] case={} pass", case.name);
+    Ok(())
+}
+
 fn server_config(relay_url: &str) -> GatewayConfig {
+    server_config_with_modes(
+        relay_url,
+        EncryptionMode::Optional,
+        GiftWrapMode::Optional,
+    )
+}
+
+fn server_config_with_modes(
+    relay_url: &str,
+    encryption_mode: EncryptionMode,
+    gift_wrap_mode: GiftWrapMode,
+) -> GatewayConfig {
     GatewayConfig {
         nostr_config: NostrServerTransportConfig {
             relay_urls: vec![relay_url.to_string()],
-            encryption_mode: EncryptionMode::Optional,
+            encryption_mode,
+            gift_wrap_mode,
             server_info: Some(CtxServerInfo {
                 name: Some("rmcp-matrix-server".to_string()),
                 about: Some("rmcp matrix coverage server".to_string()),
@@ -587,14 +1097,140 @@ fn server_config(relay_url: &str) -> GatewayConfig {
 }
 
 fn client_config(relay_url: &str, server_pubkey: String) -> ProxyConfig {
+    client_config_with_modes(
+        relay_url,
+        server_pubkey,
+        EncryptionMode::Optional,
+        GiftWrapMode::Optional,
+    )
+}
+
+fn client_config_with_modes(
+    relay_url: &str,
+    server_pubkey: String,
+    encryption_mode: EncryptionMode,
+    gift_wrap_mode: GiftWrapMode,
+) -> ProxyConfig {
     ProxyConfig {
         nostr_config: NostrClientTransportConfig {
             relay_urls: vec![relay_url.to_string()],
             server_pubkey,
-            encryption_mode: EncryptionMode::Optional,
+            encryption_mode,
+            gift_wrap_mode,
             ..Default::default()
         },
     }
+}
+
+fn server_transport_config_with_modes(
+    relay_url: &str,
+    encryption_mode: EncryptionMode,
+    gift_wrap_mode: GiftWrapMode,
+) -> NostrServerTransportConfig {
+    NostrServerTransportConfig {
+        relay_urls: vec![relay_url.to_string()],
+        encryption_mode,
+        gift_wrap_mode,
+        server_info: Some(CtxServerInfo {
+            name: Some("cep19-transport-server".to_string()),
+            about: Some("CEP-19 transport matrix server".to_string()),
+            ..Default::default()
+        }),
+        is_announced_server: false,
+        ..Default::default()
+    }
+}
+
+fn client_transport_config_with_modes(
+    relay_url: &str,
+    server_pubkey: String,
+    encryption_mode: EncryptionMode,
+    gift_wrap_mode: GiftWrapMode,
+) -> NostrClientTransportConfig {
+    NostrClientTransportConfig {
+        relay_urls: vec![relay_url.to_string()],
+        server_pubkey,
+        encryption_mode,
+        gift_wrap_mode,
+        ..Default::default()
+    }
+}
+
+fn initialize_request(id: serde_json::Value, client_name: &str) -> JsonRpcMessage {
+    JsonRpcMessage::Request(JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id,
+        method: "initialize".to_string(),
+        params: Some(serde_json::json!({
+            "protocolVersion": mcp_protocol_version(),
+            "capabilities": {
+                "tools": {},
+                "resources": {}
+            },
+            "clientInfo": {
+                "name": client_name,
+                "version": "0.1.0"
+            }
+        })),
+    })
+}
+
+fn tools_list_request(id: serde_json::Value) -> JsonRpcMessage {
+    JsonRpcMessage::Request(JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id,
+        method: "tools/list".to_string(),
+        params: Some(serde_json::json!({})),
+    })
+}
+
+fn initialized_notification() -> JsonRpcMessage {
+    JsonRpcMessage::Notification(JsonRpcNotification {
+        jsonrpc: "2.0".to_string(),
+        method: "notifications/initialized".to_string(),
+        params: None,
+    })
+}
+
+fn payment_required_notification() -> JsonRpcMessage {
+    JsonRpcMessage::Notification(JsonRpcNotification {
+        jsonrpc: "2.0".to_string(),
+        method: "notifications/payment_required".to_string(),
+        params: Some(serde_json::json!({
+            "reason": "cep19-matrix-check"
+        })),
+    })
+}
+
+fn initialize_result_response() -> JsonRpcMessage {
+    JsonRpcMessage::Response(JsonRpcResponse {
+        jsonrpc: "2.0".to_string(),
+        id: serde_json::json!(0),
+        result: serde_json::json!({
+            "protocolVersion": mcp_protocol_version(),
+            "serverInfo": {
+                "name": "cep19-matrix-server",
+                "version": "0.1.0"
+            },
+            "capabilities": {
+                "tools": {},
+                "resources": {}
+            }
+        }),
+    })
+}
+
+fn tools_list_response() -> JsonRpcMessage {
+    JsonRpcMessage::Response(JsonRpcResponse {
+        jsonrpc: "2.0".to_string(),
+        id: serde_json::json!(0),
+        result: serde_json::json!({
+            "tools": [{
+                "name": "echo",
+                "description": "Echo tool for CEP-19 matrix testing"
+            }]
+        }),
+    })
 }
 
 async fn send_legacy_request_and_wait(
@@ -618,6 +1254,154 @@ async fn send_legacy_request_and_wait(
 
         if msg.is_notification() {
             continue;
+        }
+    }
+}
+
+async fn assert_no_response_for_id(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<JsonRpcMessage>,
+    expected_id: &serde_json::Value,
+    wait_for: Duration,
+    case_name: &str,
+) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + wait_for;
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Ok(());
+        }
+
+        let remaining = deadline.saturating_duration_since(now);
+        match timeout(remaining, rx.recv()).await {
+            Ok(Some(msg)) => {
+                if msg.id() == Some(expected_id) {
+                    bail!(
+                        "CEP-19 case '{case_name}' unexpectedly received response for id {expected_id}"
+                    );
+                }
+            }
+            Ok(None) => return Ok(()),
+            Err(_) => return Ok(()),
+        }
+    }
+}
+
+async fn receive_server_request(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<IncomingRequest>,
+    stage: &str,
+    expected_method: &str,
+) -> Result<IncomingRequest> {
+    let deadline = tokio::time::Instant::now() + IO_TIMEOUT;
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            bail!(
+                "timed out waiting for server request method '{}' during {}",
+                expected_method,
+                stage
+            );
+        }
+
+        let remaining = deadline.saturating_duration_since(now);
+        let maybe_msg = timeout(remaining, rx.recv())
+            .await
+            .with_context(|| format!("timed out waiting for server request during {stage}"))?;
+        let msg =
+            maybe_msg.ok_or_else(|| anyhow!("server request channel closed during {stage}"))?;
+
+        if msg.message.is_request() && msg.message.method() == Some(expected_method) {
+            return Ok(msg);
+        }
+    }
+}
+
+async fn wait_for_client_message_with_id(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<JsonRpcMessage>,
+    expected_id: &serde_json::Value,
+    timeout_duration: Duration,
+    stage: &str,
+) -> Result<JsonRpcMessage> {
+    let deadline = tokio::time::Instant::now() + timeout_duration;
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            bail!(
+                "timed out waiting for client message id {} during {}",
+                expected_id,
+                stage
+            );
+        }
+
+        let remaining = deadline.saturating_duration_since(now);
+        let maybe_msg = timeout(remaining, rx.recv())
+            .await
+            .with_context(|| format!("timed out waiting for client message during {stage}"))?;
+
+        let msg = maybe_msg.ok_or_else(|| anyhow!("client response channel closed during {stage}"))?;
+
+        if msg.id() == Some(expected_id) {
+            return Ok(msg);
+        }
+    }
+}
+
+async fn wait_for_response_and_track_notification(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<JsonRpcMessage>,
+    expected_id: &serde_json::Value,
+    notification_method: &str,
+    timeout_duration: Duration,
+) -> Result<(JsonRpcMessage, bool)> {
+    let deadline = tokio::time::Instant::now() + timeout_duration;
+    let mut saw_notification = false;
+
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            bail!(
+                "timed out waiting for response id {} while tracking notification {}",
+                expected_id,
+                notification_method
+            );
+        }
+
+        let remaining = deadline.saturating_duration_since(now);
+        let maybe_msg = timeout(remaining, rx.recv())
+            .await
+            .context("timed out while waiting for tracked response")?;
+        let msg = maybe_msg.ok_or_else(|| anyhow!("client channel closed while tracking response"))?;
+
+        if msg.method() == Some(notification_method) {
+            saw_notification = true;
+        }
+
+        if msg.id() == Some(expected_id) {
+            return Ok((msg, saw_notification));
+        }
+    }
+}
+
+async fn wait_for_notification_method(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<JsonRpcMessage>,
+    notification_method: &str,
+    timeout_duration: Duration,
+) -> Result<bool> {
+    let deadline = tokio::time::Instant::now() + timeout_duration;
+
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Ok(false);
+        }
+
+        let remaining = deadline.saturating_duration_since(now);
+        match timeout(remaining, rx.recv()).await {
+            Ok(Some(msg)) => {
+                if msg.method() == Some(notification_method) {
+                    return Ok(true);
+                }
+            }
+            Ok(None) => return Ok(false),
+            Err(_) => return Ok(false),
         }
     }
 }
