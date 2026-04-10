@@ -29,6 +29,8 @@ pub struct NostrServerTransportConfig {
     pub relay_urls: Vec<String>,
     /// Encryption mode.
     pub encryption_mode: EncryptionMode,
+    /// Gift-wrap policy for encrypted messages.
+    pub gift_wrap_mode: GiftWrapMode,
     /// Server information for announcements.
     pub server_info: Option<ServerInfo>,
     /// Whether this server publishes public announcements (CEP-6).
@@ -50,6 +52,7 @@ impl Default for NostrServerTransportConfig {
         Self {
             relay_urls: vec!["wss://relay.damus.io".to_string()],
             encryption_mode: EncryptionMode::Optional,
+            gift_wrap_mode: GiftWrapMode::Optional,
             server_info: None,
             is_announced_server: false,
             allowed_public_keys: Vec::new(),
@@ -65,6 +68,10 @@ impl Default for NostrServerTransportConfig {
 pub struct NostrServerTransport {
     base: BaseTransport,
     config: NostrServerTransportConfig,
+    /// Extra common discovery tags to include in server announcements and first responses.
+    extra_common_tags: Vec<Tag>,
+    /// Pricing tags to include in announcements and capability list responses.
+    pricing_tags: Vec<Tag>,
     /// Client sessions: client_pubkey_hex → ClientSession
     sessions: Arc<RwLock<HashMap<String, ClientSession>>>,
     /// Reverse lookup: event_id → client_pubkey_hex
@@ -110,6 +117,7 @@ impl NostrServerTransport {
             relay_count = config.relay_urls.len(),
             announced = config.is_announced_server,
             encryption_mode = ?config.encryption_mode,
+            gift_wrap_mode = ?config.gift_wrap_mode,
             "Created server transport"
         );
         Ok(Self {
@@ -119,6 +127,8 @@ impl NostrServerTransport {
                 is_connected: false,
             },
             config,
+            extra_common_tags: Vec::new(),
+            pricing_tags: Vec::new(),
             sessions: Arc::new(RwLock::new(HashMap::new())),
             event_to_client: Arc::new(RwLock::new(HashMap::new())),
             message_tx: tx,
@@ -168,23 +178,25 @@ impl NostrServerTransport {
             })?;
 
         // Spawn event loop
-        let client = self.base.relay_pool.client().clone();
+        let relay_pool = self.base.relay_pool.clone();
         let sessions = self.sessions.clone();
         let event_to_client = self.event_to_client.clone();
         let tx = self.message_tx.clone();
         let allowed = self.config.allowed_public_keys.clone();
         let excluded = self.config.excluded_capabilities.clone();
         let encryption_mode = self.config.encryption_mode;
+        let gift_wrap_mode = self.config.gift_wrap_mode;
 
         tokio::spawn(async move {
             Self::event_loop(
-                client,
+                relay_pool,
                 sessions,
                 event_to_client,
                 tx,
                 allowed,
                 excluded,
                 encryption_mode,
+                gift_wrap_mode,
             )
             .await;
         });
@@ -259,17 +271,29 @@ impl NostrServerTransport {
             Error::Other(format!("No session for client {client_pubkey_hex}"))
         })?;
 
-        // Restore original request ID
-        if let Some(original_id) = session.pending_requests.get(event_id) {
-            match &mut response {
-                JsonRpcMessage::Response(r) => r.id = original_id.clone(),
-                JsonRpcMessage::ErrorResponse(r) => r.id = original_id.clone(),
-                _ => {}
-            }
-        }
-
+        let route = session
+            .pending_requests
+            .get(event_id)
+            .cloned()
+            .ok_or_else(|| {
+                tracing::error!(
+                    target: LOG_TARGET,
+                    client_pubkey = %client_pubkey_hex,
+                    event_id = %event_id,
+                    "No pending route for correlated response"
+                );
+                Error::Other(format!("No pending route for event {event_id}"))
+            })?;
         let is_encrypted = session.is_encrypted;
+        let should_attach_common_tags = !session.has_sent_common_tags;
         drop(sessions);
+
+        // Restore original request ID
+        match &mut response {
+            JsonRpcMessage::Response(r) => r.id = route.original_request_id.clone(),
+            JsonRpcMessage::ErrorResponse(r) => r.id = route.original_request_id.clone(),
+            _ => {}
+        }
 
         let client_pubkey = PublicKey::from_hex(&client_pubkey_hex).map_err(|error| {
             tracing::error!(
@@ -291,7 +315,21 @@ impl NostrServerTransport {
             Error::Other(error.to_string())
         })?;
 
-        let tags = BaseTransport::create_response_tags(&client_pubkey, &event_id_parsed);
+        let mut tags = BaseTransport::create_response_tags(&client_pubkey, &event_id_parsed);
+        if should_attach_common_tags {
+            Self::append_common_response_tags(
+                &mut tags,
+                self.config.server_info.as_ref(),
+                &self.extra_common_tags,
+                self.config.encryption_mode,
+                self.config.gift_wrap_mode,
+            );
+        } else if Self::is_initialize_result_response(&response) {
+            tags.extend(Self::server_info_tags(self.config.server_info.as_ref()));
+        }
+        if Self::is_capability_list_response(&response) {
+            tags.extend(self.pricing_tags.iter().cloned());
+        }
 
         self.base
             .send_mcp_message(
@@ -300,6 +338,11 @@ impl NostrServerTransport {
                 CTXVM_MESSAGES_KIND,
                 tags,
                 Some(is_encrypted),
+                Self::select_outbound_gift_wrap_kind(
+                    self.config.gift_wrap_mode,
+                    is_encrypted,
+                    route.wrap_kind,
+                ),
             )
             .await
             .map_err(|error| {
@@ -316,11 +359,14 @@ impl NostrServerTransport {
         // Clean up
         let mut sessions = self.sessions.write().await;
         if let Some(session) = sessions.get_mut(&client_pubkey_hex) {
-            // Clean up progress token
-            if let Some(token) = session.event_to_progress_token.remove(event_id) {
-                session.pending_requests.remove(&token);
+            if let Some(removed_route) = session.pending_requests.remove(event_id) {
+                if let Some(token) = removed_route.progress_token {
+                    session.progress_token_to_event.remove(&token);
+                }
             }
-            session.pending_requests.remove(event_id);
+            if should_attach_common_tags {
+                session.has_sent_common_tags = true;
+            }
         }
         drop(sessions);
 
@@ -348,13 +394,21 @@ impl NostrServerTransport {
             .get(client_pubkey_hex)
             .ok_or_else(|| Error::Other(format!("No session for {client_pubkey_hex}")))?;
         let is_encrypted = session.is_encrypted;
+        let progress_token = Self::progress_token_from_notification(notification);
+        let correlated_event_id =
+            Self::resolve_notification_correlation(session, notification, correlated_event_id);
+        if progress_token.is_some() && correlated_event_id.is_none() {
+            return Err(Error::Other(format!(
+                "No request route found for progress token in client session {client_pubkey_hex}"
+            )));
+        }
         drop(sessions);
 
         let client_pubkey =
             PublicKey::from_hex(client_pubkey_hex).map_err(|e| Error::Other(e.to_string()))?;
 
         let mut tags = BaseTransport::create_recipient_tags(&client_pubkey);
-        if let Some(eid) = correlated_event_id {
+        if let Some(ref eid) = correlated_event_id {
             let event_id = EventId::from_hex(eid).map_err(|e| Error::Other(e.to_string()))?;
             tags.push(Tag::event(event_id));
         }
@@ -366,6 +420,10 @@ impl NostrServerTransport {
                 CTXVM_MESSAGES_KIND,
                 tags,
                 Some(is_encrypted),
+                Self::select_outbound_notification_gift_wrap_kind(
+                    self.config.gift_wrap_mode,
+                    is_encrypted,
+                ),
             )
             .await?;
 
@@ -402,6 +460,16 @@ impl NostrServerTransport {
         self.message_rx.take()
     }
 
+    /// Sets extra discovery tags to include in announcements and first-response discovery replay.
+    pub fn set_announcement_extra_tags(&mut self, tags: Vec<Tag>) {
+        self.extra_common_tags = tags;
+    }
+
+    /// Sets pricing tags to include in announcement/list events and capability list responses.
+    pub fn set_announcement_pricing_tags(&mut self, tags: Vec<Tag>) {
+        self.pricing_tags = tags;
+    }
+
     /// Publish server announcement (kind 11316).
     pub async fn announce(&self) -> Result<EventId> {
         let info = self
@@ -412,41 +480,14 @@ impl NostrServerTransport {
 
         let content = serde_json::to_string(info)?;
 
-        let mut tags = Vec::new();
-        if let Some(ref name) = info.name {
-            tags.push(Tag::custom(
-                TagKind::Custom(tags::NAME.into()),
-                vec![name.clone()],
-            ));
-        }
-        if let Some(ref about) = info.about {
-            tags.push(Tag::custom(
-                TagKind::Custom(tags::ABOUT.into()),
-                vec![about.clone()],
-            ));
-        }
-        if let Some(ref website) = info.website {
-            tags.push(Tag::custom(
-                TagKind::Custom(tags::WEBSITE.into()),
-                vec![website.clone()],
-            ));
-        }
-        if let Some(ref picture) = info.picture {
-            tags.push(Tag::custom(
-                TagKind::Custom(tags::PICTURE.into()),
-                vec![picture.clone()],
-            ));
-        }
-        if self.config.encryption_mode != EncryptionMode::Disabled {
-            tags.push(Tag::custom(
-                TagKind::Custom(tags::SUPPORT_ENCRYPTION.into()),
-                Vec::<String>::new(),
-            ));
-            tags.push(Tag::custom(
-                TagKind::Custom(tags::SUPPORT_ENCRYPTION_EPHEMERAL.into()),
-                Vec::<String>::new(),
-            ));
-        }
+        let mut tags = Self::server_info_tags(Some(info));
+        Self::append_transport_capability_tags(
+            &mut tags,
+            self.config.encryption_mode,
+            self.config.gift_wrap_mode,
+        );
+        tags.extend(self.extra_common_tags.iter().cloned());
+        tags.extend(self.pricing_tags.iter().cloned());
 
         let builder = EventBuilder::new(Kind::Custom(SERVER_ANNOUNCEMENT_KIND), content).tags(tags);
 
@@ -459,7 +500,8 @@ impl NostrServerTransport {
         let builder = EventBuilder::new(
             Kind::Custom(TOOLS_LIST_KIND),
             serde_json::to_string(&content)?,
-        );
+        )
+        .tags(self.pricing_tags.iter().cloned());
         self.base.relay_pool.publish(builder).await
     }
 
@@ -469,7 +511,8 @@ impl NostrServerTransport {
         let builder = EventBuilder::new(
             Kind::Custom(RESOURCES_LIST_KIND),
             serde_json::to_string(&content)?,
-        );
+        )
+        .tags(self.pricing_tags.iter().cloned());
         self.base.relay_pool.publish(builder).await
     }
 
@@ -479,7 +522,8 @@ impl NostrServerTransport {
         let builder = EventBuilder::new(
             Kind::Custom(PROMPTS_LIST_KIND),
             serde_json::to_string(&content)?,
-        );
+        )
+        .tags(self.pricing_tags.iter().cloned());
         self.base.relay_pool.publish(builder).await
     }
 
@@ -492,21 +536,31 @@ impl NostrServerTransport {
         let builder = EventBuilder::new(
             Kind::Custom(RESOURCETEMPLATES_LIST_KIND),
             serde_json::to_string(&content)?,
-        );
+        )
+        .tags(self.pricing_tags.iter().cloned());
         self.base.relay_pool.publish(builder).await
     }
 
     /// Delete server announcements (NIP-09 kind 5).
     pub async fn delete_announcements(&self, reason: &str) -> Result<()> {
-        // We publish kind 5 events for each announcement kind
         let pubkey = self.base.get_public_key().await?;
-        let _pubkey_hex = pubkey.to_hex();
-
         for kind in UNENCRYPTED_KINDS {
-            let builder = EventBuilder::new(Kind::Custom(5), reason).tag(Tag::custom(
-                TagKind::Custom("k".into()),
-                vec![kind.to_string()],
-            ));
+            let filter = Filter::new().kind(Kind::Custom(*kind)).author(pubkey);
+            let events = self
+                .base
+                .relay_pool
+                .client()
+                .fetch_events(filter, Duration::from_secs(10))
+                .await
+                .map_err(|error| Error::Transport(error.to_string()))?;
+            let deletion_tags: Vec<Tag> = events
+                .into_iter()
+                .map(|event| Tag::event(event.id))
+                .collect();
+            if deletion_tags.is_empty() {
+                continue;
+            }
+            let builder = EventBuilder::new(Kind::Custom(5), reason).tags(deletion_tags);
             self.base.relay_pool.publish(builder).await?;
         }
         Ok(())
@@ -585,99 +639,283 @@ impl NostrServerTransport {
         })
     }
 
+    fn server_info_tags(server_info: Option<&ServerInfo>) -> Vec<Tag> {
+        let mut tags = Vec::new();
+        let Some(info) = server_info else {
+            return tags;
+        };
+
+        if let Some(ref name) = info.name {
+            tags.push(Tag::custom(
+                TagKind::Custom(tags::NAME.into()),
+                vec![name.clone()],
+            ));
+        }
+        if let Some(ref about) = info.about {
+            tags.push(Tag::custom(
+                TagKind::Custom(tags::ABOUT.into()),
+                vec![about.clone()],
+            ));
+        }
+        if let Some(ref website) = info.website {
+            tags.push(Tag::custom(
+                TagKind::Custom(tags::WEBSITE.into()),
+                vec![website.clone()],
+            ));
+        }
+        if let Some(ref picture) = info.picture {
+            tags.push(Tag::custom(
+                TagKind::Custom(tags::PICTURE.into()),
+                vec![picture.clone()],
+            ));
+        }
+
+        tags
+    }
+
+    fn append_transport_capability_tags(
+        tags: &mut Vec<Tag>,
+        encryption_mode: EncryptionMode,
+        gift_wrap_mode: GiftWrapMode,
+    ) {
+        if encryption_mode == EncryptionMode::Disabled {
+            return;
+        }
+
+        tags.push(Tag::custom(
+            TagKind::Custom(crate::core::constants::tags::SUPPORT_ENCRYPTION.into()),
+            Vec::<String>::new(),
+        ));
+
+        if gift_wrap_mode.supports_ephemeral() {
+            tags.push(Tag::custom(
+                TagKind::Custom(crate::core::constants::tags::SUPPORT_ENCRYPTION_EPHEMERAL.into()),
+                Vec::<String>::new(),
+            ));
+        }
+    }
+
+    fn append_common_response_tags(
+        tags: &mut Vec<Tag>,
+        server_info: Option<&ServerInfo>,
+        extra_common_tags: &[Tag],
+        encryption_mode: EncryptionMode,
+        gift_wrap_mode: GiftWrapMode,
+    ) {
+        tags.extend(Self::server_info_tags(server_info));
+        Self::append_transport_capability_tags(tags, encryption_mode, gift_wrap_mode);
+        tags.extend(extra_common_tags.iter().cloned());
+    }
+
+    fn select_outbound_gift_wrap_kind(
+        gift_wrap_mode: GiftWrapMode,
+        is_encrypted: bool,
+        mirrored_kind: Option<u16>,
+    ) -> Option<u16> {
+        if !is_encrypted {
+            return None;
+        }
+
+        Some(match gift_wrap_mode {
+            GiftWrapMode::Persistent => GIFT_WRAP_KIND,
+            GiftWrapMode::Ephemeral => EPHEMERAL_GIFT_WRAP_KIND,
+            GiftWrapMode::Optional => match mirrored_kind {
+                Some(kind) if kind == EPHEMERAL_GIFT_WRAP_KIND => EPHEMERAL_GIFT_WRAP_KIND,
+                _ => GIFT_WRAP_KIND,
+            },
+        })
+    }
+
+    fn select_outbound_notification_gift_wrap_kind(
+        gift_wrap_mode: GiftWrapMode,
+        is_encrypted: bool,
+    ) -> Option<u16> {
+        if !is_encrypted {
+            return None;
+        }
+
+        match gift_wrap_mode {
+            GiftWrapMode::Ephemeral => Some(EPHEMERAL_GIFT_WRAP_KIND),
+            GiftWrapMode::Persistent => Some(GIFT_WRAP_KIND),
+            GiftWrapMode::Optional => None,
+        }
+    }
+
+    fn is_initialize_result_response(message: &JsonRpcMessage) -> bool {
+        let JsonRpcMessage::Response(response) = message else {
+            return false;
+        };
+        response.result.get("protocolVersion").is_some()
+            && response.result.get("serverInfo").is_some()
+    }
+
+    fn is_capability_list_response(message: &JsonRpcMessage) -> bool {
+        let JsonRpcMessage::Response(response) = message else {
+            return false;
+        };
+        let result = &response.result;
+        result.get("tools").is_some()
+            || result.get("resources").is_some()
+            || result.get("resourceTemplates").is_some()
+            || result.get("prompts").is_some()
+    }
+
+    fn progress_token_from_notification(notification: &JsonRpcMessage) -> Option<String> {
+        let JsonRpcMessage::Notification(notification) = notification else {
+            return None;
+        };
+        if notification.method != "notifications/progress" {
+            return None;
+        }
+        notification
+            .params
+            .as_ref()
+            .and_then(|params| params.get("progressToken"))
+            .and_then(|token| token.as_str())
+            .map(str::to_string)
+    }
+
+    fn resolve_notification_correlation(
+        session: &ClientSession,
+        notification: &JsonRpcMessage,
+        correlated_event_id: Option<&str>,
+    ) -> Option<String> {
+        if let Some(event_id) = correlated_event_id {
+            return Some(event_id.to_string());
+        }
+
+        let progress_token = Self::progress_token_from_notification(notification)?;
+        session
+            .progress_token_to_event
+            .get(&progress_token)
+            .cloned()
+    }
+
+    fn unauthorized_error_response(request_id: &serde_json::Value) -> JsonRpcMessage {
+        JsonRpcMessage::ErrorResponse(JsonRpcErrorResponse {
+            jsonrpc: "2.0".to_string(),
+            id: request_id.clone(),
+            error: JsonRpcError {
+                code: -32000,
+                message: "Unauthorized".to_string(),
+                data: None,
+            },
+        })
+    }
+
     async fn event_loop(
-        client: Arc<Client>,
+        relay_pool: Arc<RelayPool>,
         sessions: Arc<RwLock<HashMap<String, ClientSession>>>,
         event_to_client: Arc<RwLock<HashMap<String, String>>>,
         tx: tokio::sync::mpsc::UnboundedSender<IncomingRequest>,
         allowed_pubkeys: Vec<String>,
         excluded_capabilities: Vec<CapabilityExclusion>,
         encryption_mode: EncryptionMode,
+        gift_wrap_mode: GiftWrapMode,
     ) {
+        let client = relay_pool.client().clone();
+        let transport = BaseTransport {
+            relay_pool,
+            encryption_mode,
+            is_connected: true,
+        };
         let mut notifications = client.notifications();
 
         while let Ok(notification) = notifications.recv().await {
             if let RelayPoolNotification::Event { event, .. } = notification {
-                let (content, sender_pubkey, event_id, is_encrypted) = if event.kind
-                    == Kind::Custom(GIFT_WRAP_KIND)
-                    || event.kind == Kind::Custom(EPHEMERAL_GIFT_WRAP_KIND)
-                {
-                    if encryption_mode == EncryptionMode::Disabled {
-                        tracing::warn!(
-                            target: LOG_TARGET,
-                            event_id = %event.id.to_hex(),
-                            sender_pubkey = %event.pubkey.to_hex(),
-                            "Received encrypted message but encryption is disabled"
-                        );
-                        continue;
-                    }
-                    // Single-layer NIP-44 decrypt (matches JS/TS SDK)
-                    let signer = match client.signer().await {
-                        Ok(s) => s,
-                        Err(error) => {
-                            tracing::error!(
+                let outer_kind = event.kind.as_u16();
+                let (content, sender_pubkey, event_id, is_encrypted, incoming_gift_wrap_kind) =
+                    if outer_kind == GIFT_WRAP_KIND || outer_kind == EPHEMERAL_GIFT_WRAP_KIND
+                    {
+                        let event_kind = outer_kind;
+                        if !gift_wrap_mode.allows_kind(event_kind) {
+                            tracing::warn!(
                                 target: LOG_TARGET,
-                                error = %error,
-                                "Failed to get signer"
+                                event_id = %event.id.to_hex(),
+                                event_kind = event_kind,
+                                configured_mode = ?gift_wrap_mode,
+                                "Skipping gift wrap due to CEP-19 policy"
                             );
                             continue;
                         }
-                    };
-                    match encryption::decrypt_gift_wrap_single_layer(&signer, &event).await {
-                        Ok(decrypted_json) => {
-                            // The decrypted content is JSON of the inner signed event.
-                            // Use the INNER event's ID for correlation — the client
-                            // registers the inner event ID in its correlation store.
-                            match serde_json::from_str::<Event>(&decrypted_json) {
-                                Ok(inner) => {
-                                    if let Err(e) = inner.verify() {
-                                        tracing::warn!(
-                                            "Inner event signature verification failed: {e}"
+                        if encryption_mode == EncryptionMode::Disabled {
+                            tracing::warn!(
+                                target: LOG_TARGET,
+                                event_id = %event.id.to_hex(),
+                                sender_pubkey = %event.pubkey.to_hex(),
+                                "Received encrypted message but encryption is disabled"
+                            );
+                            continue;
+                        }
+                        // Single-layer NIP-44 decrypt (matches JS/TS SDK)
+                        let signer = match client.signer().await {
+                            Ok(s) => s,
+                            Err(error) => {
+                                tracing::error!(
+                                    target: LOG_TARGET,
+                                    error = %error,
+                                    "Failed to get signer"
+                                );
+                                continue;
+                            }
+                        };
+                        match encryption::decrypt_gift_wrap_single_layer(&signer, &event).await {
+                            Ok(decrypted_json) => {
+                                // The decrypted content is JSON of the inner signed event.
+                                // Use the INNER event's ID for correlation — the client
+                                // registers the inner event ID in its correlation store.
+                                match serde_json::from_str::<Event>(&decrypted_json) {
+                                    Ok(inner) => {
+                                        if let Err(e) = inner.verify() {
+                                            tracing::warn!(
+                                                "Inner event signature verification failed: {e}"
+                                            );
+                                            continue;
+                                        }
+                                        (
+                                            inner.content,
+                                            inner.pubkey.to_hex(),
+                                            inner.id.to_hex(),
+                                            true,
+                                            Some(event_kind),
+                                        )
+                                    }
+                                    Err(error) => {
+                                        tracing::error!(
+                                            target: LOG_TARGET,
+                                            error = %error,
+                                            "Failed to parse inner event"
                                         );
                                         continue;
                                     }
-                                    (
-                                        inner.content,
-                                        inner.pubkey.to_hex(),
-                                        inner.id.to_hex(),
-                                        true,
-                                    )
-                                }
-                                Err(error) => {
-                                    tracing::error!(
-                                        target: LOG_TARGET,
-                                        error = %error,
-                                        "Failed to parse inner event"
-                                    );
-                                    continue;
                                 }
                             }
+                            Err(error) => {
+                                tracing::error!(
+                                    target: LOG_TARGET,
+                                    error = %error,
+                                    "Failed to decrypt"
+                                );
+                                continue;
+                            }
                         }
-                        Err(error) => {
-                            tracing::error!(
+                    } else {
+                        if encryption_mode == EncryptionMode::Required {
+                            tracing::warn!(
                                 target: LOG_TARGET,
-                                error = %error,
-                                "Failed to decrypt"
+                                sender_pubkey = %event.pubkey.to_hex(),
+                                "Received unencrypted message but encryption is required"
                             );
                             continue;
                         }
-                    }
-                } else {
-                    if encryption_mode == EncryptionMode::Required {
-                        tracing::warn!(
-                            target: LOG_TARGET,
-                            sender_pubkey = %event.pubkey.to_hex(),
-                            "Received unencrypted message but encryption is required"
-                        );
-                        continue;
-                    }
-                    (
-                        event.content.clone(),
-                        event.pubkey.to_hex(),
-                        event.id.to_hex(),
-                        false,
-                    )
-                };
+                        (
+                            event.content.clone(),
+                            event.pubkey.to_hex(),
+                            event.id.to_hex(),
+                            false,
+                            None,
+                        )
+                    };
 
                 // Parse MCP message
                 let mcp_msg = match validation::validate_and_parse(&content) {
@@ -714,6 +952,36 @@ impl NostrServerTransport {
                             method = method,
                             "Unauthorized request"
                         );
+                        if let JsonRpcMessage::Request(ref request) = mcp_msg {
+                            if let Ok(client_pubkey) = PublicKey::from_hex(&sender_pubkey) {
+                                let mut tags = BaseTransport::create_response_tags(
+                                    &client_pubkey,
+                                    &EventId::from_hex(&event_id).unwrap_or(event.id),
+                                );
+                                if let Err(error) = transport
+                                    .send_mcp_message(
+                                        &Self::unauthorized_error_response(&request.id),
+                                        &client_pubkey,
+                                        CTXVM_MESSAGES_KIND,
+                                        std::mem::take(&mut tags),
+                                        Some(is_encrypted),
+                                        Self::select_outbound_gift_wrap_kind(
+                                            gift_wrap_mode,
+                                            is_encrypted,
+                                            incoming_gift_wrap_kind,
+                                        ),
+                                    )
+                                    .await
+                                {
+                                    tracing::error!(
+                                        target: LOG_TARGET,
+                                        error = %error,
+                                        client_pubkey = %sender_pubkey,
+                                        "Failed to send unauthorized response"
+                                    );
+                                }
+                            }
+                        }
                         continue;
                     }
                 }
@@ -728,29 +996,30 @@ impl NostrServerTransport {
 
                 // Track request for correlation
                 if let JsonRpcMessage::Request(ref req) = mcp_msg {
-                    let original_id = req.id.clone();
-                    session
-                        .pending_requests
-                        .insert(event_id.clone(), original_id);
-                    event_to_client
-                        .write()
-                        .await
-                        .insert(event_id.clone(), sender_pubkey.clone());
-
-                    // Track progress token
-                    if let Some(token) = req
+                    let progress_token = req
                         .params
                         .as_ref()
                         .and_then(|p| p.get("_meta"))
                         .and_then(|m| m.get("progressToken"))
                         .and_then(|t| t.as_str())
-                    {
+                        .map(str::to_string);
+                    session.pending_requests.insert(
+                        event_id.clone(),
+                        PendingRequestRoute {
+                            original_request_id: req.id.clone(),
+                            progress_token: progress_token.clone(),
+                            wrap_kind: incoming_gift_wrap_kind,
+                        },
+                    );
+                    event_to_client
+                        .write()
+                        .await
+                        .insert(event_id.clone(), sender_pubkey.clone());
+
+                    if let Some(token) = progress_token {
                         session
-                            .pending_requests
-                            .insert(token.to_string(), serde_json::json!(event_id));
-                        session
-                            .event_to_progress_token
-                            .insert(event_id.clone(), token.to_string());
+                            .progress_token_to_event
+                            .insert(token, event_id.clone());
                     }
                 }
 
@@ -789,9 +1058,6 @@ impl NostrServerTransport {
                 for event_id in session.pending_requests.keys() {
                     event_map.remove(event_id);
                 }
-                for event_id in session.event_to_progress_token.keys() {
-                    event_map.remove(event_id);
-                }
                 tracing::debug!(
                     target: LOG_TARGET,
                     client_pubkey = %pubkey,
@@ -819,9 +1085,10 @@ mod tests {
     fn test_client_session_creation() {
         let session = ClientSession::new(true);
         assert!(!session.is_initialized);
+        assert!(!session.has_sent_common_tags);
         assert!(session.is_encrypted);
         assert!(session.pending_requests.is_empty());
-        assert!(session.event_to_progress_token.is_empty());
+        assert!(session.progress_token_to_event.is_empty());
     }
 
     #[test]
@@ -840,9 +1107,17 @@ mod tests {
 
         // Insert a session with an old activity time
         let mut session = ClientSession::new(false);
+        session.pending_requests.insert(
+            "evt1".to_string(),
+            PendingRequestRoute {
+                original_request_id: serde_json::json!(1),
+                progress_token: Some("token1".to_string()),
+                wrap_kind: None,
+            },
+        );
         session
-            .pending_requests
-            .insert("evt1".to_string(), serde_json::json!(1));
+            .progress_token_to_event
+            .insert("token1".to_string(), "evt1".to_string());
         sessions
             .write()
             .await
@@ -898,12 +1173,27 @@ mod tests {
     #[test]
     fn test_pending_request_tracking() {
         let mut session = ClientSession::new(false);
+        let route = PendingRequestRoute {
+            original_request_id: serde_json::json!(42),
+            progress_token: None,
+            wrap_kind: Some(GIFT_WRAP_KIND),
+        };
         session
             .pending_requests
-            .insert("event_abc".to_string(), serde_json::json!(42));
+            .insert("event_abc".to_string(), route.clone());
         assert_eq!(
-            session.pending_requests.get("event_abc"),
-            Some(&serde_json::json!(42))
+            session
+                .pending_requests
+                .get("event_abc")
+                .map(|route| route.original_request_id.clone()),
+            Some(serde_json::json!(42))
+        );
+        assert_eq!(
+            session
+                .pending_requests
+                .get("event_abc")
+                .and_then(|route| route.wrap_kind),
+            route.wrap_kind
         );
     }
 
@@ -911,14 +1201,19 @@ mod tests {
     fn test_progress_token_tracking() {
         let mut session = ClientSession::new(false);
         session
-            .event_to_progress_token
-            .insert("evt1".to_string(), "token1".to_string());
-        session
-            .pending_requests
-            .insert("token1".to_string(), serde_json::json!("evt1"));
+            .progress_token_to_event
+            .insert("token1".to_string(), "evt1".to_string());
+        session.pending_requests.insert(
+            "evt1".to_string(),
+            PendingRequestRoute {
+                original_request_id: serde_json::json!("evt1"),
+                progress_token: Some("token1".to_string()),
+                wrap_kind: None,
+            },
+        );
         assert_eq!(
-            session.event_to_progress_token.get("evt1"),
-            Some(&"token1".to_string())
+            session.progress_token_to_event.get("token1"),
+            Some(&"evt1".to_string())
         );
     }
 
@@ -1017,6 +1312,151 @@ mod tests {
     fn test_encryption_mode_default() {
         let config = NostrServerTransportConfig::default();
         assert_eq!(config.encryption_mode, EncryptionMode::Optional);
+        assert_eq!(config.gift_wrap_mode, GiftWrapMode::Optional);
+    }
+
+    #[test]
+    fn test_append_transport_capability_tags_respects_gift_wrap_mode() {
+        let mut tags = Vec::new();
+        NostrServerTransport::append_transport_capability_tags(
+            &mut tags,
+            EncryptionMode::Optional,
+            GiftWrapMode::Persistent,
+        );
+        let rendered: Vec<Vec<String>> = tags.iter().cloned().map(|t| t.to_vec()).collect();
+        assert!(rendered
+            .iter()
+            .any(|t| t[0] == crate::core::constants::tags::SUPPORT_ENCRYPTION));
+        assert!(!rendered
+            .iter()
+            .any(|t| { t[0] == crate::core::constants::tags::SUPPORT_ENCRYPTION_EPHEMERAL }));
+
+        let mut tags = Vec::new();
+        NostrServerTransport::append_transport_capability_tags(
+            &mut tags,
+            EncryptionMode::Optional,
+            GiftWrapMode::Optional,
+        );
+        let rendered: Vec<Vec<String>> = tags.iter().cloned().map(|t| t.to_vec()).collect();
+        assert!(rendered
+            .iter()
+            .any(|t| { t[0] == crate::core::constants::tags::SUPPORT_ENCRYPTION_EPHEMERAL }));
+    }
+
+    #[test]
+    fn test_select_outbound_gift_wrap_kind_optional_mode_mirrors_client_kind() {
+        assert_eq!(
+            NostrServerTransport::select_outbound_gift_wrap_kind(
+                GiftWrapMode::Optional,
+                true,
+                Some(EPHEMERAL_GIFT_WRAP_KIND),
+            ),
+            Some(EPHEMERAL_GIFT_WRAP_KIND)
+        );
+        assert_eq!(
+            NostrServerTransport::select_outbound_gift_wrap_kind(
+                GiftWrapMode::Optional,
+                true,
+                Some(GIFT_WRAP_KIND),
+            ),
+            Some(GIFT_WRAP_KIND)
+        );
+        assert_eq!(
+            NostrServerTransport::select_outbound_gift_wrap_kind(
+                GiftWrapMode::Persistent,
+                true,
+                Some(EPHEMERAL_GIFT_WRAP_KIND),
+            ),
+            Some(GIFT_WRAP_KIND)
+        );
+        assert_eq!(
+            NostrServerTransport::select_outbound_gift_wrap_kind(
+                GiftWrapMode::Ephemeral,
+                true,
+                Some(GIFT_WRAP_KIND),
+            ),
+            Some(EPHEMERAL_GIFT_WRAP_KIND)
+        );
+    }
+
+    #[test]
+    fn test_select_outbound_notification_gift_wrap_kind_optional_mode_uses_default_persistent() {
+        assert_eq!(
+            NostrServerTransport::select_outbound_notification_gift_wrap_kind(
+                GiftWrapMode::Optional,
+                true,
+            ),
+            None
+        );
+        assert_eq!(
+            NostrServerTransport::select_outbound_notification_gift_wrap_kind(
+                GiftWrapMode::Persistent,
+                true,
+            ),
+            Some(GIFT_WRAP_KIND)
+        );
+        assert_eq!(
+            NostrServerTransport::select_outbound_notification_gift_wrap_kind(
+                GiftWrapMode::Ephemeral,
+                true,
+            ),
+            Some(EPHEMERAL_GIFT_WRAP_KIND)
+        );
+    }
+
+    #[test]
+    fn test_resolve_notification_correlation_uses_progress_token_mapping() {
+        let mut session = ClientSession::new(true);
+        session
+            .progress_token_to_event
+            .insert("token1".to_string(), "evt1".to_string());
+        let notification = JsonRpcMessage::Notification(JsonRpcNotification {
+            jsonrpc: "2.0".to_string(),
+            method: "notifications/progress".to_string(),
+            params: Some(serde_json::json!({ "progressToken": "token1" })),
+        });
+
+        assert_eq!(
+            NostrServerTransport::resolve_notification_correlation(&session, &notification, None),
+            Some("evt1".to_string())
+        );
+    }
+
+    #[test]
+    fn test_common_response_tags_include_server_info_and_transport_capabilities() {
+        let mut tags = Vec::new();
+        NostrServerTransport::append_common_response_tags(
+            &mut tags,
+            Some(&ServerInfo {
+                name: Some("Demo".to_string()),
+                ..Default::default()
+            }),
+            &[Tag::custom(
+                TagKind::Custom("x-demo".into()),
+                Vec::<String>::new(),
+            )],
+            EncryptionMode::Optional,
+            GiftWrapMode::Optional,
+        );
+        let rendered: Vec<Vec<String>> = tags.iter().cloned().map(|tag| tag.to_vec()).collect();
+        assert!(rendered
+            .iter()
+            .any(|tag| tag[0] == crate::core::constants::tags::NAME));
+        assert!(rendered
+            .iter()
+            .any(|tag| tag[0] == crate::core::constants::tags::SUPPORT_ENCRYPTION));
+        assert!(rendered.iter().any(|tag| tag[0] == "x-demo"));
+    }
+
+    #[test]
+    fn test_unauthorized_error_response_shape() {
+        let response = NostrServerTransport::unauthorized_error_response(&serde_json::json!(1));
+        let JsonRpcMessage::ErrorResponse(response) = response else {
+            panic!("expected JSON-RPC error response");
+        };
+        assert_eq!(response.id, serde_json::json!(1));
+        assert_eq!(response.error.code, -32000);
+        assert_eq!(response.error.message, "Unauthorized");
     }
 
     // ── Config defaults ─────────────────────────────────────────
@@ -1030,6 +1470,7 @@ mod tests {
         assert!(config.excluded_capabilities.is_empty());
         assert_eq!(config.cleanup_interval, Duration::from_secs(60));
         assert_eq!(config.session_timeout, Duration::from_secs(300));
+        assert_eq!(config.gift_wrap_mode, GiftWrapMode::Optional);
         assert!(config.server_info.is_none());
         assert!(config.log_file_path.is_none());
     }

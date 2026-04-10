@@ -4,6 +4,7 @@
 //! kind 25910 events, correlates responses via `e` tag.
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -31,6 +32,8 @@ pub struct NostrClientTransportConfig {
     pub server_pubkey: String,
     /// Encryption mode.
     pub encryption_mode: EncryptionMode,
+    /// Gift-wrap policy for encrypted messages.
+    pub gift_wrap_mode: GiftWrapMode,
     /// Stateless mode: emulate initialize response locally.
     pub is_stateless: bool,
     /// Response timeout (default: 30s).
@@ -45,6 +48,7 @@ impl Default for NostrClientTransportConfig {
             relay_urls: vec!["wss://relay.damus.io".to_string()],
             server_pubkey: String::new(),
             encryption_mode: EncryptionMode::Optional,
+            gift_wrap_mode: GiftWrapMode::Optional,
             is_stateless: false,
             timeout: Duration::from_secs(30),
             log_file_path: None,
@@ -59,6 +63,8 @@ pub struct NostrClientTransport {
     server_pubkey: PublicKey,
     /// Pending request event IDs awaiting responses.
     pending_requests: Arc<RwLock<HashSet<String>>>,
+    /// Learned support for server-side ephemeral gift wraps.
+    server_supports_ephemeral: Arc<AtomicBool>,
     /// Channel for receiving processed MCP messages from the event loop.
     message_tx: tokio::sync::mpsc::UnboundedSender<JsonRpcMessage>,
     message_rx: Option<tokio::sync::mpsc::UnboundedReceiver<JsonRpcMessage>>,
@@ -108,6 +114,7 @@ impl NostrClientTransport {
             config,
             server_pubkey,
             pending_requests: Arc::new(RwLock::new(HashSet::new())),
+            server_supports_ephemeral: Arc::new(AtomicBool::new(false)),
             message_tx: tx,
             message_rx: Some(rx),
         })
@@ -160,9 +167,20 @@ impl NostrClientTransport {
         let server_pubkey = self.server_pubkey;
         let tx = self.message_tx.clone();
         let encryption_mode = self.config.encryption_mode;
+        let gift_wrap_mode = self.config.gift_wrap_mode;
+        let server_supports_ephemeral = self.server_supports_ephemeral.clone();
 
         tokio::spawn(async move {
-            Self::event_loop(client, pending, server_pubkey, tx, encryption_mode).await;
+            Self::event_loop(
+                client,
+                pending,
+                server_pubkey,
+                tx,
+                encryption_mode,
+                gift_wrap_mode,
+                server_supports_ephemeral,
+            )
+            .await;
         });
 
         tracing::info!(
@@ -204,6 +222,7 @@ impl NostrClientTransport {
                 CTXVM_MESSAGES_KIND,
                 tags,
                 None,
+                Some(self.choose_outbound_gift_wrap_kind()),
             )
             .await
             .map_err(|error| {
@@ -265,63 +284,107 @@ impl NostrClientTransport {
         pending: Arc<RwLock<HashSet<String>>>,
         server_pubkey: PublicKey,
         tx: tokio::sync::mpsc::UnboundedSender<JsonRpcMessage>,
-        _encryption_mode: EncryptionMode,
+        encryption_mode: EncryptionMode,
+        gift_wrap_mode: GiftWrapMode,
+        server_supports_ephemeral: Arc<AtomicBool>,
     ) {
         let mut notifications = client.notifications();
 
         while let Ok(notification) = notifications.recv().await {
             if let RelayPoolNotification::Event { event, .. } = notification {
+                let outer_kind = event.kind.as_u16();
                 // Handle gift-wrapped events
-                let (actual_event_content, actual_pubkey, e_tag) = if event.kind
-                    == Kind::Custom(GIFT_WRAP_KIND)
-                    || event.kind == Kind::Custom(EPHEMERAL_GIFT_WRAP_KIND)
-                {
-                    // Single-layer NIP-44 decrypt (matches JS/TS SDK)
-                    let signer = match client.signer().await {
-                        Ok(s) => s,
-                        Err(error) => {
-                            tracing::error!(
+                let (actual_event_content, actual_pubkey, e_tag, verified_tags, event_kind) =
+                    if outer_kind == GIFT_WRAP_KIND || outer_kind == EPHEMERAL_GIFT_WRAP_KIND
+                    {
+                        let event_kind = outer_kind;
+                        if !Self::accepts_encrypted_event(
+                            encryption_mode,
+                            gift_wrap_mode,
+                            event_kind,
+                        ) {
+                            let reason = if encryption_mode == EncryptionMode::Disabled {
+                                "Skipping encrypted response because client encryption is disabled"
+                            } else {
+                                "Skipping gift wrap due to CEP-19 policy"
+                            };
+                            tracing::warn!(
                                 target: LOG_TARGET,
-                                error = %error,
-                                "Failed to get signer"
+                                event_id = %event.id.to_hex(),
+                                event_kind = event_kind,
+                                configured_mode = ?gift_wrap_mode,
+                                reason
                             );
                             continue;
                         }
-                    };
-                    match encryption::decrypt_gift_wrap_single_layer(&signer, &event).await {
-                        Ok(decrypted_json) => {
-                            match serde_json::from_str::<Event>(&decrypted_json) {
-                                Ok(inner) => {
-                                    if let Err(e) = inner.verify() {
-                                        tracing::warn!("Inner event signature verification failed: {e}");
+                        // Single-layer NIP-44 decrypt
+                        let signer = match client.signer().await {
+                            Ok(s) => s,
+                            Err(error) => {
+                                tracing::error!(
+                                    target: LOG_TARGET,
+                                    error = %error,
+                                    "Failed to get signer"
+                                );
+                                continue;
+                            }
+                        };
+                        match encryption::decrypt_gift_wrap_single_layer(&signer, &event).await {
+                            Ok(decrypted_json) => {
+                                match serde_json::from_str::<Event>(&decrypted_json) {
+                                    Ok(inner) => {
+                                        if let Err(e) = inner.verify() {
+                                            tracing::warn!(
+                                                "Inner event signature verification failed: {e}"
+                                            );
+                                            continue;
+                                        }
+                                        let e_tag = serializers::get_tag_value(&inner.tags, "e");
+                                        (
+                                            inner.content,
+                                            inner.pubkey,
+                                            e_tag,
+                                            inner.tags,
+                                            Some(event_kind),
+                                        )
+                                    }
+                                    Err(error) => {
+                                        tracing::error!(
+                                            target: LOG_TARGET,
+                                            error = %error,
+                                            "Failed to parse inner event"
+                                        );
                                         continue;
                                     }
-                                    let e_tag = serializers::get_tag_value(&inner.tags, "e");
-                                    (inner.content, inner.pubkey, e_tag)
-                                }
-                                Err(error) => {
-                                    tracing::error!(
-                                        target: LOG_TARGET,
-                                        error = %error,
-                                        "Failed to parse inner event"
-                                    );
-                                    continue;
                                 }
                             }
+                            Err(error) => {
+                                tracing::error!(
+                                    target: LOG_TARGET,
+                                    error = %error,
+                                    "Failed to decrypt gift wrap"
+                                );
+                                continue;
+                            }
                         }
-                        Err(error) => {
-                            tracing::error!(
+                    } else {
+                        if !Self::accepts_plaintext_event(encryption_mode) {
+                            tracing::warn!(
                                 target: LOG_TARGET,
-                                error = %error,
-                                "Failed to decrypt gift wrap"
+                                event_id = %event.id.to_hex(),
+                                "Skipping plaintext response because client encryption is required"
                             );
                             continue;
                         }
-                    }
-                } else {
-                    let e_tag = serializers::get_tag_value(&event.tags, "e");
-                    (event.content.clone(), event.pubkey, e_tag)
-                };
+                        let e_tag = serializers::get_tag_value(&event.tags, "e");
+                        (
+                            event.content.clone(),
+                            event.pubkey,
+                            e_tag,
+                            event.tags.clone(),
+                            None,
+                        )
+                    };
 
                 // Verify it's from our server
                 if actual_pubkey != server_pubkey {
@@ -334,31 +397,98 @@ impl NostrClientTransport {
                     continue;
                 }
 
-                // Correlate response
-                if let Some(ref correlated_id) = e_tag {
-                    let is_pending = pending.read().await.contains(correlated_id.as_str());
-                    if !is_pending {
-                        tracing::warn!(
-                            target: LOG_TARGET,
-                            correlated_event_id = %correlated_id,
-                            "Response for unknown request"
-                        );
-                        continue;
-                    }
+                if Self::should_learn_ephemeral_support(
+                    actual_pubkey,
+                    server_pubkey,
+                    event_kind,
+                    &verified_tags,
+                ) {
+                    server_supports_ephemeral.store(true, Ordering::Relaxed);
                 }
 
                 // Parse MCP message
-                if let Some(mcp_msg) =
-                    validation::validate_and_parse(&actual_event_content)
-                {
-                    // Clean up pending request
-                    if let Some(ref correlated_id) = e_tag {
+                if let Some(mcp_msg) = validation::validate_and_parse(&actual_event_content) {
+                    if Self::requires_pending_response_route(&mcp_msg) {
+                        let Some(ref correlated_id) = e_tag else {
+                            tracing::warn!(
+                                target: LOG_TARGET,
+                                "Received JSON-RPC response without correlation e tag"
+                            );
+                            continue;
+                        };
+                        let is_pending = pending.read().await.contains(correlated_id.as_str());
+                        if !is_pending {
+                            tracing::warn!(
+                                target: LOG_TARGET,
+                                correlated_event_id = %correlated_id,
+                                "Response for unknown request"
+                            );
+                            continue;
+                        }
                         pending.write().await.remove(correlated_id.as_str());
                     }
                     let _ = tx.send(mcp_msg);
                 }
             }
         }
+    }
+
+    fn choose_outbound_gift_wrap_kind(&self) -> u16 {
+        match self.config.gift_wrap_mode {
+            GiftWrapMode::Persistent => GIFT_WRAP_KIND,
+            GiftWrapMode::Ephemeral => EPHEMERAL_GIFT_WRAP_KIND,
+            GiftWrapMode::Optional => {
+                if self.server_supports_ephemeral.load(Ordering::Relaxed) {
+                    EPHEMERAL_GIFT_WRAP_KIND
+                } else {
+                    GIFT_WRAP_KIND
+                }
+            }
+        }
+    }
+
+    fn has_support_ephemeral_tag(tags: &Tags) -> bool {
+        tags.iter().any(|tag| {
+            tag.kind()
+                == TagKind::Custom(
+                    crate::core::constants::tags::SUPPORT_ENCRYPTION_EPHEMERAL.into(),
+                )
+        })
+    }
+
+    fn accepts_encrypted_event(
+        encryption_mode: EncryptionMode,
+        gift_wrap_mode: GiftWrapMode,
+        event_kind: u16,
+    ) -> bool {
+        encryption_mode != EncryptionMode::Disabled && gift_wrap_mode.allows_kind(event_kind)
+    }
+
+    fn accepts_plaintext_event(encryption_mode: EncryptionMode) -> bool {
+        encryption_mode != EncryptionMode::Required
+    }
+
+    fn should_learn_ephemeral_support(
+        actual_pubkey: PublicKey,
+        server_pubkey: PublicKey,
+        event_kind: Option<u16>,
+        tags: &Tags,
+    ) -> bool {
+        actual_pubkey == server_pubkey
+            && (event_kind == Some(EPHEMERAL_GIFT_WRAP_KIND)
+                || Self::has_support_ephemeral_tag(tags))
+    }
+
+    fn requires_pending_response_route(message: &JsonRpcMessage) -> bool {
+        matches!(
+            message,
+            JsonRpcMessage::Response(_) | JsonRpcMessage::ErrorResponse(_)
+        )
+    }
+
+    /// Returns whether the client has learned ephemeral gift-wrap support from the server.
+    pub fn server_supports_ephemeral_encryption(&self) -> bool {
+        self.server_supports_ephemeral.load(Ordering::Relaxed)
     }
 }
 
@@ -372,6 +502,7 @@ mod tests {
         assert_eq!(config.relay_urls, vec!["wss://relay.damus.io".to_string()]);
         assert!(config.server_pubkey.is_empty());
         assert_eq!(config.encryption_mode, EncryptionMode::Optional);
+        assert_eq!(config.gift_wrap_mode, GiftWrapMode::Optional);
         assert!(!config.is_stateless);
         assert_eq!(config.timeout, Duration::from_secs(30));
         assert!(config.log_file_path.is_none());
@@ -384,6 +515,100 @@ mod tests {
             ..Default::default()
         };
         assert!(config.is_stateless);
+    }
+
+    #[test]
+    fn test_has_support_ephemeral_tag_detects_capability() {
+        let tags = Tags::from_list(vec![Tag::custom(
+            TagKind::Custom(crate::core::constants::tags::SUPPORT_ENCRYPTION_EPHEMERAL.into()),
+            Vec::<String>::new(),
+        )]);
+        assert!(NostrClientTransport::has_support_ephemeral_tag(&tags));
+    }
+
+    #[test]
+    fn test_accepts_encrypted_event_respects_encryption_and_gift_wrap_policy() {
+        assert!(NostrClientTransport::accepts_encrypted_event(
+            EncryptionMode::Optional,
+            GiftWrapMode::Optional,
+            GIFT_WRAP_KIND,
+        ));
+        assert!(!NostrClientTransport::accepts_encrypted_event(
+            EncryptionMode::Disabled,
+            GiftWrapMode::Optional,
+            GIFT_WRAP_KIND,
+        ));
+        assert!(!NostrClientTransport::accepts_encrypted_event(
+            EncryptionMode::Optional,
+            GiftWrapMode::Persistent,
+            EPHEMERAL_GIFT_WRAP_KIND,
+        ));
+    }
+
+    #[test]
+    fn test_accepts_plaintext_event_respects_required_encryption() {
+        assert!(NostrClientTransport::accepts_plaintext_event(
+            EncryptionMode::Optional
+        ));
+        assert!(!NostrClientTransport::accepts_plaintext_event(
+            EncryptionMode::Required
+        ));
+    }
+
+    #[test]
+    fn test_should_learn_ephemeral_support_requires_matching_server_pubkey() {
+        let server_keys = Keys::generate();
+        let other_keys = Keys::generate();
+        let tags = Tags::from_list(vec![Tag::custom(
+            TagKind::Custom(crate::core::constants::tags::SUPPORT_ENCRYPTION_EPHEMERAL.into()),
+            Vec::<String>::new(),
+        )]);
+
+        assert!(!NostrClientTransport::should_learn_ephemeral_support(
+            other_keys.public_key(),
+            server_keys.public_key(),
+            Some(EPHEMERAL_GIFT_WRAP_KIND),
+            &tags,
+        ));
+        assert!(NostrClientTransport::should_learn_ephemeral_support(
+            server_keys.public_key(),
+            server_keys.public_key(),
+            Some(EPHEMERAL_GIFT_WRAP_KIND),
+            &tags,
+        ));
+    }
+
+    #[test]
+    fn test_requires_pending_response_route_only_for_jsonrpc_responses() {
+        let response = JsonRpcMessage::Response(JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: serde_json::json!(1),
+            result: serde_json::json!({}),
+        });
+        let error = JsonRpcMessage::ErrorResponse(JsonRpcErrorResponse {
+            jsonrpc: "2.0".to_string(),
+            id: serde_json::json!(1),
+            error: JsonRpcError {
+                code: -1,
+                message: "oops".to_string(),
+                data: None,
+            },
+        });
+        let notification = JsonRpcMessage::Notification(JsonRpcNotification {
+            jsonrpc: "2.0".to_string(),
+            method: "payment_required".to_string(),
+            params: Some(serde_json::json!({})),
+        });
+
+        assert!(NostrClientTransport::requires_pending_response_route(
+            &response
+        ));
+        assert!(NostrClientTransport::requires_pending_response_route(
+            &error
+        ));
+        assert!(!NostrClientTransport::requires_pending_response_route(
+            &notification
+        ));
     }
 
     #[test]
