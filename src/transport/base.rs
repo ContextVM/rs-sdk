@@ -55,19 +55,17 @@ impl BaseTransport {
 
     /// Subscribe to events targeting a pubkey (both regular and encrypted).
     ///
-    /// Uses two filters: one for ephemeral ContextVM messages (kind 25910)
-    /// with `since: now()`, and one for NIP-59 gift wraps (kind 1059) without
-    /// a `since` constraint. Gift wraps use randomized timestamps per NIP-59,
-    /// so a `since: now()` filter would reject most incoming encrypted messages.
+    /// Uses three filters: one for ephemeral ContextVM messages (kind 25910)
+    /// and two for NIP-59 gift wraps (kinds 1059 and 21059).
     pub async fn subscribe_for_pubkey(&self, pubkey: &PublicKey) -> Result<()> {
         let p_tag = pubkey.to_hex();
+        let now = Timestamp::now();
 
         let ephemeral_filter = Filter::new()
             .kind(Kind::Custom(CTXVM_MESSAGES_KIND))
             .custom_tag(SingleLetterTag::lowercase(Alphabet::P), p_tag.clone())
-            .since(Timestamp::now());
+            .since(now);
 
-        let now = Timestamp::now();
         let gift_wrap_filter = Filter::new()
             .kind(Kind::Custom(GIFT_WRAP_KIND))
             .custom_tag(SingleLetterTag::lowercase(Alphabet::P), p_tag.clone())
