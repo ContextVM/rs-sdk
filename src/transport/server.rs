@@ -18,6 +18,7 @@ use crate::core::validation;
 use crate::encryption;
 use crate::relay::RelayPool;
 use crate::transport::base::BaseTransport;
+use crate::transport::dedup::EventDeduplicator;
 
 use crate::util::tracing_setup;
 
@@ -41,6 +42,8 @@ pub struct NostrServerTransportConfig {
     pub cleanup_interval: Duration,
     /// Session timeout (default: 300s).
     pub session_timeout: Duration,
+    /// Size of LRU seen-event cache used for inbound deduplication (default: 5000).
+    pub seen_event_cache_size: usize,
     /// Optional log file path. Logs always go to stdout and are also appended here when set.
     pub log_file_path: Option<String>,
 }
@@ -56,6 +59,7 @@ impl Default for NostrServerTransportConfig {
             excluded_capabilities: Vec::new(),
             cleanup_interval: Duration::from_secs(60),
             session_timeout: Duration::from_secs(300),
+            seen_event_cache_size: DEFAULT_LRU_SIZE,
             log_file_path: None,
         }
     }
@@ -85,6 +89,13 @@ pub struct IncomingRequest {
     pub event_id: String,
     /// Whether the original message was encrypted.
     pub is_encrypted: bool,
+}
+
+struct EventLoopSettings {
+    allowed_pubkeys: Vec<String>,
+    excluded_capabilities: Vec<CapabilityExclusion>,
+    encryption_mode: EncryptionMode,
+    seen_event_cache_size: usize,
 }
 
 impl NostrServerTransport {
@@ -172,21 +183,15 @@ impl NostrServerTransport {
         let sessions = self.sessions.clone();
         let event_to_client = self.event_to_client.clone();
         let tx = self.message_tx.clone();
-        let allowed = self.config.allowed_public_keys.clone();
-        let excluded = self.config.excluded_capabilities.clone();
-        let encryption_mode = self.config.encryption_mode;
+        let settings = EventLoopSettings {
+            allowed_pubkeys: self.config.allowed_public_keys.clone(),
+            excluded_capabilities: self.config.excluded_capabilities.clone(),
+            encryption_mode: self.config.encryption_mode,
+            seen_event_cache_size: self.config.seen_event_cache_size,
+        };
 
         tokio::spawn(async move {
-            Self::event_loop(
-                client,
-                sessions,
-                event_to_client,
-                tx,
-                allowed,
-                excluded,
-                encryption_mode,
-            )
-            .await;
+            Self::event_loop(client, sessions, event_to_client, tx, settings).await;
         });
 
         // Spawn session cleanup
@@ -220,6 +225,7 @@ impl NostrServerTransport {
             relay_count = self.config.relay_urls.len(),
             cleanup_interval_secs = self.config.cleanup_interval.as_secs(),
             session_timeout_secs = self.config.session_timeout.as_secs(),
+            seen_event_cache_size = self.config.seen_event_cache_size,
             "Server transport loops spawned"
         );
         Ok(())
@@ -590,19 +596,37 @@ impl NostrServerTransport {
         sessions: Arc<RwLock<HashMap<String, ClientSession>>>,
         event_to_client: Arc<RwLock<HashMap<String, String>>>,
         tx: tokio::sync::mpsc::UnboundedSender<IncomingRequest>,
-        allowed_pubkeys: Vec<String>,
-        excluded_capabilities: Vec<CapabilityExclusion>,
-        encryption_mode: EncryptionMode,
+        settings: EventLoopSettings,
     ) {
         let mut notifications = client.notifications();
+        let mut deduplicator = EventDeduplicator::new(settings.seen_event_cache_size);
 
         while let Ok(notification) = notifications.recv().await {
             if let RelayPoolNotification::Event { event, .. } = notification {
+                let outer_event_id = event.id.to_hex();
+                if deduplicator.should_drop(&outer_event_id) {
+                    let dedup_hits = deduplicator.duplicate_hits();
+                    tracing::debug!(
+                        target: LOG_TARGET,
+                        event_id = %outer_event_id,
+                        dedup_hits = dedup_hits,
+                        "Skipping duplicate event"
+                    );
+                    if dedup_hits.is_multiple_of(100) {
+                        tracing::info!(
+                            target: LOG_TARGET,
+                            dedup_hits = dedup_hits,
+                            "Server inbound deduplication suppressed duplicate events"
+                        );
+                    }
+                    continue;
+                }
+
                 let (content, sender_pubkey, event_id, is_encrypted) = if event.kind
                     == Kind::Custom(GIFT_WRAP_KIND)
                     || event.kind == Kind::Custom(EPHEMERAL_GIFT_WRAP_KIND)
                 {
-                    if encryption_mode == EncryptionMode::Disabled {
+                    if settings.encryption_mode == EncryptionMode::Disabled {
                         tracing::warn!(
                             target: LOG_TARGET,
                             event_id = %event.id.to_hex(),
@@ -663,7 +687,7 @@ impl NostrServerTransport {
                         }
                     }
                 } else {
-                    if encryption_mode == EncryptionMode::Required {
+                    if settings.encryption_mode == EncryptionMode::Required {
                         tracing::warn!(
                             target: LOG_TARGET,
                             sender_pubkey = %event.pubkey.to_hex(),
@@ -693,7 +717,7 @@ impl NostrServerTransport {
                 };
 
                 // Authorization check
-                if !allowed_pubkeys.is_empty() {
+                if !settings.allowed_pubkeys.is_empty() {
                     let method = mcp_msg.method().unwrap_or("");
                     let name = match &mcp_msg {
                         JsonRpcMessage::Request(r) => r
@@ -705,9 +729,9 @@ impl NostrServerTransport {
                     };
 
                     let is_excluded =
-                        Self::is_capability_excluded(&excluded_capabilities, method, name);
+                        Self::is_capability_excluded(&settings.excluded_capabilities, method, name);
 
-                    if !allowed_pubkeys.contains(&sender_pubkey) && !is_excluded {
+                    if !settings.allowed_pubkeys.contains(&sender_pubkey) && !is_excluded {
                         tracing::warn!(
                             target: LOG_TARGET,
                             sender_pubkey = %sender_pubkey,
@@ -1019,6 +1043,15 @@ mod tests {
         assert_eq!(config.encryption_mode, EncryptionMode::Optional);
     }
 
+    #[test]
+    fn test_custom_seen_event_cache_size() {
+        let config = NostrServerTransportConfig {
+            seen_event_cache_size: 2049,
+            ..Default::default()
+        };
+        assert_eq!(config.seen_event_cache_size, 2049);
+    }
+
     // ── Config defaults ─────────────────────────────────────────
 
     #[test]
@@ -1030,6 +1063,7 @@ mod tests {
         assert!(config.excluded_capabilities.is_empty());
         assert_eq!(config.cleanup_interval, Duration::from_secs(60));
         assert_eq!(config.session_timeout, Duration::from_secs(300));
+        assert_eq!(config.seen_event_cache_size, DEFAULT_LRU_SIZE);
         assert!(config.server_info.is_none());
         assert!(config.log_file_path.is_none());
     }

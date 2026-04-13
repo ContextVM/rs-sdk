@@ -127,6 +127,7 @@ mod tests {
             excluded_capabilities: vec![],
             cleanup_interval: Duration::from_secs(120),
             session_timeout: Duration::from_secs(600),
+            seen_event_cache_size: 4096,
             log_file_path: None,
         };
 
@@ -142,6 +143,7 @@ mod tests {
         );
         assert!(config.nostr_config.is_announced_server);
         assert_eq!(config.nostr_config.allowed_public_keys.len(), 1);
+        assert_eq!(config.nostr_config.seen_event_cache_size, 4096);
         assert!(
             config
                 .nostr_config
