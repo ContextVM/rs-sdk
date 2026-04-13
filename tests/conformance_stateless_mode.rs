@@ -21,6 +21,7 @@ async fn make_stateless_transport() -> (
         encryption_mode: EncryptionMode::Optional,
         is_stateless: true,
         timeout: Duration::from_secs(1),
+        seen_event_cache_size: 64,
         log_file_path: None,
     };
 

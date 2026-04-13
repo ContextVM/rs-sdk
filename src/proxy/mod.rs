@@ -112,6 +112,7 @@ mod tests {
             encryption_mode: EncryptionMode::Required,
             is_stateless: true,
             timeout: Duration::from_secs(60),
+            seen_event_cache_size: 2048,
             log_file_path: None,
         };
 
@@ -128,6 +129,7 @@ mod tests {
         );
         assert!(config.nostr_config.is_stateless);
         assert_eq!(config.nostr_config.timeout, Duration::from_secs(60));
+        assert_eq!(config.nostr_config.seen_event_cache_size, 2048);
     }
 
     #[test]

@@ -18,6 +18,7 @@ use crate::core::validation;
 use crate::encryption;
 use crate::relay::RelayPool;
 use crate::transport::base::BaseTransport;
+use crate::transport::dedup::EventDeduplicator;
 
 use crate::util::tracing_setup;
 
@@ -35,6 +36,8 @@ pub struct NostrClientTransportConfig {
     pub is_stateless: bool,
     /// Response timeout (default: 30s).
     pub timeout: Duration,
+    /// Size of LRU seen-event cache used for inbound deduplication (default: 5000).
+    pub seen_event_cache_size: usize,
     /// Optional log file path. Logs always go to stdout and are also appended here when set.
     pub log_file_path: Option<String>,
 }
@@ -47,6 +50,7 @@ impl Default for NostrClientTransportConfig {
             encryption_mode: EncryptionMode::Optional,
             is_stateless: false,
             timeout: Duration::from_secs(30),
+            seen_event_cache_size: DEFAULT_LRU_SIZE,
             log_file_path: None,
         }
     }
@@ -160,14 +164,24 @@ impl NostrClientTransport {
         let server_pubkey = self.server_pubkey;
         let tx = self.message_tx.clone();
         let encryption_mode = self.config.encryption_mode;
+        let seen_event_cache_size = self.config.seen_event_cache_size;
 
         tokio::spawn(async move {
-            Self::event_loop(client, pending, server_pubkey, tx, encryption_mode).await;
+            Self::event_loop(
+                client,
+                pending,
+                server_pubkey,
+                tx,
+                encryption_mode,
+                seen_event_cache_size,
+            )
+            .await;
         });
 
         tracing::info!(
             target: LOG_TARGET,
             relay_count = self.config.relay_urls.len(),
+            seen_event_cache_size = self.config.seen_event_cache_size,
             "Client transport event loop spawned"
         );
         Ok(())
@@ -266,11 +280,32 @@ impl NostrClientTransport {
         server_pubkey: PublicKey,
         tx: tokio::sync::mpsc::UnboundedSender<JsonRpcMessage>,
         encryption_mode: EncryptionMode,
+        seen_event_cache_size: usize,
     ) {
         let mut notifications = client.notifications();
+        let mut deduplicator = EventDeduplicator::new(seen_event_cache_size);
 
         while let Ok(notification) = notifications.recv().await {
             if let RelayPoolNotification::Event { event, .. } = notification {
+                let event_id = event.id.to_hex();
+                if deduplicator.should_drop(&event_id) {
+                    let dedup_hits = deduplicator.duplicate_hits();
+                    tracing::debug!(
+                        target: LOG_TARGET,
+                        event_id = %event_id,
+                        dedup_hits = dedup_hits,
+                        "Skipping duplicate event"
+                    );
+                    if dedup_hits.is_multiple_of(100) {
+                        tracing::info!(
+                            target: LOG_TARGET,
+                            dedup_hits = dedup_hits,
+                            "Client inbound deduplication suppressed duplicate events"
+                        );
+                    }
+                    continue;
+                }
+
                 let is_gift_wrap = is_gift_wrap_kind(&event.kind);
 
                 // Enforce mode before decrypt/parse.
