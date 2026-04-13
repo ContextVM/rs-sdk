@@ -5,6 +5,7 @@
 
 pub mod base;
 pub mod client;
+mod dedup;
 pub mod server;
 
 pub use client::{NostrClientTransport, NostrClientTransportConfig};
