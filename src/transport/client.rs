@@ -3,11 +3,12 @@
 //! Connects to a remote MCP server over Nostr. Sends JSON-RPC requests as
 //! kind 25910 events, correlates responses via `e` tag.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use nostr_sdk::prelude::*;
+use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::RwLock;
 
 use crate::core::constants::*;
@@ -22,6 +23,8 @@ use crate::transport::base::BaseTransport;
 use crate::util::tracing_setup;
 
 const LOG_TARGET: &str = "contextvm_sdk::transport::client";
+
+type PendingRequests = Arc<RwLock<HashMap<String, (serde_json::Value, Instant)>>>;
 
 /// Configuration for the client transport.
 pub struct NostrClientTransportConfig {
@@ -46,7 +49,7 @@ impl Default for NostrClientTransportConfig {
             server_pubkey: String::new(),
             encryption_mode: EncryptionMode::Optional,
             is_stateless: false,
-            timeout: Duration::from_secs(30),
+            timeout: Duration::from_millis(crate::core::constants::DEFAULT_TIMEOUT_MS),
             log_file_path: None,
         }
     }
@@ -57,8 +60,8 @@ pub struct NostrClientTransport {
     base: BaseTransport,
     config: NostrClientTransportConfig,
     server_pubkey: PublicKey,
-    /// Pending request event IDs awaiting responses.
-    pending_requests: Arc<RwLock<HashSet<String>>>,
+    /// Pending request event IDs awaiting responses and their timestamps.
+    pending_requests: PendingRequests,
     /// Channel for receiving processed MCP messages from the event loop.
     message_tx: tokio::sync::mpsc::UnboundedSender<JsonRpcMessage>,
     message_rx: Option<tokio::sync::mpsc::UnboundedReceiver<JsonRpcMessage>>,
@@ -107,7 +110,7 @@ impl NostrClientTransport {
             },
             config,
             server_pubkey,
-            pending_requests: Arc::new(RwLock::new(HashSet::new())),
+            pending_requests: Arc::new(RwLock::new(HashMap::new())),
             message_tx: tx,
             message_rx: Some(rx),
         })
@@ -160,9 +163,10 @@ impl NostrClientTransport {
         let server_pubkey = self.server_pubkey;
         let tx = self.message_tx.clone();
         let encryption_mode = self.config.encryption_mode;
+        let timeout = self.config.timeout;
 
         tokio::spawn(async move {
-            Self::event_loop(client, pending, server_pubkey, tx, encryption_mode).await;
+            Self::event_loop(client, pending, server_pubkey, tx, encryption_mode, timeout).await;
         });
 
         tracing::info!(
@@ -217,11 +221,11 @@ impl NostrClientTransport {
                 error
             })?;
 
-        if matches!(message, JsonRpcMessage::Request(_)) {
+        if let JsonRpcMessage::Request(req) = message {
             self.pending_requests
                 .write()
                 .await
-                .insert(event_id.to_hex());
+                .insert(event_id.to_hex(), (req.id.clone(), Instant::now()));
         }
 
         tracing::debug!(
@@ -262,119 +266,179 @@ impl NostrClientTransport {
 
     async fn event_loop(
         client: Arc<Client>,
-        pending: Arc<RwLock<HashSet<String>>>,
+        pending: PendingRequests,
         server_pubkey: PublicKey,
         tx: tokio::sync::mpsc::UnboundedSender<JsonRpcMessage>,
         encryption_mode: EncryptionMode,
+        timeout: Duration,
     ) {
         let mut notifications = client.notifications();
+        let sweep_interval = timeout.clamp(Duration::from_millis(10), Duration::from_secs(1));
+        let mut interval = tokio::time::interval(sweep_interval);
 
-        while let Ok(notification) = notifications.recv().await {
-            if let RelayPoolNotification::Event { event, .. } = notification {
-                let is_gift_wrap = is_gift_wrap_kind(&event.kind);
-
-                // Enforce mode before decrypt/parse.
-                if violates_encryption_policy(&event.kind, &encryption_mode) {
-                    if is_gift_wrap {
-                        tracing::warn!(
-                            event_id = %event.id.to_hex(),
-                            "Received encrypted response but encryption is disabled"
-                        );
-                    } else {
-                        tracing::warn!(
-                            event_id = %event.id.to_hex(),
-                            "Received unencrypted response but encryption is required"
-                        );
-                    }
-                    continue;
-                }
-
-                // Handle gift-wrapped events
-                let (actual_event_content, actual_pubkey, e_tag) = if is_gift_wrap {
-                    // Single-layer NIP-44 decrypt (matches JS/TS SDK)
-                    let signer = match client.signer().await {
-                        Ok(s) => s,
-                        Err(error) => {
-                            tracing::error!(
+        loop {
+            tokio::select! {
+                result = notifications.recv() => {
+                    let notification = match result {
+                        Ok(notification) => notification,
+                        Err(RecvError::Lagged(skipped)) => {
+                            tracing::warn!(
                                 target: LOG_TARGET,
-                                error = %error,
-                                "Failed to get signer"
+                                skipped,
+                                "Client notification stream lagged; dropping skipped notifications"
                             );
                             continue;
                         }
+                        Err(RecvError::Closed) => {
+                            tracing::warn!(
+                                target: LOG_TARGET,
+                                "Client notification stream closed; stopping event loop"
+                            );
+                            break;
+                        }
                     };
-                    match encryption::decrypt_gift_wrap_single_layer(&signer, &event).await {
-                        Ok(decrypted_json) => {
-                            match serde_json::from_str::<Event>(&decrypted_json) {
-                                Ok(inner) => {
-                                    if let Err(e) = inner.verify() {
-                                        tracing::warn!(
-                                            "Inner event signature verification failed: {e}"
-                                        );
-                                        continue;
+
+                    if let RelayPoolNotification::Event { event, .. } = notification {
+                        let is_gift_wrap = is_gift_wrap_kind(&event.kind);
+
+                        if violates_encryption_policy(&event.kind, &encryption_mode) {
+                            if is_gift_wrap {
+                                tracing::warn!(
+                                    event_id = %event.id.to_hex(),
+                                    "Received encrypted response but encryption is disabled"
+                                );
+                            } else {
+                                tracing::warn!(
+                                    event_id = %event.id.to_hex(),
+                                    "Received unencrypted response but encryption is required"
+                                );
+                            }
+                            continue;
+                        }
+
+                        let (actual_event_content, actual_pubkey, e_tag) = if is_gift_wrap {
+                            let signer = match client.signer().await {
+                                Ok(s) => s,
+                                Err(error) => {
+                                    tracing::error!(
+                                        target: LOG_TARGET,
+                                        error = %error,
+                                        "Failed to get signer"
+                                    );
+                                    continue;
+                                }
+                            };
+                            match encryption::decrypt_gift_wrap_single_layer(&signer, &event).await {
+                                Ok(decrypted_json) => {
+                                    match serde_json::from_str::<Event>(&decrypted_json) {
+                                        Ok(inner) => {
+                                            if let Err(e) = inner.verify() {
+                                                tracing::warn!(
+                                                    "Inner event signature verification failed: {e}"
+                                                );
+                                                continue;
+                                            }
+                                            let e_tag = serializers::get_tag_value(&inner.tags, "e");
+                                            (inner.content, inner.pubkey, e_tag)
+                                        }
+                                        Err(error) => {
+                                            tracing::error!(
+                                                target: LOG_TARGET,
+                                                error = %error,
+                                                "Failed to parse inner event"
+                                            );
+                                            continue;
+                                        }
                                     }
-                                    let e_tag = serializers::get_tag_value(&inner.tags, "e");
-                                    (inner.content, inner.pubkey, e_tag)
                                 }
                                 Err(error) => {
                                     tracing::error!(
                                         target: LOG_TARGET,
                                         error = %error,
-                                        "Failed to parse inner event"
+                                        "Failed to decrypt gift wrap"
                                     );
                                     continue;
                                 }
                             }
-                        }
-                        Err(error) => {
-                            tracing::error!(
+                        } else {
+                            let e_tag = serializers::get_tag_value(&event.tags, "e");
+                            (event.content.clone(), event.pubkey, e_tag)
+                        };
+
+                        if actual_pubkey != server_pubkey {
+                            tracing::debug!(
                                 target: LOG_TARGET,
-                                error = %error,
-                                "Failed to decrypt gift wrap"
+                                event_pubkey = %actual_pubkey.to_hex(),
+                                expected_pubkey = %server_pubkey.to_hex(),
+                                "Skipping event from unexpected pubkey"
                             );
                             continue;
                         }
-                    }
-                } else {
-                    let e_tag = serializers::get_tag_value(&event.tags, "e");
-                    (event.content.clone(), event.pubkey, e_tag)
-                };
 
-                // Verify it's from our server
-                if actual_pubkey != server_pubkey {
-                    tracing::debug!(
-                        target: LOG_TARGET,
-                        event_pubkey = %actual_pubkey.to_hex(),
-                        expected_pubkey = %server_pubkey.to_hex(),
-                        "Skipping event from unexpected pubkey"
-                    );
-                    continue;
-                }
+                        if let Some(ref correlated_id) = e_tag {
+                            let is_pending = pending.read().await.contains_key(correlated_id.as_str());
+                            if !is_pending {
+                                tracing::warn!(
+                                    target: LOG_TARGET,
+                                    correlated_event_id = %correlated_id,
+                                    "Response for unknown request"
+                                );
+                                continue;
+                            }
+                        }
 
-                // Correlate response
-                if let Some(ref correlated_id) = e_tag {
-                    let is_pending = pending.read().await.contains(correlated_id.as_str());
-                    if !is_pending {
-                        tracing::warn!(
-                            target: LOG_TARGET,
-                            correlated_event_id = %correlated_id,
-                            "Response for unknown request"
-                        );
-                        continue;
+                        if let Some(mcp_msg) = validation::validate_and_parse(&actual_event_content) {
+                            if let Some(ref correlated_id) = e_tag {
+                                pending.write().await.remove(correlated_id.as_str());
+                            }
+                            let _ = tx.send(mcp_msg);
+                        }
                     }
                 }
+                _ = interval.tick() => {
+                    let mut pending_guard = pending.write().await;
+                    let timeouts = collect_timed_out_requests(&mut pending_guard, Instant::now(), timeout);
+                    drop(pending_guard);
 
-                // Parse MCP message
-                if let Some(mcp_msg) = validation::validate_and_parse(&actual_event_content) {
-                    // Clean up pending request
-                    if let Some(ref correlated_id) = e_tag {
-                        pending.write().await.remove(correlated_id.as_str());
+                    for req_id in timeouts {
+                        let err_resp = timeout_error_response(req_id);
+                        let _ = tx.send(err_resp);
                     }
-                    let _ = tx.send(mcp_msg);
                 }
             }
         }
     }
+}
+
+fn collect_timed_out_requests(
+    pending: &mut HashMap<String, (serde_json::Value, Instant)>,
+    now: Instant,
+    timeout: Duration,
+) -> Vec<serde_json::Value> {
+    let mut timed_out = Vec::new();
+
+    pending.retain(|_event_id, (request_id, sent_at)| {
+        if now.duration_since(*sent_at) >= timeout {
+            timed_out.push(request_id.clone());
+            false
+        } else {
+            true
+        }
+    });
+
+    timed_out
+}
+
+fn timeout_error_response(request_id: serde_json::Value) -> JsonRpcMessage {
+    JsonRpcMessage::ErrorResponse(JsonRpcErrorResponse {
+        jsonrpc: "2.0".to_string(),
+        id: request_id,
+        error: JsonRpcError {
+            code: -32000,
+            message: Error::Timeout.to_string(),
+            data: None,
+        },
+    })
 }
 
 #[inline]
@@ -402,8 +466,64 @@ mod tests {
         assert!(config.server_pubkey.is_empty());
         assert_eq!(config.encryption_mode, EncryptionMode::Optional);
         assert!(!config.is_stateless);
-        assert_eq!(config.timeout, Duration::from_secs(30));
+        assert_eq!(config.timeout, Duration::from_millis(DEFAULT_TIMEOUT_MS));
         assert!(config.log_file_path.is_none());
+    }
+
+    #[test]
+    fn test_collect_timed_out_requests_removes_only_expired() {
+        let now = Instant::now();
+        let mut pending: HashMap<String, (serde_json::Value, Instant)> = HashMap::new();
+
+        pending.insert(
+            "expired".to_string(),
+            (serde_json::json!(1), now - Duration::from_secs(31)),
+        );
+        pending.insert(
+            "active".to_string(),
+            (serde_json::json!(2), now - Duration::from_secs(5)),
+        );
+
+        let timed_out = collect_timed_out_requests(&mut pending, now, Duration::from_secs(30));
+
+        assert_eq!(timed_out.len(), 1);
+        assert!(timed_out.contains(&serde_json::json!(1)));
+        assert!(!pending.contains_key("expired"));
+        assert!(pending.contains_key("active"));
+    }
+
+    #[test]
+    fn test_collect_timed_out_requests_expires_on_boundary() {
+        let now = Instant::now();
+        let mut pending: HashMap<String, (serde_json::Value, Instant)> = HashMap::new();
+
+        pending.insert(
+            "boundary".to_string(),
+            (serde_json::json!(1), now - Duration::from_secs(30)),
+        );
+
+        let timed_out = collect_timed_out_requests(&mut pending, now, Duration::from_secs(30));
+
+        assert_eq!(timed_out.len(), 1);
+        assert!(timed_out.contains(&serde_json::json!(1)));
+        assert!(!pending.contains_key("boundary"));
+    }
+
+    #[test]
+    fn test_timeout_error_response_shape() {
+        let request_id = serde_json::json!("req-42");
+        let message = timeout_error_response(request_id.clone());
+
+        match message {
+            JsonRpcMessage::ErrorResponse(error_response) => {
+                assert_eq!(error_response.jsonrpc, "2.0");
+                assert_eq!(error_response.id, request_id);
+                assert_eq!(error_response.error.code, -32000);
+                assert_eq!(error_response.error.message, Error::Timeout.to_string());
+                assert!(error_response.error.data.is_none());
+            }
+            _ => panic!("expected timeout error response"),
+        }
     }
 
     #[test]
