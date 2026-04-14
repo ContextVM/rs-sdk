@@ -23,6 +23,7 @@ use crate::transport::base::BaseTransport;
 use crate::util::tracing_setup;
 
 const LOG_TARGET: &str = "contextvm_sdk::transport::client";
+const JSON_RPC_TIMEOUT_ERROR_CODE: i64 = -32000;
 
 type PendingRequests = Arc<RwLock<HashMap<String, (serde_json::Value, Instant)>>>;
 
@@ -434,7 +435,7 @@ fn timeout_error_response(request_id: serde_json::Value) -> JsonRpcMessage {
         jsonrpc: "2.0".to_string(),
         id: request_id,
         error: JsonRpcError {
-            code: -32000,
+            code: JSON_RPC_TIMEOUT_ERROR_CODE,
             message: Error::Timeout.to_string(),
             data: None,
         },
@@ -518,7 +519,7 @@ mod tests {
             JsonRpcMessage::ErrorResponse(error_response) => {
                 assert_eq!(error_response.jsonrpc, "2.0");
                 assert_eq!(error_response.id, request_id);
-                assert_eq!(error_response.error.code, -32000);
+                assert_eq!(error_response.error.code, JSON_RPC_TIMEOUT_ERROR_CODE);
                 assert_eq!(error_response.error.message, Error::Timeout.to_string());
                 assert!(error_response.error.data.is_none());
             }
