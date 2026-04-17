@@ -397,6 +397,12 @@ impl NostrServerTransport {
         let progress_token = Self::progress_token_from_notification(notification);
         let correlated_event_id =
             Self::resolve_notification_correlation(session, notification, correlated_event_id);
+        let correlated_wrap_kind = correlated_event_id.as_ref().and_then(|event_id| {
+            session
+                .pending_requests
+                .get(event_id)
+                .and_then(|route| route.wrap_kind)
+        });
         if progress_token.is_some() && correlated_event_id.is_none() {
             return Err(Error::Other(format!(
                 "No request route found for progress token in client session {client_pubkey_hex}"
@@ -423,6 +429,7 @@ impl NostrServerTransport {
                 Self::select_outbound_notification_gift_wrap_kind(
                     self.config.gift_wrap_mode,
                     is_encrypted,
+                    correlated_wrap_kind,
                 ),
             )
             .await?;
@@ -729,6 +736,7 @@ impl NostrServerTransport {
     fn select_outbound_notification_gift_wrap_kind(
         gift_wrap_mode: GiftWrapMode,
         is_encrypted: bool,
+        mirrored_kind: Option<u16>,
     ) -> Option<u16> {
         if !is_encrypted {
             return None;
@@ -737,7 +745,11 @@ impl NostrServerTransport {
         match gift_wrap_mode {
             GiftWrapMode::Ephemeral => Some(EPHEMERAL_GIFT_WRAP_KIND),
             GiftWrapMode::Persistent => Some(GIFT_WRAP_KIND),
-            GiftWrapMode::Optional => None,
+            GiftWrapMode::Optional => match mirrored_kind {
+                Some(kind) if kind == EPHEMERAL_GIFT_WRAP_KIND => Some(EPHEMERAL_GIFT_WRAP_KIND),
+                Some(_) => Some(GIFT_WRAP_KIND),
+                None => None,
+            },
         }
     }
 
@@ -1384,13 +1396,23 @@ mod tests {
             NostrServerTransport::select_outbound_notification_gift_wrap_kind(
                 GiftWrapMode::Optional,
                 true,
+                None,
             ),
             None
         );
         assert_eq!(
             NostrServerTransport::select_outbound_notification_gift_wrap_kind(
+                GiftWrapMode::Optional,
+                true,
+                Some(EPHEMERAL_GIFT_WRAP_KIND),
+            ),
+            Some(EPHEMERAL_GIFT_WRAP_KIND)
+        );
+        assert_eq!(
+            NostrServerTransport::select_outbound_notification_gift_wrap_kind(
                 GiftWrapMode::Persistent,
                 true,
+                None,
             ),
             Some(GIFT_WRAP_KIND)
         );
@@ -1398,6 +1420,7 @@ mod tests {
             NostrServerTransport::select_outbound_notification_gift_wrap_kind(
                 GiftWrapMode::Ephemeral,
                 true,
+                None,
             ),
             Some(EPHEMERAL_GIFT_WRAP_KIND)
         );
