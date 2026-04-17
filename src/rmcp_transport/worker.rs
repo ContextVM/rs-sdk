@@ -2,6 +2,11 @@
 //!
 //! This file defines wrapper types that bind existing ContextVM Nostr
 //! transports to rmcp's worker abstraction.
+//!
+//! # Deprecation
+//!
+//! [`NostrServerWorker`] is deprecated. Use [`super::pool::start_worker_pool`]
+//! for multi-client server deployments.
 
 use std::collections::HashMap;
 
@@ -19,14 +24,26 @@ use super::convert::{
 const LOG_TARGET: &str = "contextvm_sdk::rmcp_transport::worker";
 
 /// rmcp server worker wrapper for ContextVM Nostr server transport.
+///
+/// # Deprecated
+///
+/// This worker accepts messages from **all** connected clients but routes
+/// responses via its internal correlation map.  For production deployments
+/// that need capacity management and backpressure, use
+/// [`super::pool::start_worker_pool`] instead.
+#[deprecated(
+    since = "0.2.0",
+    note = "Use `rmcp_transport::pool::start_worker_pool` for multi-client support with capacity management"
+)]
 pub struct NostrServerWorker {
     transport: NostrServerTransport,
-    // rmcp service instance is single-peer. Keep one active client per worker.
-    active_client_pubkey: Option<String>,
-    // Maps request id (serialized JSON value) -> incoming Nostr event id.
+    /// Multi-client correlation: serialized_request_id → (event_id, client_pubkey).
     request_id_to_event_id: HashMap<String, String>,
+    /// Tracks which client pubkey is associated with each request for response routing.
+    request_id_to_client: HashMap<String, String>,
 }
 
+#[allow(deprecated)]
 impl NostrServerWorker {
     /// Create a new server worker from existing server transport config.
     pub async fn new<T>(signer: T, config: NostrServerTransportConfig) -> Result<Self>
@@ -36,8 +53,8 @@ impl NostrServerWorker {
         let transport = NostrServerTransport::new(signer, config).await?;
         Ok(Self {
             transport,
-            active_client_pubkey: None,
             request_id_to_event_id: HashMap::new(),
+            request_id_to_client: HashMap::new(),
         })
     }
 
@@ -47,6 +64,7 @@ impl NostrServerWorker {
     }
 }
 
+#[allow(deprecated)]
 impl Worker for NostrServerWorker {
     type Error = crate::core::error::Error;
     type Role = rmcp::RoleServer;
@@ -94,31 +112,14 @@ impl Worker for NostrServerWorker {
                         ..
                     } = incoming;
 
-                    match &self.active_client_pubkey {
-                        Some(active) if active != &client_pubkey => {
-                            tracing::warn!(
-                                target: LOG_TARGET,
-                                active_client = %active,
-                                ignored_client = %client_pubkey,
-                                "Ignoring message from second client: rmcp server worker currently supports one active client per worker"
-                            );
-                            continue;
-                        }
-                        None => {
-                            tracing::info!(
-                                target: LOG_TARGET,
-                                client_pubkey = %client_pubkey,
-                                "Binding rmcp server worker to first client session"
-                            );
-                            self.active_client_pubkey = Some(client_pubkey.clone());
-                        }
-                        _ => {}
-                    }
+                    // Accept messages from any client (multi-client support).
+                    // Track correlation for response routing.
 
                     if let JsonRpcMessage::Request(req) = &message {
                         match serde_json::to_string(&req.id) {
                             Ok(request_key) => {
-                                self.request_id_to_event_id.insert(request_key, event_id);
+                                self.request_id_to_event_id.insert(request_key.clone(), event_id);
+                                self.request_id_to_client.insert(request_key, client_pubkey);
                             }
                             Err(e) => {
                                 tracing::warn!(
@@ -275,6 +276,7 @@ impl Worker for NostrClientWorker {
     }
 }
 
+#[allow(deprecated)]
 impl NostrServerWorker {
     async fn forward_server_internal(&mut self, message: JsonRpcMessage) -> Result<()> {
         match message {
@@ -325,27 +327,36 @@ impl NostrServerWorker {
                     .await
             }
             JsonRpcMessage::Notification(notification) => {
-                let target = self.active_client_pubkey.as_deref().ok_or_else(|| {
-                    crate::core::error::Error::Validation(
-                        "cannot forward rmcp server notification: no active client bound"
-                            .to_string(),
-                    )
-                })?;
-                let message = JsonRpcMessage::Notification(notification);
-                self.transport
-                    .send_notification(target, &message, None)
-                    .await
+                // For notifications, try to find a recent client from the correlation map.
+                // Fall back to broadcasting if no specific client is known.
+                let target = self.request_id_to_client.values().next().cloned();
+                match target {
+                    Some(pubkey) => {
+                        let message = JsonRpcMessage::Notification(notification);
+                        self.transport
+                            .send_notification(&pubkey, &message, None)
+                            .await
+                    }
+                    None => {
+                        let message = JsonRpcMessage::Notification(notification);
+                        self.transport.broadcast_notification(&message).await
+                    }
+                }
             }
             JsonRpcMessage::Request(request) => {
-                let target = self.active_client_pubkey.as_deref().ok_or_else(|| {
-                    crate::core::error::Error::Validation(
-                        "cannot forward rmcp server request: no active client bound".to_string(),
-                    )
-                })?;
-                let message = JsonRpcMessage::Request(request);
-                self.transport
-                    .send_notification(target, &message, None)
-                    .await
+                // Server-to-client request: route to a recent client.
+                let target = self.request_id_to_client.values().next().cloned();
+                match target {
+                    Some(pubkey) => {
+                        let message = JsonRpcMessage::Request(request);
+                        self.transport
+                            .send_notification(&pubkey, &message, None)
+                            .await
+                    }
+                    None => Err(crate::core::error::Error::Validation(
+                        "cannot forward rmcp server request: no clients connected".to_string(),
+                    )),
+                }
             }
         }
     }
