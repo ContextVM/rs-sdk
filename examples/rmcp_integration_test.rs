@@ -297,18 +297,16 @@ async fn run_hybrid_relay_case(relay_url: &str) -> Result<()> {
     println!("[relay-hybrid] stage: spawning rmcp server task");
     let relay_url_owned = relay_url.to_string();
     let server_task = tokio::spawn(async move {
-        let server = NostrMCPGateway::serve_handler(
+        let _server = NostrMCPGateway::serve_handler_pooled(
             server_keys,
             server_config(&relay_url_owned),
-            DemoServer::new(),
+            contextvm_sdk::rmcp_transport::WorkerPoolConfig::default(),
+            || DemoServer::new(),
         )
         .await
         .with_context(|| format!("failed to start rmcp server on relay {relay_url_owned}"))?;
 
-        let _ = server
-            .waiting()
-            .await
-            .map_err(|e| anyhow!("rmcp server exited with error: {e}"))?;
+        std::future::pending::<()>().await;
 
         Err(anyhow!("rmcp server stopped unexpectedly"))
     });
@@ -464,18 +462,16 @@ async fn run_relay_rmcp_case(relay_url: &str) -> Result<()> {
     println!("[relay-rmcp] stage: spawning rmcp server task");
     let relay_url_owned = relay_url.to_string();
     let server_task = tokio::spawn(async move {
-        let server = NostrMCPGateway::serve_handler(
+        let _server = NostrMCPGateway::serve_handler_pooled(
             server_keys,
             server_config(&relay_url_owned),
-            DemoServer::new(),
+            contextvm_sdk::rmcp_transport::WorkerPoolConfig::default(),
+            || DemoServer::new(),
         )
         .await
         .with_context(|| format!("failed to start rmcp server on relay {relay_url_owned}"))?;
 
-        let _ = server
-            .waiting()
-            .await
-            .map_err(|e| anyhow!("rmcp server exited with error: {e}"))?;
+        std::future::pending::<()>().await;
 
         Err(anyhow!("rmcp server stopped unexpectedly"))
     });
