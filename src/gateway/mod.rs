@@ -83,8 +83,15 @@ impl NostrMCPGateway {
 impl NostrMCPGateway {
     /// Start a gateway directly from an rmcp server handler.
     ///
-    /// This additive API keeps the existing `new/start/send_response` flow intact,
-    /// while allowing rmcp-first usage through the worker adapter.
+    /// # Deprecated
+    ///
+    /// This method creates a single worker that can only serve one client
+    /// at a time. Use [`serve_handler_pooled`](Self::serve_handler_pooled)
+    /// for production deployments that need to handle multiple concurrent clients.
+    #[deprecated(
+        since = "0.2.0",
+        note = "Use `serve_handler_pooled` for multi-client support with capacity management"
+    )]
     pub async fn serve_handler<T, H>(
         signer: T,
         config: GatewayConfig,
@@ -94,14 +101,66 @@ impl NostrMCPGateway {
         T: nostr_sdk::prelude::IntoNostrSigner,
         H: rmcp::ServerHandler,
     {
+        #[allow(deprecated)]
         use crate::rmcp_transport::NostrServerWorker;
         use rmcp::ServiceExt;
 
+        #[allow(deprecated)]
         let worker = NostrServerWorker::new(signer, config.nostr_config).await?;
         handler
             .serve(worker)
             .await
             .map_err(|e| Error::Other(format!("rmcp server initialization failed: {e}")))
+    }
+
+    /// Start a gateway with a worker pool that serves multiple clients concurrently.
+    ///
+    /// Each worker in the pool gets a fresh handler instance created by the
+    /// `handler_factory` function. Incoming clients are distributed across
+    /// workers using round-robin assignment with client affinity (a client's
+    /// messages always go to the same worker once assigned).
+    ///
+    /// # Arguments
+    ///
+    /// * `signer` — The Nostr signer for the server identity
+    /// * `config` — Gateway configuration (wraps `NostrServerTransportConfig`)
+    /// * `pool_config` — Worker pool sizing and capacity settings
+    /// * `handler_factory` — A function that creates a new handler instance per worker
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use contextvm_sdk::gateway::{NostrMCPGateway, GatewayConfig};
+    /// use contextvm_sdk::rmcp_transport::WorkerPoolConfig;
+    ///
+    /// # async fn example() -> contextvm_sdk::Result<()> {
+    /// // let handle = NostrMCPGateway::serve_handler_pooled(
+    /// //     keys,
+    /// //     config,
+    /// //     WorkerPoolConfig::default(),
+    /// //     || MyHandler::new(),
+    /// // ).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn serve_handler_pooled<T, H, F>(
+        signer: T,
+        config: GatewayConfig,
+        pool_config: crate::rmcp_transport::WorkerPoolConfig,
+        handler_factory: F,
+    ) -> Result<crate::rmcp_transport::WorkerPoolHandle>
+    where
+        T: nostr_sdk::prelude::IntoNostrSigner,
+        H: rmcp::ServerHandler,
+        F: Fn() -> H,
+    {
+        crate::rmcp_transport::start_worker_pool(
+            signer,
+            config.nostr_config,
+            pool_config,
+            handler_factory,
+        )
+        .await
     }
 }
 
