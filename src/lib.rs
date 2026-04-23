@@ -57,7 +57,8 @@ pub use core::types::{
     ServerInfo,
 };
 pub use discovery::ServerAnnouncement;
-pub use relay::RelayPool;
+pub use relay::mock::MockRelayPool;
+pub use relay::{RelayPool, RelayPoolTrait};
 pub use transport::client::{
     ClientCorrelationStore, NostrClientTransport, NostrClientTransportConfig,
 };

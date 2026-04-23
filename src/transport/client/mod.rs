@@ -126,6 +126,50 @@ impl NostrClientTransport {
         })
     }
 
+    /// Like [`new`](Self::new) but accepts an existing relay pool.
+    pub async fn with_relay_pool(
+        config: NostrClientTransportConfig,
+        relay_pool: Arc<dyn RelayPoolTrait>,
+    ) -> Result<Self> {
+        tracing_setup::init_tracer(config.log_file_path.as_deref())?;
+
+        let server_pubkey = PublicKey::from_hex(&config.server_pubkey).map_err(|error| {
+            tracing::error!(
+                target: LOG_TARGET,
+                error = %error,
+                server_pubkey = %config.server_pubkey,
+                "Invalid server pubkey"
+            );
+            Error::Other(format!("Invalid server pubkey: {error}"))
+        })?;
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let seen_gift_wrap_ids = Arc::new(Mutex::new(LruCache::new(
+            NonZeroUsize::new(DEFAULT_LRU_SIZE).expect("DEFAULT_LRU_SIZE must be non-zero"),
+        )));
+
+        tracing::info!(
+            target: LOG_TARGET,
+            relay_count = config.relay_urls.len(),
+            stateless = config.is_stateless,
+            encryption_mode = ?config.encryption_mode,
+            "Created client transport (with_relay_pool)"
+        );
+        Ok(Self {
+            base: BaseTransport {
+                relay_pool,
+                encryption_mode: config.encryption_mode,
+                is_connected: false,
+            },
+            config,
+            server_pubkey,
+            pending_requests: ClientCorrelationStore::new(),
+            seen_gift_wrap_ids,
+            message_tx: tx,
+            message_rx: Some(rx),
+        })
+    }
+
     /// Connect and start listening for responses.
     pub async fn start(&mut self) -> Result<()> {
         self.base

@@ -70,6 +70,36 @@ impl MockRelayPool {
         self.keys.public_key()
     }
 
+    /// Like [`new`](Self::new) but with caller-provided signing keys.
+    pub fn with_keys(keys: Keys) -> Self {
+        let (tx, _rx) = tokio::sync::broadcast::channel(1024);
+        Self {
+            inner: Arc::new(Mutex::new(MockRelayInner::new())),
+            notification_tx: tx,
+            keys,
+        }
+    }
+
+    /// Create a pair of linked mock relay pools with different signing keys.
+    ///
+    /// Both pools share the same event store and notification channel; events
+    /// published by one are visible to the other's `notifications()` receivers.
+    pub fn create_pair() -> (Self, Self) {
+        let (tx, _rx) = tokio::sync::broadcast::channel(1024);
+        let inner = Arc::new(Mutex::new(MockRelayInner::new()));
+        let a = Self {
+            inner: Arc::clone(&inner),
+            notification_tx: tx.clone(),
+            keys: Keys::generate(),
+        };
+        let b = Self {
+            inner,
+            notification_tx: tx,
+            keys: Keys::generate(),
+        };
+        (a, b)
+    }
+
     /// Clone of all events published so far (useful for assertions in tests).
     pub async fn stored_events(&self) -> Vec<Event> {
         self.inner.lock().await.events.clone()
