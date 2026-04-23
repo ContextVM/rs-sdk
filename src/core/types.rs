@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Instant;
 
+use crate::core::constants::{EPHEMERAL_GIFT_WRAP_KIND, GIFT_WRAP_KIND};
+
 // ── Encryption mode ─────────────────────────────────────────────────
 
 /// Encryption mode for transport communication.
@@ -20,6 +22,39 @@ pub enum EncryptionMode {
     Required,
     /// Disable encryption entirely; all messages are plaintext kind 25910.
     Disabled,
+}
+
+// Gift-wrap mode (CEP-19)
+
+// Gift-wrap policy for encrypted transport communication (CEP-19).
+// Controls whether encrypted messages use persistent gift wraps (kind `1059`),
+// ephemeral gift wraps (kind `21059`), or adapt based on peer support.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GiftWrapMode {
+    /// Prefer persistent gift wraps until ephemeral support is explicitly chosen or learned.
+    #[default]
+    Optional,
+    /// Force the ephemeral gift-wrap kind (`21059`) for encrypted messages.
+    Ephemeral,
+    /// Force the persistent gift-wrap kind (`1059`) for encrypted messages.
+    Persistent,
+}
+
+impl GiftWrapMode {
+    /// Returns whether this mode accepts the given encrypted outer event kind.
+    pub fn allows_kind(self, kind: u16) -> bool {
+        match self {
+            Self::Optional => kind == GIFT_WRAP_KIND || kind == EPHEMERAL_GIFT_WRAP_KIND,
+            Self::Ephemeral => kind == EPHEMERAL_GIFT_WRAP_KIND,
+            Self::Persistent => kind == GIFT_WRAP_KIND,
+        }
+    }
+
+    /// Returns whether this mode supports sending and advertising ephemeral gift wraps.
+    pub fn supports_ephemeral(self) -> bool {
+        !matches!(self, Self::Persistent)
+    }
 }
 
 // ── Server info ─────────────────────────────────────────────────────
@@ -226,6 +261,7 @@ pub struct CapabilityExclusion {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::constants::{EPHEMERAL_GIFT_WRAP_KIND, GIFT_WRAP_KIND};
     use serde_json::json;
     use std::thread;
     use std::time::Duration;
@@ -255,6 +291,50 @@ mod tests {
         assert_eq!(s, "\"disabled\"");
         let parsed: EncryptionMode = serde_json::from_str(&s).unwrap();
         assert_eq!(parsed, mode);
+    }
+
+    #[test]
+    fn test_gift_wrap_mode_serde_roundtrip_optional() {
+        let mode = GiftWrapMode::Optional;
+        let s = serde_json::to_string(&mode).unwrap();
+        assert_eq!(s, "\"optional\"");
+        let parsed: GiftWrapMode = serde_json::from_str(&s).unwrap();
+        assert_eq!(parsed, mode);
+    }
+
+    #[test]
+    fn test_gift_wrap_mode_serde_roundtrip_ephemeral() {
+        let mode = GiftWrapMode::Ephemeral;
+        let s = serde_json::to_string(&mode).unwrap();
+        assert_eq!(s, "\"ephemeral\"");
+        let parsed: GiftWrapMode = serde_json::from_str(&s).unwrap();
+        assert_eq!(parsed, mode);
+    }
+
+    #[test]
+    fn test_gift_wrap_mode_serde_roundtrip_persistent() {
+        let mode = GiftWrapMode::Persistent;
+        let s = serde_json::to_string(&mode).unwrap();
+        assert_eq!(s, "\"persistent\"");
+        let parsed: GiftWrapMode = serde_json::from_str(&s).unwrap();
+        assert_eq!(parsed, mode);
+    }
+
+    #[test]
+    fn test_gift_wrap_mode_policy_helpers() {
+        // Optional accepts both kinds
+        assert!(GiftWrapMode::Optional.allows_kind(GIFT_WRAP_KIND));
+        assert!(GiftWrapMode::Optional.allows_kind(EPHEMERAL_GIFT_WRAP_KIND));
+        // Ephemeral only accepts 21059
+        assert!(GiftWrapMode::Ephemeral.allows_kind(EPHEMERAL_GIFT_WRAP_KIND));
+        assert!(!GiftWrapMode::Ephemeral.allows_kind(GIFT_WRAP_KIND));
+        // Persistent only accepts 1059
+        assert!(GiftWrapMode::Persistent.allows_kind(GIFT_WRAP_KIND));
+        assert!(!GiftWrapMode::Persistent.allows_kind(EPHEMERAL_GIFT_WRAP_KIND));
+        // supports_ephemeral check
+        assert!(GiftWrapMode::Optional.supports_ephemeral());
+        assert!(GiftWrapMode::Ephemeral.supports_ephemeral());
+        assert!(!GiftWrapMode::Persistent.supports_ephemeral());
     }
 
     fn assert_json_rpc_roundtrip(msg: &JsonRpcMessage) {

@@ -3,7 +3,7 @@
 //! Provides NIP-44 encryption/decryption and NIP-59 gift wrapping.
 //! The actual gift wrapping is done via nostr-sdk's Client for full NIP-59 compliance.
 
-use crate::core::constants::GIFT_WRAP_KIND;
+use crate::core::constants::{EPHEMERAL_GIFT_WRAP_KIND, GIFT_WRAP_KIND};
 use crate::core::error::{Error, Result};
 use nostr_sdk::prelude::*;
 
@@ -37,12 +37,8 @@ where
         .map_err(|e| Error::Decryption(e.to_string()))
 }
 
-/// Decrypt a single-layer NIP-44 gift wrap (kind 1059).
-///
-/// This matches the ContextVM JS/TS SDK's encryption scheme:
-/// - The gift wrap event has NIP-44 encrypted content (single layer)
-/// - Decrypt using recipient's key + event's pubkey (ephemeral sender)
-/// - Returns the decrypted plaintext content string
+// Decrypt a single-layer NIP-44 gift wrap (kind 1059).
+
 pub async fn decrypt_gift_wrap_single_layer<T>(signer: &T, event: &Event) -> Result<String>
 where
     T: NostrSigner,
@@ -51,13 +47,8 @@ where
     decrypt_nip44(signer, &sender_pubkey, &event.content).await
 }
 
-/// Create a single-layer NIP-44 gift wrap (kind 1059).
-///
-/// Matches the ContextVM JS/TS SDK's `encryptMessage`:
-/// 1. Generate ephemeral keypair
-/// 2. NIP-44 encrypt plaintext using ephemeral_secret + recipient_pubkey
-/// 3. Build kind 1059 event with `p` tag pointing to recipient
-/// 4. Sign with ephemeral key
+// Create a single-layer NIP-44 gift wrap (kind 1059).
+
 pub async fn gift_wrap_single_layer<T>(
     _signer: &T,
     recipient: &PublicKey,
@@ -72,6 +63,37 @@ where
 
     let builder =
         EventBuilder::new(Kind::Custom(GIFT_WRAP_KIND), encrypted).tag(Tag::public_key(*recipient));
+
+    builder
+        .sign_with_keys(&ephemeral)
+        .map_err(|e| Error::Encryption(e.to_string()))
+}
+
+/// Create a single-layer NIP-44 gift wrap using the provided outer event kind.
+///
+/// Only ContextVM's supported persistent (`1059`) and ephemeral (`21059`) gift-wrap
+/// kinds are accepted here.
+pub async fn gift_wrap_single_layer_with_kind<T>(
+    _signer: &T,
+    recipient: &PublicKey,
+    plaintext: &str,
+    gift_wrap_kind: u16,
+) -> Result<Event>
+where
+    T: NostrSigner,
+{
+    if gift_wrap_kind != GIFT_WRAP_KIND && gift_wrap_kind != EPHEMERAL_GIFT_WRAP_KIND {
+        return Err(Error::Encryption(format!(
+            "Unsupported gift-wrap kind for single-layer encryption: {gift_wrap_kind}"
+        )));
+    }
+
+    let ephemeral = Keys::generate();
+
+    let encrypted = encrypt_nip44(&ephemeral, recipient, plaintext).await?;
+
+    let builder =
+        EventBuilder::new(Kind::Custom(gift_wrap_kind), encrypted).tag(Tag::public_key(*recipient));
 
     builder
         .sign_with_keys(&ephemeral)
@@ -111,7 +133,7 @@ pub async fn gift_wrap(
 
 #[cfg(test)]
 mod tests {
-    use crate::core::constants::GIFT_WRAP_KIND;
+    use crate::core::constants::{EPHEMERAL_GIFT_WRAP_KIND, GIFT_WRAP_KIND};
 
     use super::*;
 
@@ -297,6 +319,57 @@ mod tests {
         assert!(
             parsed.verify().is_err(),
             "forged inner event must fail signature verification"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ephemeral_gift_wrap_roundtrip_single_layer() {
+        let sender_keys = Keys::generate();
+        let recipient_keys = Keys::generate();
+
+        let mcp_content = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+        let inner_event = EventBuilder::new(Kind::Custom(25910), mcp_content)
+            .tag(Tag::public_key(recipient_keys.public_key()))
+            .sign_with_keys(&sender_keys)
+            .unwrap();
+        let inner_json = serde_json::to_string(&inner_event).unwrap();
+
+        let gift_wrap_event = gift_wrap_single_layer_with_kind(
+            &sender_keys,
+            &recipient_keys.public_key(),
+            &inner_json,
+            EPHEMERAL_GIFT_WRAP_KIND,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(gift_wrap_event.kind, Kind::Custom(EPHEMERAL_GIFT_WRAP_KIND));
+
+        let decrypted = decrypt_gift_wrap_single_layer(&recipient_keys, &gift_wrap_event)
+            .await
+            .unwrap();
+        let parsed: Event = serde_json::from_str(&decrypted).unwrap();
+        assert_eq!(parsed.pubkey, sender_keys.public_key());
+        assert_eq!(parsed.content, mcp_content);
+    }
+
+    #[tokio::test]
+    async fn test_invalid_gift_wrap_kind_rejected() {
+        let sender_keys = Keys::generate();
+        let recipient_keys = Keys::generate();
+
+        let error = gift_wrap_single_layer_with_kind(
+            &sender_keys,
+            &recipient_keys.public_key(),
+            "test",
+            4242,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("Unsupported gift-wrap kind"),
+            "unexpected error: {error}"
         );
     }
 }

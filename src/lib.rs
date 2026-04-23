@@ -52,8 +52,9 @@ mod util;
 // Re-export commonly used types
 pub use core::error::{Error, Result};
 pub use core::types::{
-    CapabilityExclusion, ClientSession, EncryptionMode, JsonRpcError, JsonRpcErrorResponse,
-    JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, ServerInfo,
+    CapabilityExclusion, ClientSession, EncryptionMode, GiftWrapMode, JsonRpcError,
+    JsonRpcErrorResponse, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
+    ServerInfo,
 };
 pub use discovery::ServerAnnouncement;
 pub use relay::RelayPool;
