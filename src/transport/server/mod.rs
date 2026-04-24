@@ -49,6 +49,12 @@ pub struct NostrServerTransportConfig {
     pub session_timeout: Duration,
     /// Optional log file path. Logs always go to stdout and are also appended here when set.
     pub log_file_path: Option<String>,
+    /// Optional channel to notify external systems (e.g., worker pool) when sessions are evicted.
+    ///
+    /// Mirrors the TS SDK's `onClientSessionEvicted` callback in `SessionStoreOptions`.
+    /// When a session is cleaned up due to timeout, the client pubkey is sent through
+    /// this channel so the pool can reclaim capacity.
+    pub session_eviction_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
 }
 
 impl Default for NostrServerTransportConfig {
@@ -63,6 +69,7 @@ impl Default for NostrServerTransportConfig {
             cleanup_interval: Duration::from_secs(60),
             session_timeout: Duration::from_secs(300),
             log_file_path: None,
+            session_eviction_tx: None,
         }
     }
 }
@@ -245,12 +252,13 @@ impl NostrServerTransport {
         let event_routes_cleanup = self.event_routes.clone();
         let cleanup_interval = self.config.cleanup_interval;
         let session_timeout = self.config.session_timeout;
+        let eviction_tx = self.config.session_eviction_tx.clone();
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(cleanup_interval);
             loop {
                 interval.tick().await;
-                let cleaned = Self::cleanup_sessions(
+                let (cleaned, evicted_pubkeys) = Self::cleanup_sessions(
                     &sessions_cleanup,
                     &event_routes_cleanup,
                     session_timeout,
@@ -262,6 +270,12 @@ impl NostrServerTransport {
                         cleaned_sessions = cleaned,
                         "Cleaned up inactive sessions"
                     );
+                    // Notify external systems (e.g., worker pool) about evicted sessions
+                    if let Some(ref tx) = eviction_tx {
+                        for pubkey in evicted_pubkeys {
+                            let _ = tx.send(pubkey);
+                        }
+                    }
                 }
             }
         });
@@ -855,10 +869,11 @@ impl NostrServerTransport {
         sessions: &SessionStore,
         event_routes: &ServerEventRouteStore,
         timeout: Duration,
-    ) -> usize {
+    ) -> (usize, Vec<String>) {
         let mut sessions_w = sessions.write().await;
         let mut cleaned = 0;
         let mut stale_event_ids = Vec::new();
+        let mut evicted_pubkeys = Vec::new();
 
         sessions_w.retain(|pubkey, session| {
             if session.last_activity.elapsed() > timeout {
@@ -869,6 +884,7 @@ impl NostrServerTransport {
                     client_pubkey = %pubkey,
                     "Session expired"
                 );
+                evicted_pubkeys.push(pubkey.clone());
                 cleaned += 1;
                 false
             } else {
@@ -881,7 +897,7 @@ impl NostrServerTransport {
             event_routes.pop(event_id).await;
         }
 
-        cleaned
+        (cleaned, evicted_pubkeys)
     }
 }
 
@@ -934,26 +950,26 @@ mod tests {
             .await;
 
         // With a long timeout, nothing should be cleaned
-        let cleaned = NostrServerTransport::cleanup_sessions(
+        let (cleaned, _evicted) = NostrServerTransport::cleanup_sessions(
             &sessions,
             &event_routes,
             Duration::from_secs(300),
         )
         .await;
         assert_eq!(cleaned, 0);
-        assert_eq!(sessions.session_count().await, 1);
+        assert_eq!(sessions.read().await.len(), 1);
 
         // With zero timeout, it should be cleaned
         thread::sleep(Duration::from_millis(5));
-        let cleaned = NostrServerTransport::cleanup_sessions(
+        let (cleaned, _evicted) = NostrServerTransport::cleanup_sessions(
             &sessions,
             &event_routes,
             Duration::from_millis(1),
         )
         .await;
         assert_eq!(cleaned, 1);
-        assert_eq!(sessions.session_count().await, 0);
-        assert!(event_routes.pop("evt1").await.is_none());
+        assert!(sessions.read().await.is_empty());
+        assert_eq!(event_routes.event_route_count().await, 0);
     }
 
     #[tokio::test]
@@ -963,14 +979,14 @@ mod tests {
 
         sessions.get_or_create_session("active", false).await;
 
-        let cleaned = NostrServerTransport::cleanup_sessions(
+        let (cleaned, _evicted) = NostrServerTransport::cleanup_sessions(
             &sessions,
             &event_routes,
             Duration::from_secs(300),
         )
         .await;
         assert_eq!(cleaned, 0);
-        assert_eq!(sessions.session_count().await, 1);
+        assert_eq!(sessions.read().await.len(), 1);
     }
 
     // ── Request ID correlation ──────────────────────────────────
