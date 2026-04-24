@@ -63,7 +63,8 @@ pub use transport::client::{
     ClientCorrelationStore, NostrClientTransport, NostrClientTransportConfig,
 };
 pub use transport::server::{
-    IncomingRequest, NostrServerTransport, NostrServerTransportConfig, ServerEventRouteStore,
+    IncomingRequest, NostrServerTransport, NostrServerTransportConfig, RouteEntry,
+    ServerEventRouteStore, SessionSnapshot, SessionStore,
 };
 
 #[cfg(feature = "rmcp")]

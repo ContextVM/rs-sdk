@@ -1,14 +1,65 @@
-//! Server-side event route store for mapping event IDs to client public keys.
+//! Server-side event route store for mapping event IDs to client routes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
 
-/// Maps event IDs to client public keys for response routing on the server side.
+/// A route entry for an in-flight request.
+#[derive(Debug, Clone)]
+pub struct RouteEntry {
+    /// The client's public key that originated this request.
+    pub client_pubkey: String,
+    /// The original JSON-RPC request ID (before replacement with event ID).
+    pub original_request_id: serde_json::Value,
+    /// Optional progress token for this request.
+    pub progress_token: Option<String>,
+}
+
+/// Internal state behind the lock.
+struct Inner {
+    /// Primary index: event_id → route entry.
+    routes: HashMap<String, RouteEntry>,
+    /// Secondary index: progress_token → event_id.
+    progress_token_to_event: HashMap<String, String>,
+    /// Secondary index: client_pubkey → set of event_ids.
+    client_event_ids: HashMap<String, HashSet<String>>,
+}
+
+impl Inner {
+    fn new() -> Self {
+        Self {
+            routes: HashMap::new(),
+            progress_token_to_event: HashMap::new(),
+            client_event_ids: HashMap::new(),
+        }
+    }
+
+    /// Remove a single route and clean up all secondary indexes.
+    fn remove_route(&mut self, event_id: &str) -> Option<RouteEntry> {
+        let route = self.routes.remove(event_id)?;
+
+        // Clean up progress token index.
+        if let Some(ref token) = route.progress_token {
+            self.progress_token_to_event.remove(token);
+        }
+
+        // Clean up client index.
+        if let Some(set) = self.client_event_ids.get_mut(&route.client_pubkey) {
+            set.remove(event_id);
+            if set.is_empty() {
+                self.client_event_ids.remove(&route.client_pubkey);
+            }
+        }
+
+        Some(route)
+    }
+}
+
+/// Maps event IDs to full route entries for response routing on the server side.
 #[derive(Clone)]
 pub struct ServerEventRouteStore {
-    event_to_client: Arc<RwLock<HashMap<String, String>>>,
+    inner: Arc<RwLock<Inner>>,
 }
 
 impl Default for ServerEventRouteStore {
@@ -20,43 +71,140 @@ impl Default for ServerEventRouteStore {
 impl ServerEventRouteStore {
     pub fn new() -> Self {
         Self {
-            event_to_client: Arc::new(RwLock::new(HashMap::new())),
+            inner: Arc::new(RwLock::new(Inner::new())),
         }
     }
 
-    pub async fn register(&self, event_id: String, client_pubkey: String) {
-        self.event_to_client
-            .write()
-            .await
-            .insert(event_id, client_pubkey);
+    /// Register a route for an incoming request.
+    pub async fn register(
+        &self,
+        event_id: String,
+        client_pubkey: String,
+        original_request_id: serde_json::Value,
+        progress_token: Option<String>,
+    ) {
+        let mut inner = self.inner.write().await;
+
+        // Update client index.
+        inner
+            .client_event_ids
+            .entry(client_pubkey.clone())
+            .or_default()
+            .insert(event_id.clone());
+
+        // Update progress token index.
+        if let Some(ref token) = progress_token {
+            inner
+                .progress_token_to_event
+                .insert(token.clone(), event_id.clone());
+        }
+
+        inner.routes.insert(
+            event_id,
+            RouteEntry {
+                client_pubkey,
+                original_request_id,
+                progress_token,
+            },
+        );
     }
 
     /// Returns the client public key for the given event ID without removing it.
     pub async fn get(&self, event_id: &str) -> Option<String> {
-        self.event_to_client.read().await.get(event_id).cloned()
-    }
-
-    /// Removes and returns the client public key for the given event ID.
-    pub async fn pop(&self, event_id: &str) -> Option<String> {
-        self.event_to_client.write().await.remove(event_id)
-    }
-
-    /// Removes all routes for a given client public key.
-    pub async fn remove_for_client(&self, client_pubkey: &str) {
-        self.event_to_client
-            .write()
+        self.inner
+            .read()
             .await
-            .retain(|_, v| v != client_pubkey);
+            .routes
+            .get(event_id)
+            .map(|r| r.client_pubkey.clone())
+    }
+
+    /// Returns the full route entry for the given event ID without removing it.
+    pub async fn get_route(&self, event_id: &str) -> Option<RouteEntry> {
+        self.inner.read().await.routes.get(event_id).cloned()
+    }
+
+    /// Removes and returns the full route entry for the given event ID.
+    pub async fn pop(&self, event_id: &str) -> Option<RouteEntry> {
+        self.inner.write().await.remove_route(event_id)
+    }
+
+    /// Removes all routes for a given client public key. Returns the count removed.
+    pub async fn remove_for_client(&self, client_pubkey: &str) -> usize {
+        let mut inner = self.inner.write().await;
+
+        let event_ids = match inner.client_event_ids.remove(client_pubkey) {
+            Some(ids) => ids,
+            None => return 0,
+        };
+
+        let count = event_ids.len();
+        for event_id in &event_ids {
+            if let Some(route) = inner.routes.remove(event_id.as_str()) {
+                if let Some(ref token) = route.progress_token {
+                    inner.progress_token_to_event.remove(token);
+                }
+            }
+        }
+        count
+    }
+
+    /// Check whether a route exists for the given event ID.
+    pub async fn has_event_route(&self, event_id: &str) -> bool {
+        self.inner.read().await.routes.contains_key(event_id)
+    }
+
+    /// Check whether the given client has any active routes.
+    pub async fn has_active_routes_for_client(&self, client_pubkey: &str) -> bool {
+        self.inner
+            .read()
+            .await
+            .client_event_ids
+            .get(client_pubkey)
+            .is_some_and(|set| !set.is_empty())
+    }
+
+    /// Look up the event ID associated with a progress token.
+    pub async fn get_event_id_by_progress_token(&self, token: &str) -> Option<String> {
+        self.inner
+            .read()
+            .await
+            .progress_token_to_event
+            .get(token)
+            .cloned()
+    }
+
+    /// Check whether a progress token mapping exists.
+    pub async fn has_progress_token(&self, token: &str) -> bool {
+        self.inner
+            .read()
+            .await
+            .progress_token_to_event
+            .contains_key(token)
+    }
+
+    /// Number of event routes currently tracked.
+    pub async fn event_route_count(&self) -> usize {
+        self.inner.read().await.routes.len()
+    }
+
+    /// Number of progress token mappings currently tracked.
+    pub async fn progress_token_count(&self) -> usize {
+        self.inner.read().await.progress_token_to_event.len()
     }
 
     pub async fn clear(&self) {
-        self.event_to_client.write().await.clear();
+        let mut inner = self.inner.write().await;
+        inner.routes.clear();
+        inner.progress_token_to_event.clear();
+        inner.client_event_ids.clear();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[tokio::test]
     async fn pop_on_empty_returns_none() {
@@ -67,7 +215,9 @@ mod tests {
     #[tokio::test]
     async fn get_returns_without_removing() {
         let store = ServerEventRouteStore::new();
-        store.register("e1".into(), "pk1".into()).await;
+        store
+            .register("e1".into(), "pk1".into(), json!("r1"), None)
+            .await;
         assert_eq!(store.get("e1").await.as_deref(), Some("pk1"));
         assert_eq!(store.get("e1").await.as_deref(), Some("pk1"));
     }
@@ -75,19 +225,29 @@ mod tests {
     #[tokio::test]
     async fn pop_removes_entry() {
         let store = ServerEventRouteStore::new();
-        store.register("e1".into(), "pk1".into()).await;
-        assert_eq!(store.pop("e1").await.as_deref(), Some("pk1"));
+        store
+            .register("e1".into(), "pk1".into(), json!("r1"), None)
+            .await;
+        let route = store.pop("e1").await.unwrap();
+        assert_eq!(route.client_pubkey, "pk1");
         assert!(store.pop("e1").await.is_none());
     }
 
     #[tokio::test]
     async fn remove_for_client_only_removes_matching() {
         let store = ServerEventRouteStore::new();
-        store.register("e1".into(), "pk1".into()).await;
-        store.register("e2".into(), "pk2".into()).await;
-        store.register("e3".into(), "pk1".into()).await;
+        store
+            .register("e1".into(), "pk1".into(), json!("r1"), None)
+            .await;
+        store
+            .register("e2".into(), "pk2".into(), json!("r2"), None)
+            .await;
+        store
+            .register("e3".into(), "pk1".into(), json!("r3"), None)
+            .await;
 
-        store.remove_for_client("pk1").await;
+        let removed = store.remove_for_client("pk1").await;
+        assert_eq!(removed, 2);
 
         assert!(store.get("e1").await.is_none());
         assert!(store.get("e3").await.is_none());
@@ -97,16 +257,23 @@ mod tests {
     #[tokio::test]
     async fn remove_for_client_noop_when_no_match() {
         let store = ServerEventRouteStore::new();
-        store.register("e1".into(), "pk1".into()).await;
-        store.remove_for_client("pk_other").await;
+        store
+            .register("e1".into(), "pk1".into(), json!("r1"), None)
+            .await;
+        let removed = store.remove_for_client("pk_other").await;
+        assert_eq!(removed, 0);
         assert_eq!(store.get("e1").await.as_deref(), Some("pk1"));
     }
 
     #[tokio::test]
     async fn clear_empties_store() {
         let store = ServerEventRouteStore::new();
-        store.register("e1".into(), "pk1".into()).await;
-        store.register("e2".into(), "pk2".into()).await;
+        store
+            .register("e1".into(), "pk1".into(), json!("r1"), None)
+            .await;
+        store
+            .register("e2".into(), "pk2".into(), json!("r2"), None)
+            .await;
         store.clear().await;
         assert!(store.get("e1").await.is_none());
         assert!(store.get("e2").await.is_none());

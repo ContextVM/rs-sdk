@@ -5,17 +5,17 @@
 //! server announcements.
 
 pub mod correlation_store;
+pub mod session_store;
 
-pub use correlation_store::ServerEventRouteStore;
+pub use correlation_store::{RouteEntry, ServerEventRouteStore};
+pub use session_store::{SessionSnapshot, SessionStore};
 
-use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use lru::LruCache;
 use nostr_sdk::prelude::*;
-use tokio::sync::RwLock;
 
 use crate::core::constants::*;
 use crate::core::error::{Error, Result};
@@ -71,9 +71,9 @@ impl Default for NostrServerTransportConfig {
 pub struct NostrServerTransport {
     base: BaseTransport,
     config: NostrServerTransportConfig,
-    /// Client sessions: client_pubkey_hex → ClientSession
-    sessions: Arc<RwLock<HashMap<String, ClientSession>>>,
-    /// Reverse lookup: event_id → client_pubkey_hex
+    /// Client sessions.
+    sessions: SessionStore,
+    /// Reverse lookup: event_id → client route.
     event_routes: ServerEventRouteStore,
     /// Outer gift-wrap event IDs successfully decrypted and verified (inner `verify()`).
     /// Duplicate outer ids are skipped before decrypt; ids are inserted only after success
@@ -133,7 +133,7 @@ impl NostrServerTransport {
                 is_connected: false,
             },
             config,
-            sessions: Arc::new(RwLock::new(HashMap::new())),
+            sessions: SessionStore::new(),
             event_routes: ServerEventRouteStore::new(),
             seen_gift_wrap_ids,
             message_tx: tx,
@@ -167,7 +167,7 @@ impl NostrServerTransport {
                 is_connected: false,
             },
             config,
-            sessions: Arc::new(RwLock::new(HashMap::new())),
+            sessions: SessionStore::new(),
             event_routes: ServerEventRouteStore::new(),
             seen_gift_wrap_ids,
             message_tx: tx,
@@ -279,7 +279,7 @@ impl NostrServerTransport {
     /// Close the transport.
     pub async fn close(&mut self) -> Result<()> {
         self.base.disconnect().await?;
-        self.sessions.write().await.clear();
+        self.sessions.clear().await;
         self.event_routes.clear().await;
         Ok(())
     }
@@ -634,7 +634,7 @@ impl NostrServerTransport {
     #[allow(clippy::too_many_arguments)]
     async fn event_loop(
         relay_pool: Arc<dyn RelayPoolTrait>,
-        sessions: Arc<RwLock<HashMap<String, ClientSession>>>,
+        sessions: SessionStore,
         event_routes: ServerEventRouteStore,
         tx: tokio::sync::mpsc::UnboundedSender<IncomingRequest>,
         allowed_pubkeys: Vec<String>,
@@ -798,28 +798,37 @@ impl NostrServerTransport {
                 // Track request for correlation
                 if let JsonRpcMessage::Request(ref req) = mcp_msg {
                     let original_id = req.id.clone();
-                    session
-                        .pending_requests
-                        .insert(event_id.clone(), original_id);
-                    event_routes
-                        .register(event_id.clone(), sender_pubkey.clone())
-                        .await;
 
-                    // Track progress token
-                    if let Some(token) = req
+                    // Extract progress token from _meta if present.
+                    let progress_token = req
                         .params
                         .as_ref()
                         .and_then(|p| p.get("_meta"))
                         .and_then(|m| m.get("progressToken"))
                         .and_then(|t| t.as_str())
-                    {
+                        .map(String::from);
+
+                    // Duplicate into session fields (kept for backward compat).
+                    session
+                        .pending_requests
+                        .insert(event_id.clone(), original_id.clone());
+                    if let Some(ref token) = progress_token {
                         session
                             .pending_requests
-                            .insert(token.to_string(), serde_json::json!(event_id));
+                            .insert(token.clone(), serde_json::json!(event_id));
                         session
                             .event_to_progress_token
-                            .insert(event_id.clone(), token.to_string());
+                            .insert(event_id.clone(), token.clone());
                     }
+
+                    event_routes
+                        .register(
+                            event_id.clone(),
+                            sender_pubkey.clone(),
+                            original_id,
+                            progress_token,
+                        )
+                        .await;
                 }
 
                 // Handle initialized notification
@@ -843,7 +852,7 @@ impl NostrServerTransport {
     }
 
     async fn cleanup_sessions(
-        sessions: &RwLock<HashMap<String, ClientSession>>,
+        sessions: &SessionStore,
         event_routes: &ServerEventRouteStore,
         timeout: Duration,
     ) -> usize {
@@ -903,7 +912,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cleanup_sessions_removes_expired() {
-        let sessions = Arc::new(RwLock::new(HashMap::new()));
+        let sessions = SessionStore::new();
         let event_routes = ServerEventRouteStore::new();
 
         // Insert a session with an old activity time
@@ -916,7 +925,12 @@ mod tests {
             .await
             .insert("pubkey1".to_string(), session);
         event_routes
-            .register("evt1".to_string(), "pubkey1".to_string())
+            .register(
+                "evt1".to_string(),
+                "pubkey1".to_string(),
+                serde_json::json!(1),
+                None,
+            )
             .await;
 
         // With a long timeout, nothing should be cleaned
@@ -927,7 +941,7 @@ mod tests {
         )
         .await;
         assert_eq!(cleaned, 0);
-        assert_eq!(sessions.read().await.len(), 1);
+        assert_eq!(sessions.session_count().await, 1);
 
         // With zero timeout, it should be cleaned
         thread::sleep(Duration::from_millis(5));
@@ -938,17 +952,16 @@ mod tests {
         )
         .await;
         assert_eq!(cleaned, 1);
-        assert!(sessions.read().await.is_empty());
+        assert_eq!(sessions.session_count().await, 0);
         assert!(event_routes.pop("evt1").await.is_none());
     }
 
     #[tokio::test]
     async fn test_cleanup_preserves_active_sessions() {
-        let sessions = Arc::new(RwLock::new(HashMap::new()));
+        let sessions = SessionStore::new();
         let event_routes = ServerEventRouteStore::new();
 
-        let session = ClientSession::new(false);
-        sessions.write().await.insert("active".to_string(), session);
+        sessions.get_or_create_session("active", false).await;
 
         let cleaned = NostrServerTransport::cleanup_sessions(
             &sessions,
@@ -957,7 +970,7 @@ mod tests {
         )
         .await;
         assert_eq!(cleaned, 0);
-        assert_eq!(sessions.read().await.len(), 1);
+        assert_eq!(sessions.session_count().await, 1);
     }
 
     // ── Request ID correlation ──────────────────────────────────
