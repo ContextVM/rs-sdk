@@ -284,8 +284,9 @@ impl NostrClientTransport {
             })?;
 
         if let JsonRpcMessage::Request(ref req) = message {
+            let is_initialize = req.method == INITIALIZE_METHOD;
             self.pending_requests
-                .register(event_id.to_hex(), req.id.clone())
+                .register(event_id.to_hex(), req.id.clone(), is_initialize)
                 .await;
         }
 

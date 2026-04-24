@@ -4,8 +4,6 @@
 //! - `src/transport/nostr-client/correlation-store.test.ts`
 //! - `src/transport/nostr-server/session-store.test.ts`
 //! - `src/transport/nostr-server/correlation-store.test.ts`
-//!
-//! LRU eviction tests are deferred — only non-eviction tests are ported here.
 
 use contextvm_sdk::{ClientCorrelationStore, ServerEventRouteStore, SessionStore};
 use serde_json::json;
@@ -22,14 +20,18 @@ mod client_correlation_store {
     #[tokio::test]
     async fn stores_request_with_event_id() {
         let store = ClientCorrelationStore::new();
-        store.register("event123".into(), json!("req1")).await;
+        store
+            .register("event123".into(), json!("req1"), false)
+            .await;
         assert!(store.contains("event123").await);
     }
 
     #[tokio::test]
     async fn stores_and_resolves_original_request_id() {
         let store = ClientCorrelationStore::new();
-        store.register("event456".into(), json!("req2")).await;
+        store
+            .register("event456".into(), json!("req2"), false)
+            .await;
 
         // Retrieve the stored original ID.
         let original = store.get_original_id("event456").await.unwrap();
@@ -40,12 +42,23 @@ mod client_correlation_store {
         assert!(store.get_original_id("event456").await.is_none());
     }
 
+    #[tokio::test]
+    async fn register_request_flags_initialize_requests() {
+        let store = ClientCorrelationStore::new();
+        store.register("e_init".into(), json!("r1"), true).await;
+        store.register("e_normal".into(), json!("r2"), false).await;
+
+        assert!(store.is_initialize_request("e_init").await);
+        assert!(!store.is_initialize_request("e_normal").await);
+        assert!(!store.is_initialize_request("unknown").await);
+    }
+
     // ── resolveResponse (get_original_id + remove) ────────────────
 
     #[tokio::test]
     async fn restores_original_request_id() {
         let store = ClientCorrelationStore::new();
-        store.register("event789".into(), json!(42)).await;
+        store.register("event789".into(), json!(42), false).await;
         let original = store.get_original_id("event789").await.unwrap();
         assert_eq!(original, json!(42));
     }
@@ -59,7 +72,7 @@ mod client_correlation_store {
     #[tokio::test]
     async fn get_and_remove_roundtrip() {
         let store = ClientCorrelationStore::new();
-        store.register("event1".into(), json!("req1")).await;
+        store.register("event1".into(), json!("req1"), false).await;
 
         // Lookup succeeds before removal.
         let original = store.get_original_id("event1").await.unwrap();
@@ -76,7 +89,7 @@ mod client_correlation_store {
     #[tokio::test]
     async fn removes_existing_request() {
         let store = ClientCorrelationStore::new();
-        store.register("event1".into(), json!(null)).await;
+        store.register("event1".into(), json!(null), false).await;
         assert!(store.remove("event1").await);
         assert!(!store.contains("event1").await);
     }
@@ -92,10 +105,29 @@ mod client_correlation_store {
     #[tokio::test]
     async fn removes_all_pending_requests() {
         let store = ClientCorrelationStore::new();
-        store.register("event1".into(), json!(null)).await;
-        store.register("event2".into(), json!(null)).await;
+        store.register("event1".into(), json!(null), false).await;
+        store.register("event2".into(), json!(null), false).await;
         store.clear().await;
         assert_eq!(store.count().await, 0);
+    }
+
+    // ── LRU eviction (TS SDK client test 9) ───────────────────────
+
+    #[tokio::test]
+    async fn evicts_oldest_when_capacity_reached() {
+        let store = ClientCorrelationStore::with_max_pending(2);
+        for i in 0..5 {
+            store
+                .register(format!("event{i}"), json!(null), false)
+                .await;
+        }
+        assert_eq!(store.count().await, 2);
+        // Only the two most recent entries survive.
+        assert!(!store.contains("event0").await);
+        assert!(!store.contains("event1").await);
+        assert!(!store.contains("event2").await);
+        assert!(store.contains("event3").await);
+        assert!(store.contains("event4").await);
     }
 }
 
@@ -721,5 +753,67 @@ mod server_correlation_store {
 
         assert!(store.has_active_routes_for_client("c1").await);
         assert!(store.has_active_routes_for_client("c2").await);
+    }
+
+    // ── LRU eviction (TS SDK server tests 28–30) ─────────────────
+
+    #[tokio::test]
+    async fn evicts_oldest_route_when_capacity_reached() {
+        let store = ServerEventRouteStore::with_max_routes(2);
+
+        store
+            .register("event1".into(), "client1".into(), json!("req1"), None)
+            .await;
+        store
+            .register("event2".into(), "client1".into(), json!("req2"), None)
+            .await;
+        store
+            .register("event3".into(), "client1".into(), json!("req3"), None)
+            .await;
+
+        // event1 should have been evicted.
+        assert!(!store.has_event_route("event1").await);
+        assert_eq!(store.event_route_count().await, 2);
+    }
+
+    #[tokio::test]
+    async fn cleans_up_progress_tokens_on_eviction() {
+        let store = ServerEventRouteStore::with_max_routes(1);
+
+        store
+            .register(
+                "event1".into(),
+                "client1".into(),
+                json!("req1"),
+                Some("token1".into()),
+            )
+            .await;
+        store
+            .register(
+                "event2".into(),
+                "client1".into(),
+                json!("req2"),
+                Some("token2".into()),
+            )
+            .await;
+
+        assert!(!store.has_progress_token("token1").await);
+        assert!(store.has_progress_token("token2").await);
+    }
+
+    #[tokio::test]
+    async fn cleans_up_client_index_on_eviction() {
+        let store = ServerEventRouteStore::with_max_routes(1);
+
+        store
+            .register("event1".into(), "client1".into(), json!("req1"), None)
+            .await;
+        store
+            .register("event2".into(), "client2".into(), json!("req2"), None)
+            .await;
+
+        // client1's only route was evicted.
+        assert!(!store.has_active_routes_for_client("client1").await);
+        assert!(store.has_active_routes_for_client("client2").await);
     }
 }

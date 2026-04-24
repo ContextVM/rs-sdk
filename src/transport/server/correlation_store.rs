@@ -1,8 +1,10 @@
 //! Server-side event route store for mapping event IDs to client routes.
 
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
+use lru::LruCache;
 use tokio::sync::RwLock;
 
 /// A route entry for an in-flight request.
@@ -18,8 +20,8 @@ pub struct RouteEntry {
 
 /// Internal state behind the lock.
 struct Inner {
-    /// Primary index: event_id → route entry.
-    routes: HashMap<String, RouteEntry>,
+    /// Primary index: event_id → route entry (LRU-ordered).
+    routes: LruCache<String, RouteEntry>,
     /// Secondary index: progress_token → event_id.
     progress_token_to_event: HashMap<String, String>,
     /// Secondary index: client_pubkey → set of event_ids.
@@ -27,36 +29,43 @@ struct Inner {
 }
 
 impl Inner {
-    fn new() -> Self {
+    fn new(max_routes: Option<usize>) -> Self {
+        let routes = match max_routes {
+            Some(n) => LruCache::new(NonZeroUsize::new(n).expect("max_routes must be non-zero")),
+            None => LruCache::unbounded(),
+        };
         Self {
-            routes: HashMap::new(),
+            routes,
             progress_token_to_event: HashMap::new(),
             client_event_ids: HashMap::new(),
         }
     }
 
-    /// Remove a single route and clean up all secondary indexes.
-    fn remove_route(&mut self, event_id: &str) -> Option<RouteEntry> {
-        let route = self.routes.remove(event_id)?;
-
-        // Clean up progress token index.
+    /// Clean up secondary indexes for a removed route.
+    fn cleanup_indexes(&mut self, event_id: &str, route: &RouteEntry) {
         if let Some(ref token) = route.progress_token {
             self.progress_token_to_event.remove(token);
         }
-
-        // Clean up client index.
         if let Some(set) = self.client_event_ids.get_mut(&route.client_pubkey) {
             set.remove(event_id);
             if set.is_empty() {
                 self.client_event_ids.remove(&route.client_pubkey);
             }
         }
+    }
 
+    /// Remove a single route and clean up all secondary indexes.
+    fn remove_route(&mut self, event_id: &str) -> Option<RouteEntry> {
+        let route = self.routes.pop(event_id)?;
+        self.cleanup_indexes(event_id, &route);
         Some(route)
     }
 }
 
 /// Maps event IDs to full route entries for response routing on the server side.
+///
+/// An optional capacity limit enables LRU eviction; when the limit is reached
+/// the oldest entry is evicted and its secondary indexes are cleaned up.
 #[derive(Clone)]
 pub struct ServerEventRouteStore {
     inner: Arc<RwLock<Inner>>,
@@ -71,7 +80,15 @@ impl Default for ServerEventRouteStore {
 impl ServerEventRouteStore {
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(RwLock::new(Inner::new())),
+            inner: Arc::new(RwLock::new(Inner::new(None))),
+        }
+    }
+
+    /// Create a store with an upper bound on event routes.
+    /// When the limit is reached the oldest entry is evicted.
+    pub fn with_max_routes(max_routes: usize) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(Inner::new(Some(max_routes)))),
         }
     }
 
@@ -99,14 +116,22 @@ impl ServerEventRouteStore {
                 .insert(token.clone(), event_id.clone());
         }
 
-        inner.routes.insert(
-            event_id,
+        // Insert into LRU; handle possible eviction.
+        let evicted = inner.routes.push(
+            event_id.clone(),
             RouteEntry {
                 client_pubkey,
                 original_request_id,
                 progress_token,
             },
         );
+
+        if let Some((evicted_key, evicted_route)) = evicted {
+            if evicted_key != event_id {
+                // A different entry was evicted due to capacity — clean up its indexes.
+                inner.cleanup_indexes(&evicted_key, &evicted_route);
+            }
+        }
     }
 
     /// Returns the client public key for the given event ID without removing it.
@@ -115,13 +140,13 @@ impl ServerEventRouteStore {
             .read()
             .await
             .routes
-            .get(event_id)
+            .peek(event_id)
             .map(|r| r.client_pubkey.clone())
     }
 
     /// Returns the full route entry for the given event ID without removing it.
     pub async fn get_route(&self, event_id: &str) -> Option<RouteEntry> {
-        self.inner.read().await.routes.get(event_id).cloned()
+        self.inner.read().await.routes.peek(event_id).cloned()
     }
 
     /// Removes and returns the full route entry for the given event ID.
@@ -140,7 +165,7 @@ impl ServerEventRouteStore {
 
         let count = event_ids.len();
         for event_id in &event_ids {
-            if let Some(route) = inner.routes.remove(event_id.as_str()) {
+            if let Some(route) = inner.routes.pop(event_id.as_str()) {
                 if let Some(ref token) = route.progress_token {
                     inner.progress_token_to_event.remove(token);
                 }
@@ -151,7 +176,7 @@ impl ServerEventRouteStore {
 
     /// Check whether a route exists for the given event ID.
     pub async fn has_event_route(&self, event_id: &str) -> bool {
-        self.inner.read().await.routes.contains_key(event_id)
+        self.inner.read().await.routes.contains(event_id)
     }
 
     /// Check whether the given client has any active routes.
