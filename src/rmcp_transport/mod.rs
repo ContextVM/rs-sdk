@@ -16,6 +16,7 @@
 
 pub mod convert;
 pub mod pool;
+pub mod pool_transport;
 pub mod worker;
 
 #[cfg(test)]
