@@ -152,7 +152,7 @@ impl NostrMCPGateway {
     where
         T: nostr_sdk::prelude::IntoNostrSigner,
         H: rmcp::ServerHandler,
-        F: Fn() -> H,
+        F: Fn() -> H + Send + Sync + 'static,
     {
         crate::rmcp_transport::start_worker_pool(
             signer,
@@ -187,6 +187,7 @@ mod tests {
             cleanup_interval: Duration::from_secs(120),
             session_timeout: Duration::from_secs(600),
             log_file_path: None,
+            session_eviction_tx: None,
         };
 
         let config = GatewayConfig { nostr_config };

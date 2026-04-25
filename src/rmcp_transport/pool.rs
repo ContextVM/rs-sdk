@@ -1,9 +1,10 @@
 //! Worker pool for multi-client RMCP server transport.
 //!
-//! This module provides a `WorkerPool` that manages multiple `NostrServerWorker`
-//! instances, distributing incoming client peers across workers with round-robin
-//! assignment and client affinity. This solves the single-peer-per-worker
-//! limitation in the rmcp `Worker` trait.
+//! This module provides a `WorkerPool` that manages multiple workers,
+//! distributing incoming client peers across workers with round-robin
+//! assignment and client affinity. Each client gets its own rmcp `Service`
+//! instance (via `handler.serve(pool_transport)`) matching the TS SDK's
+//! per-client transport model.
 //!
 //! # Architecture
 //!
@@ -12,14 +13,17 @@
 //!         │
 //!         ▼
 //! WorkerPool dispatcher task
-//!   ├── Worker #0  (rmcp service + handler)
-//!   ├── Worker #1  (rmcp service + handler)
+//!   ├── Worker #0
+//!   │   ├── Client A  (handler.serve(transport_a))
+//!   │   └── Client B  (handler.serve(transport_b))
+//!   ├── Worker #1
+//!   │   └── Client C  (handler.serve(transport_c))
 //!   └── Worker #N  ...
 //! ```
 //!
-//! Each worker has a maximum client capacity. When all workers are full,
-//! new clients either wait in a bounded queue or receive a "server busy"
-//! JSON-RPC error response.
+//! Each worker manages up to `max_clients_per_worker` concurrent client
+//! sessions. When all workers are full, new clients wait in a bounded queue
+//! or receive a "-32000 Server busy" JSON-RPC error response.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -30,6 +34,8 @@ use tokio_util::sync::CancellationToken;
 use crate::core::error::{Error, Result};
 use crate::core::types::{JsonRpcErrorResponse, JsonRpcMessage};
 use crate::transport::server::{IncomingRequest, NostrServerTransport, NostrServerTransportConfig};
+
+use super::pool_transport::PoolWorkerTransport;
 
 /// Configuration for the worker pool.
 #[derive(Debug, Clone)]
@@ -60,18 +66,21 @@ impl Default for WorkerPoolConfig {
 
 /// Metadata for a single worker in the pool.
 struct WorkerSlot {
-    /// Channel to forward incoming requests to this worker.
+    /// Channel to forward incoming requests to this worker's dispatcher.
     tx: mpsc::UnboundedSender<IncomingRequest>,
     /// Set of client pubkeys currently assigned to this worker.
     active_clients: HashSet<String>,
 }
 
 /// Shared mutable state for the pool dispatcher.
-struct PoolState {
+pub(crate) struct PoolState {
     /// Per-worker metadata.
     workers: Vec<WorkerSlot>,
     /// Maps client pubkey → worker index for affinity.
     client_affinity: HashMap<String, usize>,
+    /// Maps client pubkey → per-client request channel.
+    /// Each client has its own channel feeding its dedicated rmcp Service.
+    client_channels: HashMap<String, mpsc::UnboundedSender<IncomingRequest>>,
     /// Round-robin counter for new client assignment.
     next_worker: usize,
     /// Waiting queue for clients when all workers are at capacity.
@@ -104,14 +113,15 @@ impl PoolState {
             .insert(client_pubkey.to_string(), worker_idx);
     }
 
-    /// Remove a client from its assigned worker (e.g., on session timeout).
-    #[allow(dead_code)]
-    fn release_client(&mut self, client_pubkey: &str) {
+    /// Remove a client from its assigned worker (e.g., on session timeout/eviction).
+    pub(crate) fn release_client(&mut self, client_pubkey: &str) {
         if let Some(worker_idx) = self.client_affinity.remove(client_pubkey) {
             if let Some(slot) = self.workers.get_mut(worker_idx) {
                 slot.active_clients.remove(client_pubkey);
             }
-            // Trigger a drain since a slot may have just opened up.
+            // Remove the per-client channel (dropping it closes the transport)
+            self.client_channels.remove(client_pubkey);
+            // Try to drain the wait queue since a slot opened up
             self.drain_wait_queue();
         }
     }
@@ -135,7 +145,7 @@ impl PoolState {
     }
 }
 
-/// Handle returned by `WorkerPool::start()` for lifecycle management.
+/// Handle returned by [`start_worker_pool`] for lifecycle management.
 pub struct WorkerPoolHandle {
     /// Cancel token to shut down the pool.
     cancel: CancellationToken,
@@ -191,32 +201,41 @@ pub struct WorkerPoolStats {
 /// Start a worker pool that dispatches incoming Nostr requests across
 /// multiple rmcp server workers.
 ///
+/// Each client assigned to a worker gets its own rmcp `Service` instance,
+/// created by calling `handler_factory()` and `handler.serve(pool_transport)`.
+/// This matches the TS SDK's per-client transport model.
+///
 /// # Type Parameters
 ///
 /// - `T`: Nostr signer type
 /// - `H`: rmcp `ServerHandler` implementation
+/// - `F`: Handler factory function
 ///
 /// # Arguments
 ///
 /// - `signer`: The Nostr signer for the server identity
 /// - `server_config`: Configuration for the underlying `NostrServerTransport`
 /// - `pool_config`: Configuration for pool sizing and capacity
-/// - `handler_factory`: A function that creates a new handler instance for each worker
+/// - `handler_factory`: A function that creates a new handler instance for each client
 ///
 /// # Returns
 ///
 /// A `WorkerPoolHandle` for lifecycle management and metrics.
 pub async fn start_worker_pool<T, H, F>(
     signer: T,
-    server_config: NostrServerTransportConfig,
+    mut server_config: NostrServerTransportConfig,
     pool_config: WorkerPoolConfig,
     handler_factory: F,
 ) -> Result<WorkerPoolHandle>
 where
     T: nostr_sdk::prelude::IntoNostrSigner,
     H: rmcp::ServerHandler,
-    F: Fn() -> H,
+    F: Fn() -> H + Send + Sync + 'static,
 {
+    // Create the session eviction channel so cleanup_sessions can notify us
+    let (eviction_tx, mut eviction_rx) = mpsc::unbounded_channel::<String>();
+    server_config.session_eviction_tx = Some(eviction_tx);
+
     // Create the single shared transport
     let mut transport = NostrServerTransport::new(signer, server_config).await?;
     transport.start().await?;
@@ -228,27 +247,26 @@ where
     let cancel = CancellationToken::new();
     let mut join_handles = Vec::new();
 
+    let transport = Arc::new(transport);
+    let handler_factory = Arc::new(handler_factory);
+
     // Create worker slots
     let mut workers = Vec::with_capacity(pool_config.pool_size);
 
-    for worker_idx in 0..pool_config.pool_size {
-        let (tx, rx) = mpsc::unbounded_channel::<IncomingRequest>();
+    for _worker_idx in 0..pool_config.pool_size {
+        let (tx, _rx) = mpsc::unbounded_channel::<IncomingRequest>();
         workers.push(WorkerSlot {
             tx,
             active_clients: HashSet::new(),
         });
-
-        // Spawn each worker's rmcp service
-        let handler = handler_factory();
-        let worker_cancel = cancel.clone();
-
-        let handle = tokio::spawn(run_worker_loop(worker_idx, rx, handler, worker_cancel));
-        join_handles.push(handle);
+        // Note: worker tasks are not pre-spawned. Per-client service tasks
+        // are spawned on demand by the dispatcher when new clients arrive.
     }
 
     let state = Arc::new(RwLock::new(PoolState {
         workers,
         client_affinity: HashMap::new(),
+        client_channels: HashMap::new(),
         next_worker: 0,
         wait_queue: VecDeque::new(),
         config: pool_config,
@@ -257,8 +275,8 @@ where
     // Spawn the dispatcher task
     let dispatcher_state = state.clone();
     let dispatcher_cancel = cancel.clone();
-    let transport = Arc::new(transport);
-    let transport_for_busy = transport.clone();
+    let transport_for_dispatcher = transport.clone();
+    let handler_factory_for_dispatcher = handler_factory.clone();
 
     let dispatcher = tokio::spawn(async move {
         loop {
@@ -277,13 +295,12 @@ where
                     let client_pubkey = request.client_pubkey.clone();
                     let event_id = request.event_id.clone();
 
-                    // Check affinity first — existing client goes to same worker
-                    if let Some(&worker_idx) = state.client_affinity.get(&client_pubkey) {
-                        if state.workers[worker_idx].tx.send(request).is_err() {
-                            tracing::error!(
-                                worker = worker_idx,
+                    // Check if this client already has a channel (affinity)
+                    if let Some(client_tx) = state.client_channels.get(&client_pubkey) {
+                        if client_tx.send(request).is_err() {
+                            tracing::warn!(
                                 client = %client_pubkey,
-                                "Worker channel closed for affine client"
+                                "Client channel closed, releasing"
                             );
                             state.release_client(&client_pubkey);
                         }
@@ -298,13 +315,42 @@ where
                             "Assigning new client to worker"
                         );
                         state.assign_client(&client_pubkey, worker_idx);
-                        if state.workers[worker_idx].tx.send(request).is_err() {
-                            tracing::error!(
-                                worker = worker_idx,
-                                "Worker channel closed during assignment"
+
+                        // Create a per-client channel and spawn a service task
+                        let (client_tx, client_rx) =
+                            mpsc::unbounded_channel::<IncomingRequest>();
+                        state
+                            .client_channels
+                            .insert(client_pubkey.clone(), client_tx.clone());
+
+                        // Send the first message
+                        let _ = client_tx.send(request);
+
+                        // Spawn a per-client rmcp service task
+                        let handler = handler_factory_for_dispatcher();
+                        let client_cancel = dispatcher_cancel.child_token();
+                        let client_transport = transport_for_dispatcher.clone();
+                        let client_pubkey_owned = client_pubkey.clone();
+                        let cleanup_state = dispatcher_state.clone();
+
+                        tokio::spawn(async move {
+                            run_client_service(
+                                handler,
+                                client_rx,
+                                client_transport,
+                                client_pubkey_owned.clone(),
+                                client_cancel,
+                            )
+                            .await;
+
+                            // When the service exits, release the client slot
+                            let mut state = cleanup_state.write().await;
+                            state.release_client(&client_pubkey_owned);
+                            tracing::debug!(
+                                client = %client_pubkey_owned,
+                                "Client service exited, slot released"
                             );
-                            state.release_client(&client_pubkey);
-                        }
+                        });
                     } else if state.wait_queue.len() < state.config.max_queue_depth {
                         // All workers full — enqueue
                         tracing::warn!(
@@ -321,16 +367,45 @@ where
                         );
                         drop(state);
                         send_server_busy_error(
-                            &transport_for_busy,
+                            &transport_for_dispatcher,
                             &client_pubkey,
                             &event_id,
-                        ).await;
+                        )
+                        .await;
                     }
                 }
             }
         }
     });
     join_handles.push(dispatcher);
+
+    // Spawn the eviction listener task
+    let eviction_state = state.clone();
+    let eviction_cancel = cancel.clone();
+
+    let eviction_listener = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = eviction_cancel.cancelled() => {
+                    break;
+                }
+                evicted = eviction_rx.recv() => {
+                    let Some(pubkey) = evicted else {
+                        break;
+                    };
+                    let mut state = eviction_state.write().await;
+                    if state.client_affinity.contains_key(&pubkey) {
+                        tracing::info!(
+                            client = %pubkey,
+                            "Session evicted by transport cleanup, releasing pool slot"
+                        );
+                        state.release_client(&pubkey);
+                    }
+                }
+            }
+        }
+    });
+    join_handles.push(eviction_listener);
 
     Ok(WorkerPoolHandle {
         cancel,
@@ -339,77 +414,51 @@ where
     })
 }
 
-/// Run a single worker's event loop, processing incoming requests
-/// via the convert bridge.
+/// Run a per-client rmcp service instance.
 ///
-/// Each worker receives `IncomingRequest`s from the pool dispatcher,
-/// converts them to rmcp format, and forwards them to the handler.
-/// Response routing back to the correct client is tracked via the
-/// request correlation map.
-async fn run_worker_loop<H: rmcp::ServerHandler>(
-    worker_idx: usize,
-    mut rx: mpsc::UnboundedReceiver<IncomingRequest>,
-    _handler: H,
+/// Creates a `PoolWorkerTransport` and calls `handler.serve(transport)`,
+/// letting rmcp's `Service` machinery drive the handler automatically.
+async fn run_client_service<H: rmcp::ServerHandler>(
+    handler: H,
+    incoming_rx: mpsc::UnboundedReceiver<IncomingRequest>,
+    server_transport: Arc<NostrServerTransport>,
+    client_pubkey: String,
     cancel: CancellationToken,
 ) {
-    use crate::rmcp_transport::convert::internal_to_rmcp_server_rx;
+    use rmcp::ServiceExt;
 
-    // Per-worker correlation: serialized_request_id → (event_id, client_pubkey)
-    let mut request_correlation: HashMap<String, (String, String)> = HashMap::new();
+    let pool_transport = PoolWorkerTransport::new(
+        incoming_rx,
+        server_transport,
+        client_pubkey.clone(),
+        cancel,
+    );
 
-    tracing::info!(worker = worker_idx, "Worker started");
-
-    loop {
-        tokio::select! {
-            _ = cancel.cancelled() => {
-                tracing::info!(worker = worker_idx, "Worker cancelled");
-                break;
-            }
-            incoming = rx.recv() => {
-                let Some(incoming) = incoming else {
-                    tracing::info!(worker = worker_idx, "Worker input channel closed");
-                    break;
-                };
-
-                let IncomingRequest {
-                    message,
-                    client_pubkey,
-                    event_id,
-                    ..
-                } = incoming;
-
-                // Track correlation for requests
-                if let JsonRpcMessage::Request(ref req) = message {
-                    if let Ok(request_key) = serde_json::to_string(&req.id) {
-                        request_correlation.insert(
-                            request_key,
-                            (event_id.clone(), client_pubkey.clone()),
-                        );
-                    }
-                }
-
-                // Convert to rmcp format for the handler
-                if let Some(_rmcp_msg) = internal_to_rmcp_server_rx(&message) {
+    match handler.serve(pool_transport).await {
+        Ok(running_service) => {
+            tracing::debug!(client = %client_pubkey, "rmcp service started for client");
+            // Block until the service completes (client disconnects or cancel)
+            match running_service.waiting().await {
+                Ok(quit_reason) => {
                     tracing::debug!(
-                        worker = worker_idx,
                         client = %client_pubkey,
-                        event_id = %event_id,
-                        "Converted and dispatched message to worker"
+                        reason = ?quit_reason,
+                        "rmcp service completed"
                     );
-                    // TODO: Forward rmcp_msg to the handler's service channel
-                    // once we integrate with rmcp's Service machinery.
-                    // For now, the convert bridge validates the message format.
-                } else {
-                    tracing::warn!(
-                        worker = worker_idx,
-                        "Failed to convert incoming message to rmcp format"
-                    );
+                }
+                Err(e) => {
+                    tracing::debug!(client = %client_pubkey, error = %e, "rmcp service join error");
                 }
             }
         }
+        Err(e) => {
+            tracing::error!(
+                client = %client_pubkey,
+                error = %e,
+                "Failed to start rmcp service for client"
+            );
+        }
     }
-
-    tracing::info!(worker = worker_idx, "Worker exiting");
 }
 
 /// Send a "server busy" JSON-RPC error response to a client.
@@ -428,15 +477,10 @@ async fn send_server_busy_error(
         },
     });
 
-    // Try to send the error response. If there's no session yet for this client,
-    // we need to send it via a notification-like path since send_response requires
-    // an existing session with correlation data.
     if let Err(e) = transport
         .send_notification(client_pubkey, &error_response, Some(event_id))
         .await
     {
-        // If notification fails (no session), try to send as response
-        // (will only work if there's already a session from a prior request)
         tracing::warn!(
             client = %client_pubkey,
             "Failed to send server-busy error: {e}"
@@ -475,17 +519,15 @@ mod tests {
                 })
                 .collect(),
             client_affinity: HashMap::new(),
+            client_channels: HashMap::new(),
             next_worker: 0,
             wait_queue: VecDeque::new(),
             config,
         };
 
-        // First selection should pick worker 0
         assert_eq!(state.select_worker(), Some(0));
-        // After selection, next_worker advances to 1
         assert_eq!(state.select_worker(), Some(1));
         assert_eq!(state.select_worker(), Some(2));
-        // Wraps around
         assert_eq!(state.select_worker(), Some(0));
     }
 
@@ -508,14 +550,13 @@ mod tests {
                 })
                 .collect(),
             client_affinity: HashMap::new(),
+            client_channels: HashMap::new(),
             next_worker: 0,
             wait_queue: VecDeque::new(),
             config,
         };
 
-        // Fill worker 0
         state.assign_client("client_a", 0);
-        // Selection should skip worker 0 and pick worker 1
         assert_eq!(state.select_worker(), Some(1));
     }
 
@@ -538,15 +579,14 @@ mod tests {
                 })
                 .collect(),
             client_affinity: HashMap::new(),
+            client_channels: HashMap::new(),
             next_worker: 0,
             wait_queue: VecDeque::new(),
             config,
         };
 
-        // Fill all workers
         state.assign_client("client_a", 0);
         state.assign_client("client_b", 1);
-        // No worker available
         assert_eq!(state.select_worker(), None);
     }
 
@@ -569,6 +609,7 @@ mod tests {
                 })
                 .collect(),
             client_affinity: HashMap::new(),
+            client_channels: HashMap::new(),
             next_worker: 0,
             wait_queue: VecDeque::new(),
             config,
@@ -577,11 +618,9 @@ mod tests {
         state.assign_client("client_a", 0);
         state.assign_client("client_b", 1);
 
-        // Affinity should map correctly
         assert_eq!(state.client_affinity.get("client_a"), Some(&0));
         assert_eq!(state.client_affinity.get("client_b"), Some(&1));
 
-        // Worker 0 should have client_a
         assert!(state.workers[0].active_clients.contains("client_a"));
         assert!(!state.workers[0].active_clients.contains("client_b"));
     }
@@ -605,6 +644,7 @@ mod tests {
                 })
                 .collect(),
             client_affinity: HashMap::new(),
+            client_channels: HashMap::new(),
             next_worker: 0,
             wait_queue: VecDeque::new(),
             config,
@@ -634,12 +674,12 @@ mod tests {
                 active_clients: HashSet::new(),
             }],
             client_affinity: HashMap::new(),
+            client_channels: HashMap::new(),
             next_worker: 0,
             wait_queue: VecDeque::new(),
             config,
         };
 
-        // Add a pending request to the queue
         state.wait_queue.push_back(IncomingRequest {
             message: JsonRpcMessage::Request(crate::core::types::JsonRpcRequest {
                 jsonrpc: "2.0".to_string(),
@@ -654,12 +694,10 @@ mod tests {
 
         assert_eq!(state.wait_queue.len(), 1);
 
-        // Drain should assign the queued client to the worker
         state.drain_wait_queue();
         assert_eq!(state.wait_queue.len(), 0);
         assert!(state.client_affinity.contains_key("queued_client"));
 
-        // The worker should have received the request
         assert!(rx.try_recv().is_ok());
     }
 }
