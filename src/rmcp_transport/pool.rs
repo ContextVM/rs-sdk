@@ -427,12 +427,8 @@ async fn run_client_service<H: rmcp::ServerHandler>(
 ) {
     use rmcp::ServiceExt;
 
-    let pool_transport = PoolWorkerTransport::new(
-        incoming_rx,
-        server_transport,
-        client_pubkey.clone(),
-        cancel,
-    );
+    let pool_transport =
+        PoolWorkerTransport::new(incoming_rx, server_transport, client_pubkey.clone(), cancel);
 
     match handler.serve(pool_transport).await {
         Ok(running_service) => {

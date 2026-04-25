@@ -17,8 +17,8 @@
 mod pool_parity {
     use contextvm_sdk::rmcp_transport::pool::{WorkerPoolConfig, WorkerPoolStats};
     use rmcp::{
-        handler::server::wrapper::Parameters, model::*, schemars, tool,
-        tool_handler, tool_router, ServerHandler, ServiceExt,
+        handler::server::wrapper::Parameters, model::*, schemars, tool, tool_handler, tool_router,
+        ServerHandler, ServiceExt,
     };
     use std::sync::Arc;
     use tokio::sync::Mutex;
@@ -116,7 +116,9 @@ mod pool_parity {
         let result = client
             .call_tool(CallToolRequestParams {
                 name: "echo".into(),
-                arguments: Some(serde_json::from_value(serde_json::json!({"message": "pool-test"})).unwrap()),
+                arguments: Some(
+                    serde_json::from_value(serde_json::json!({"message": "pool-test"})).unwrap(),
+                ),
                 meta: None,
                 task: None,
             })
@@ -165,15 +167,27 @@ mod pool_parity {
 
         // Both clients should be able to call tools concurrently
         let (r1, r2) = tokio::join!(
-            c1.call_tool(call_params("echo", serde_json::json!({"message": "from-client-1"}))),
-            c2.call_tool(call_params("echo", serde_json::json!({"message": "from-client-2"}))),
+            c1.call_tool(call_params(
+                "echo",
+                serde_json::json!({"message": "from-client-1"})
+            )),
+            c2.call_tool(call_params(
+                "echo",
+                serde_json::json!({"message": "from-client-2"})
+            )),
         );
 
         let t1 = first_text(&r1.unwrap());
         let t2 = first_text(&r2.unwrap());
 
-        assert!(t1.contains("from-client-1"), "client 1 got wrong response: {t1}");
-        assert!(t2.contains("from-client-2"), "client 2 got wrong response: {t2}");
+        assert!(
+            t1.contains("from-client-1"),
+            "client 1 got wrong response: {t1}"
+        );
+        assert!(
+            t2.contains("from-client-2"),
+            "client 2 got wrong response: {t2}"
+        );
 
         c1.cancel().await.unwrap();
         c2.cancel().await.unwrap();
@@ -264,8 +278,6 @@ mod pool_parity {
             max_clients_per_worker: 1,
             max_queue_depth: 5,
         };
-
-
 
         // Simulate pool state internals via public config validation
         // Worker is full (1/1 client)
