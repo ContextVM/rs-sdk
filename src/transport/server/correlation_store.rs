@@ -18,6 +18,9 @@ pub struct RouteEntry {
     pub original_request_id: serde_json::Value,
     /// Optional progress token for this request.
     pub progress_token: Option<String>,
+    /// The outer gift-wrap event kind that carried this request (e.g. 1059 or 21059).
+    /// Populated from the inbound event in a later PR; `None` until then.
+    pub wrap_kind: Option<u16>,
 }
 
 /// Internal state behind the lock.
@@ -123,6 +126,7 @@ impl ServerEventRouteStore {
                 client_pubkey,
                 original_request_id,
                 progress_token,
+                wrap_kind: None,
             },
         );
 

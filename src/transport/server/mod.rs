@@ -35,6 +35,8 @@ pub struct NostrServerTransportConfig {
     pub relay_urls: Vec<String>,
     /// Encryption mode.
     pub encryption_mode: EncryptionMode,
+    /// Gift-wrap kind selection policy (CEP-19).
+    pub gift_wrap_mode: GiftWrapMode,
     /// Server information for announcements.
     pub server_info: Option<ServerInfo>,
     /// Whether this server publishes public announcements (CEP-6).
@@ -56,6 +58,7 @@ impl Default for NostrServerTransportConfig {
         Self {
             relay_urls: vec!["wss://relay.damus.io".to_string()],
             encryption_mode: EncryptionMode::Optional,
+            gift_wrap_mode: GiftWrapMode::Optional,
             server_info: None,
             is_announced_server: false,
             allowed_public_keys: Vec::new(),

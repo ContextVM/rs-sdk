@@ -64,6 +64,9 @@ pub mod tags {
 
     /// Support ephemeral gift wrap kind (21059) for encrypted messages (CEP-19)
     pub const SUPPORT_ENCRYPTION_EPHEMERAL: &str = "support_encryption_ephemeral";
+
+    /// Support CEP-22 oversized payload transfer via notifications/progress framing
+    pub const SUPPORT_OVERSIZED_TRANSFER: &str = "support_oversized_transfer";
 }
 
 /// Maximum message size (1MB)
@@ -161,6 +164,10 @@ mod tests {
         assert_eq!(
             tags::SUPPORT_ENCRYPTION_EPHEMERAL,
             "support_encryption_ephemeral"
+        );
+        assert_eq!(
+            tags::SUPPORT_OVERSIZED_TRANSFER,
+            "support_oversized_transfer"
         );
     }
 

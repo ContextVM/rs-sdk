@@ -117,6 +117,7 @@ mod tests {
         let nostr_config = NostrServerTransportConfig {
             relay_urls: vec!["wss://relay.example.com".to_string()],
             encryption_mode: EncryptionMode::Required,
+            gift_wrap_mode: GiftWrapMode::Optional,
             server_info: Some(ServerInfo {
                 name: Some("Test Gateway".to_string()),
                 version: Some("1.0.0".to_string()),

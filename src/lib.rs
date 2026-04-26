@@ -62,6 +62,7 @@ pub use relay::{RelayPool, RelayPoolTrait};
 pub use transport::client::{
     ClientCorrelationStore, NostrClientTransport, NostrClientTransportConfig,
 };
+pub use transport::discovery_tags::{DiscoveredPeerCapabilities, PeerCapabilities};
 pub use transport::server::{
     IncomingRequest, NostrServerTransport, NostrServerTransportConfig, RouteEntry,
     ServerEventRouteStore, SessionSnapshot, SessionStore,
