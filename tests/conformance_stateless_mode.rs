@@ -3,7 +3,9 @@
 use std::time::Duration;
 
 use contextvm_sdk::core::constants::{mcp_protocol_version, INITIALIZE_METHOD};
-use contextvm_sdk::core::types::{EncryptionMode, JsonRpcMessage, JsonRpcRequest};
+use contextvm_sdk::core::types::{
+    EncryptionMode, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest,
+};
 use contextvm_sdk::signer;
 use contextvm_sdk::transport::client::{NostrClientTransport, NostrClientTransportConfig};
 use tokio::time::timeout;
@@ -167,5 +169,27 @@ async fn should_handle_statelessly_returns_false_for_other_methods() {
     assert!(
         recv_result.is_err(),
         "non-initialize request should not create a local emulated response"
+    );
+}
+
+#[tokio::test]
+async fn notifications_initialized_swallowed_in_stateless_mode() {
+    let (transport, mut rx) = make_stateless_transport().await;
+
+    let notification = JsonRpcMessage::Notification(JsonRpcNotification {
+        jsonrpc: "2.0".to_string(),
+        method: "notifications/initialized".to_string(),
+        params: None,
+    });
+
+    transport
+        .send(&notification)
+        .await
+        .expect("notifications/initialized should be accepted in stateless mode");
+
+    let recv_result = timeout(Duration::from_millis(200), rx.recv()).await;
+    assert!(
+        recv_result.is_err(),
+        "notifications/initialized must be swallowed in stateless mode"
     );
 }

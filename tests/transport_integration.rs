@@ -9,15 +9,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use contextvm_sdk::core::constants::{
-    mcp_protocol_version, GIFT_WRAP_KIND, SERVER_ANNOUNCEMENT_KIND,
+    mcp_protocol_version, CTXVM_MESSAGES_KIND, GIFT_WRAP_KIND, PROMPTS_LIST_KIND,
+    RESOURCES_LIST_KIND, RESOURCETEMPLATES_LIST_KIND, SERVER_ANNOUNCEMENT_KIND, TOOLS_LIST_KIND,
 };
 use contextvm_sdk::core::types::EncryptionMode;
 use contextvm_sdk::relay::mock::MockRelayPool;
 use contextvm_sdk::transport::client::{NostrClientTransport, NostrClientTransportConfig};
 use contextvm_sdk::transport::server::{NostrServerTransport, NostrServerTransportConfig};
 use contextvm_sdk::{
-    JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, RelayPoolTrait,
-    ServerInfo,
+    CapabilityExclusion, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
+    RelayPoolTrait, ServerInfo,
 };
 use nostr_sdk::prelude::*;
 
@@ -600,4 +601,1197 @@ async fn correlated_notification_has_e_tag() {
         Some(request_event_id.as_str()),
         "notification event must have e tag referencing the original request event id"
     );
+}
+
+// ── 9. Encryption Required client, Optional server ──────────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn encryption_required_client_optional_server() {
+    let (client_pool, server_pool) = MockRelayPool::create_pair();
+    let server_pubkey = server_pool.mock_public_key();
+
+    let mut server = NostrServerTransport::with_relay_pool(
+        NostrServerTransportConfig {
+            encryption_mode: EncryptionMode::Optional,
+            ..Default::default()
+        },
+        as_pool(server_pool),
+    )
+    .await
+    .expect("create server transport");
+
+    let mut client = NostrClientTransport::with_relay_pool(
+        NostrClientTransportConfig {
+            server_pubkey: server_pubkey.to_hex(),
+            encryption_mode: EncryptionMode::Required,
+            ..Default::default()
+        },
+        as_pool(client_pool),
+    )
+    .await
+    .expect("create client transport");
+
+    let mut server_rx = server
+        .take_message_receiver()
+        .expect("server message receiver");
+
+    server.start().await.expect("server start");
+    client.start().await.expect("client start");
+    let_event_loops_start().await;
+
+    let request = JsonRpcMessage::Request(JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: serde_json::json!("enc-opt-1"),
+        method: "tools/list".to_string(),
+        params: None,
+    });
+    client.send(&request).await.expect("send encrypted request");
+
+    let incoming = tokio::time::timeout(Duration::from_millis(500), server_rx.recv())
+        .await
+        .expect("timeout waiting for server to receive encrypted request")
+        .expect("server channel closed");
+
+    assert_eq!(
+        incoming.message.method(),
+        Some("tools/list"),
+        "Optional-mode server must accept encrypted messages from Required-mode client"
+    );
+    assert!(
+        incoming.is_encrypted,
+        "message from Required-mode client must be marked encrypted"
+    );
+}
+
+// ── 10. Encryption Optional both sides, encrypted path ──────────────────────
+// Optional client defaults to encrypting (unwrap_or(true)), Optional server
+// accepts encrypted messages. Tests the Optional/Optional negotiation path.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn encryption_optional_both_sides_encrypted_path() {
+    let (client_pool, server_pool) = MockRelayPool::create_pair();
+    let server_pubkey = server_pool.mock_public_key();
+
+    let mut server = NostrServerTransport::with_relay_pool(
+        NostrServerTransportConfig {
+            encryption_mode: EncryptionMode::Optional,
+            ..Default::default()
+        },
+        as_pool(server_pool),
+    )
+    .await
+    .expect("create server transport");
+
+    let mut client = NostrClientTransport::with_relay_pool(
+        NostrClientTransportConfig {
+            server_pubkey: server_pubkey.to_hex(),
+            encryption_mode: EncryptionMode::Optional,
+            ..Default::default()
+        },
+        as_pool(client_pool),
+    )
+    .await
+    .expect("create client transport");
+
+    let mut server_rx = server
+        .take_message_receiver()
+        .expect("server message receiver");
+
+    server.start().await.expect("server start");
+    client.start().await.expect("client start");
+    let_event_loops_start().await;
+
+    let request = JsonRpcMessage::Request(JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: serde_json::json!("opt-both-1"),
+        method: "tools/list".to_string(),
+        params: None,
+    });
+    client.send(&request).await.expect("send request");
+
+    let incoming = tokio::time::timeout(Duration::from_millis(500), server_rx.recv())
+        .await
+        .expect("timeout waiting for server to receive request")
+        .expect("server channel closed");
+
+    assert_eq!(incoming.message.method(), Some("tools/list"));
+    assert!(
+        incoming.is_encrypted,
+        "Optional client defaults to encrypting; Optional server must accept"
+    );
+}
+
+// ── 11. Announce includes encryption tags ────────────────────────────────────
+
+#[tokio::test]
+async fn announce_includes_encryption_tags() {
+    let pool = Arc::new(MockRelayPool::new());
+
+    let mut server = NostrServerTransport::with_relay_pool(
+        NostrServerTransportConfig {
+            is_announced_server: true,
+            server_info: Some(ServerInfo {
+                name: Some("Encrypted-Server".to_string()),
+                ..Default::default()
+            }),
+            encryption_mode: EncryptionMode::Required,
+            ..Default::default()
+        },
+        Arc::clone(&pool) as Arc<dyn RelayPoolTrait>,
+    )
+    .await
+    .expect("create server transport");
+
+    server.start().await.expect("server start");
+    server.announce().await.expect("server announce");
+
+    let events = pool.stored_events().await;
+    let announcement = events
+        .iter()
+        .find(|e| e.kind == Kind::Custom(SERVER_ANNOUNCEMENT_KIND))
+        .expect("kind 11316 event must be published");
+
+    // support_encryption is a valueless tag — check tag name directly.
+    let has_support_encryption = announcement
+        .tags
+        .iter()
+        .any(|t| t.clone().to_vec().first().map(|s| s.as_str()) == Some("support_encryption"));
+    let has_support_encryption_ephemeral = announcement.tags.iter().any(|t| {
+        t.clone().to_vec().first().map(|s| s.as_str()) == Some("support_encryption_ephemeral")
+    });
+
+    assert!(
+        has_support_encryption,
+        "announcement must include support_encryption tag"
+    );
+    assert!(
+        has_support_encryption_ephemeral,
+        "announcement must include support_encryption_ephemeral tag"
+    );
+}
+
+// ── 12. Announce includes server metadata tags ──────────────────────────────
+
+#[tokio::test]
+async fn announce_includes_server_metadata_tags() {
+    let pool = Arc::new(MockRelayPool::new());
+
+    let mut server = NostrServerTransport::with_relay_pool(
+        NostrServerTransportConfig {
+            is_announced_server: true,
+            server_info: Some(ServerInfo {
+                name: Some("Meta-Server".to_string()),
+                about: Some("A test server".to_string()),
+                website: Some("https://example.com".to_string()),
+                picture: Some("https://example.com/pic.png".to_string()),
+                ..Default::default()
+            }),
+            encryption_mode: EncryptionMode::Disabled,
+            ..Default::default()
+        },
+        Arc::clone(&pool) as Arc<dyn RelayPoolTrait>,
+    )
+    .await
+    .expect("create server transport");
+
+    server.start().await.expect("server start");
+    server.announce().await.expect("server announce");
+
+    let events = pool.stored_events().await;
+    let announcement = events
+        .iter()
+        .find(|e| e.kind == Kind::Custom(SERVER_ANNOUNCEMENT_KIND))
+        .expect("kind 11316 event must be published");
+
+    let name_tag = contextvm_sdk::core::serializers::get_tag_value(&announcement.tags, "name");
+    let about_tag = contextvm_sdk::core::serializers::get_tag_value(&announcement.tags, "about");
+    let website_tag =
+        contextvm_sdk::core::serializers::get_tag_value(&announcement.tags, "website");
+    let picture_tag =
+        contextvm_sdk::core::serializers::get_tag_value(&announcement.tags, "picture");
+
+    assert_eq!(
+        name_tag.as_deref(),
+        Some("Meta-Server"),
+        "name tag must be present"
+    );
+    assert_eq!(
+        about_tag.as_deref(),
+        Some("A test server"),
+        "about tag must be present"
+    );
+    assert_eq!(
+        website_tag.as_deref(),
+        Some("https://example.com"),
+        "website tag must be present"
+    );
+    assert_eq!(
+        picture_tag.as_deref(),
+        Some("https://example.com/pic.png"),
+        "picture tag must be present"
+    );
+}
+
+// ── 13. Publish tools produces correct kind ─────────────────────────────────
+
+#[tokio::test]
+async fn publish_tools_produces_correct_kind() {
+    let pool = Arc::new(MockRelayPool::new());
+
+    let mut server = NostrServerTransport::with_relay_pool(
+        NostrServerTransportConfig {
+            is_announced_server: true,
+            server_info: Some(ServerInfo {
+                name: Some("Tools-Server".to_string()),
+                ..Default::default()
+            }),
+            encryption_mode: EncryptionMode::Disabled,
+            ..Default::default()
+        },
+        Arc::clone(&pool) as Arc<dyn RelayPoolTrait>,
+    )
+    .await
+    .expect("create server transport");
+
+    server.start().await.expect("server start");
+    server.announce().await.expect("server announce");
+
+    let tools = vec![serde_json::json!({
+        "name": "get_weather",
+        "description": "Get the weather",
+        "inputSchema": { "type": "object" }
+    })];
+    server.publish_tools(tools).await.expect("publish tools");
+
+    let events = pool.stored_events().await;
+    let tools_event = events
+        .iter()
+        .find(|e| e.kind == Kind::Custom(TOOLS_LIST_KIND))
+        .expect("kind 11317 event must be published");
+
+    let content: serde_json::Value =
+        serde_json::from_str(&tools_event.content).expect("tools content must be JSON");
+    assert!(
+        content.get("tools").is_some(),
+        "tools event content must contain 'tools' key"
+    );
+    let tools_arr = content["tools"].as_array().expect("tools must be an array");
+    assert_eq!(tools_arr.len(), 1);
+    assert_eq!(tools_arr[0]["name"], "get_weather");
+}
+
+// ── 14. Broadcast notification reaches initialized client ─────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn broadcast_notification_reaches_initialized_client() {
+    let (c1_pool, s_pool) = MockRelayPool::create_pair();
+    let server_pk = s_pool.mock_public_key();
+
+    let mut server = NostrServerTransport::with_relay_pool(
+        NostrServerTransportConfig {
+            encryption_mode: EncryptionMode::Disabled,
+            ..Default::default()
+        },
+        as_pool(s_pool),
+    )
+    .await
+    .expect("create server transport");
+
+    let mut srv_rx = server
+        .take_message_receiver()
+        .expect("server message receiver");
+    server.start().await.expect("server start");
+
+    let mut client = NostrClientTransport::with_relay_pool(
+        NostrClientTransportConfig {
+            server_pubkey: server_pk.to_hex(),
+            encryption_mode: EncryptionMode::Disabled,
+            ..Default::default()
+        },
+        as_pool(c1_pool),
+    )
+    .await
+    .expect("create client transport");
+    let mut c_rx = client
+        .take_message_receiver()
+        .expect("client message receiver");
+    client.start().await.expect("client start");
+    let_event_loops_start().await;
+
+    // Client sends initialize request.
+    let init_req = JsonRpcMessage::Request(JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: serde_json::json!(1),
+        method: "initialize".to_string(),
+        params: Some(serde_json::json!({
+            "protocolVersion": mcp_protocol_version(),
+            "capabilities": {},
+            "clientInfo": { "name": "c1", "version": "0.0.0" }
+        })),
+    });
+    client
+        .send(&init_req)
+        .await
+        .expect("client send initialize");
+
+    let incoming = tokio::time::timeout(Duration::from_millis(500), srv_rx.recv())
+        .await
+        .expect("timeout")
+        .expect("channel closed");
+
+    // Server responds to initialize.
+    let init_resp = JsonRpcMessage::Response(JsonRpcResponse {
+        jsonrpc: "2.0".to_string(),
+        id: serde_json::json!(1),
+        result: serde_json::json!({
+            "protocolVersion": mcp_protocol_version(),
+            "serverInfo": { "name": "test-server", "version": "0.0.0" },
+            "capabilities": {}
+        }),
+    });
+    server
+        .send_response(&incoming.event_id, init_resp)
+        .await
+        .expect("send init response");
+
+    // Client receives the init response.
+    let _ = tokio::time::timeout(Duration::from_millis(500), c_rx.recv())
+        .await
+        .expect("timeout")
+        .expect("channel closed");
+
+    // Client sends notifications/initialized → session becomes initialized.
+    let init_notif = JsonRpcMessage::Notification(JsonRpcNotification {
+        jsonrpc: "2.0".to_string(),
+        method: "notifications/initialized".to_string(),
+        params: None,
+    });
+    client
+        .send(&init_notif)
+        .await
+        .expect("send initialized notification");
+
+    // Drain srv_rx until we see notifications/initialized (skipping any
+    // echoed events from the shared mock relay broadcast channel).
+    loop {
+        let msg = tokio::time::timeout(Duration::from_millis(500), srv_rx.recv())
+            .await
+            .expect("timeout waiting for notifications/initialized on server")
+            .expect("server channel closed");
+        if msg.message.method() == Some("notifications/initialized") {
+            break;
+        }
+    }
+
+    // Now broadcast — only the initialized client session should receive it.
+    let broadcast = JsonRpcMessage::Notification(JsonRpcNotification {
+        jsonrpc: "2.0".to_string(),
+        method: "notifications/progress".to_string(),
+        params: Some(serde_json::json!({ "progressToken": "bc-1", "progress": 1, "total": 1 })),
+    });
+    server
+        .broadcast_notification(&broadcast)
+        .await
+        .expect("broadcast notification");
+
+    let msg = tokio::time::timeout(Duration::from_millis(500), c_rx.recv())
+        .await
+        .expect("timeout waiting for client to receive broadcast")
+        .expect("client channel closed");
+
+    assert_eq!(msg.method(), Some("notifications/progress"));
+}
+
+// ── 15. Uncorrelated notification passes through ────────────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn uncorrelated_notification_passes_through() {
+    let (client_pool, server_pool) = MockRelayPool::create_pair();
+    let server_pubkey = server_pool.mock_public_key();
+
+    let mut server = NostrServerTransport::with_relay_pool(
+        NostrServerTransportConfig {
+            encryption_mode: EncryptionMode::Disabled,
+            ..Default::default()
+        },
+        as_pool(server_pool),
+    )
+    .await
+    .expect("create server transport");
+
+    let mut client = NostrClientTransport::with_relay_pool(
+        NostrClientTransportConfig {
+            server_pubkey: server_pubkey.to_hex(),
+            encryption_mode: EncryptionMode::Disabled,
+            ..Default::default()
+        },
+        as_pool(client_pool),
+    )
+    .await
+    .expect("create client transport");
+
+    let mut server_rx = server
+        .take_message_receiver()
+        .expect("server message receiver");
+    let mut client_rx = client
+        .take_message_receiver()
+        .expect("client message receiver");
+
+    server.start().await.expect("server start");
+    client.start().await.expect("client start");
+    let_event_loops_start().await;
+
+    let init_req = JsonRpcMessage::Request(JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: serde_json::json!("unc-init"),
+        method: "initialize".to_string(),
+        params: Some(serde_json::json!({
+            "protocolVersion": mcp_protocol_version(),
+            "capabilities": {},
+            "clientInfo": { "name": "unc-test", "version": "0.0.0" }
+        })),
+    });
+    client.send(&init_req).await.expect("send initialize");
+
+    let incoming = tokio::time::timeout(Duration::from_millis(500), server_rx.recv())
+        .await
+        .expect("timeout")
+        .expect("channel closed");
+
+    let init_resp = JsonRpcMessage::Response(JsonRpcResponse {
+        jsonrpc: "2.0".to_string(),
+        id: serde_json::json!("unc-init"),
+        result: serde_json::json!({
+            "protocolVersion": mcp_protocol_version(),
+            "serverInfo": { "name": "test", "version": "0.0.0" },
+            "capabilities": {}
+        }),
+    });
+    server
+        .send_response(&incoming.event_id, init_resp)
+        .await
+        .expect("send init response");
+
+    let _ = tokio::time::timeout(Duration::from_millis(500), client_rx.recv())
+        .await
+        .expect("timeout")
+        .expect("channel closed");
+
+    // Uncorrelated notification (no e tag) must pass through to client.
+    let notification = JsonRpcMessage::Notification(JsonRpcNotification {
+        jsonrpc: "2.0".to_string(),
+        method: "notifications/progress".to_string(),
+        params: Some(serde_json::json!({ "progressToken": "unc-1", "progress": 50, "total": 100 })),
+    });
+    server
+        .send_notification(&incoming.client_pubkey, &notification, None)
+        .await
+        .expect("send uncorrelated notification");
+
+    let client_msg = tokio::time::timeout(Duration::from_millis(500), client_rx.recv())
+        .await
+        .expect("timeout waiting for client to receive notification")
+        .expect("client channel closed");
+
+    assert!(client_msg.is_notification());
+    assert_eq!(client_msg.method(), Some("notifications/progress"));
+}
+
+// ── 16. Correlated notification with unknown e tag is dropped ───────────────
+// NOTE: The Rust SDK drops ANY server event whose e-tag references an unknown
+// pending request, including notifications. The TS SDK may forward such events.
+// This test documents the Rust SDK's stricter correlation enforcement.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn correlated_notification_unknown_e_tag_is_dropped() {
+    let (client_pool, server_pool) = MockRelayPool::create_pair();
+    let server_pubkey = server_pool.mock_public_key();
+
+    let mut server = NostrServerTransport::with_relay_pool(
+        NostrServerTransportConfig {
+            encryption_mode: EncryptionMode::Disabled,
+            ..Default::default()
+        },
+        as_pool(server_pool),
+    )
+    .await
+    .expect("create server transport");
+
+    let mut client = NostrClientTransport::with_relay_pool(
+        NostrClientTransportConfig {
+            server_pubkey: server_pubkey.to_hex(),
+            encryption_mode: EncryptionMode::Disabled,
+            ..Default::default()
+        },
+        as_pool(client_pool),
+    )
+    .await
+    .expect("create client transport");
+
+    let mut server_rx = server
+        .take_message_receiver()
+        .expect("server message receiver");
+    let mut client_rx = client
+        .take_message_receiver()
+        .expect("client message receiver");
+
+    server.start().await.expect("server start");
+    client.start().await.expect("client start");
+    let_event_loops_start().await;
+
+    let init_req = JsonRpcMessage::Request(JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: serde_json::json!("corr-init"),
+        method: "initialize".to_string(),
+        params: Some(serde_json::json!({
+            "protocolVersion": mcp_protocol_version(),
+            "capabilities": {},
+            "clientInfo": { "name": "corr-test", "version": "0.0.0" }
+        })),
+    });
+    client.send(&init_req).await.expect("send initialize");
+
+    let incoming = tokio::time::timeout(Duration::from_millis(500), server_rx.recv())
+        .await
+        .expect("timeout")
+        .expect("channel closed");
+
+    let init_resp = JsonRpcMessage::Response(JsonRpcResponse {
+        jsonrpc: "2.0".to_string(),
+        id: serde_json::json!("corr-init"),
+        result: serde_json::json!({
+            "protocolVersion": mcp_protocol_version(),
+            "serverInfo": { "name": "test", "version": "0.0.0" },
+            "capabilities": {}
+        }),
+    });
+    server
+        .send_response(&incoming.event_id, init_resp)
+        .await
+        .expect("send init response");
+
+    let _ = tokio::time::timeout(Duration::from_millis(500), client_rx.recv())
+        .await
+        .expect("timeout")
+        .expect("channel closed");
+
+    // Notification with e tag referencing unknown event id must be dropped.
+    let fake_event_id = "a".repeat(64);
+    let notification = JsonRpcMessage::Notification(JsonRpcNotification {
+        jsonrpc: "2.0".to_string(),
+        method: "notifications/progress".to_string(),
+        params: Some(serde_json::json!({ "progressToken": "fake", "progress": 1, "total": 1 })),
+    });
+    server
+        .send_notification(&incoming.client_pubkey, &notification, Some(&fake_event_id))
+        .await
+        .expect("send notification with unknown e tag");
+
+    let result = tokio::time::timeout(Duration::from_millis(500), client_rx.recv()).await;
+    assert!(
+        result.is_err(),
+        "notification with unknown e tag must be dropped by client"
+    );
+}
+
+// ── 17. Auth: allowed pubkey receives response ──────────────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auth_allowed_pubkey_receives_response() {
+    let (client_pool, server_pool) = MockRelayPool::create_pair();
+    let server_pubkey = server_pool.mock_public_key();
+    let client_pubkey = client_pool.mock_public_key();
+
+    let mut server = NostrServerTransport::with_relay_pool(
+        NostrServerTransportConfig {
+            allowed_public_keys: vec![client_pubkey.to_hex()],
+            encryption_mode: EncryptionMode::Disabled,
+            ..Default::default()
+        },
+        as_pool(server_pool),
+    )
+    .await
+    .expect("create server transport");
+
+    let mut server_rx = server
+        .take_message_receiver()
+        .expect("server message receiver");
+    server.start().await.expect("server start");
+
+    let mut client = NostrClientTransport::with_relay_pool(
+        NostrClientTransportConfig {
+            server_pubkey: server_pubkey.to_hex(),
+            encryption_mode: EncryptionMode::Disabled,
+            ..Default::default()
+        },
+        as_pool(client_pool),
+    )
+    .await
+    .expect("create client transport");
+
+    let mut client_rx = client
+        .take_message_receiver()
+        .expect("client message receiver");
+
+    client.start().await.expect("client start");
+    let_event_loops_start().await;
+
+    let request = JsonRpcMessage::Request(JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: serde_json::json!("auth-1"),
+        method: "tools/list".to_string(),
+        params: None,
+    });
+    client.send(&request).await.expect("send request");
+
+    // Server should receive it (pubkey is in the allowlist).
+    let incoming = tokio::time::timeout(Duration::from_millis(500), server_rx.recv())
+        .await
+        .expect("timeout waiting for server to receive request")
+        .expect("server channel closed");
+
+    assert_eq!(incoming.message.method(), Some("tools/list"));
+
+    // Server sends response back.
+    let response = JsonRpcMessage::Response(JsonRpcResponse {
+        jsonrpc: "2.0".to_string(),
+        id: serde_json::json!("auth-1"),
+        result: serde_json::json!({ "tools": [] }),
+    });
+    server
+        .send_response(&incoming.event_id, response)
+        .await
+        .expect("send response");
+
+    // Client should receive the response.
+    let client_msg = tokio::time::timeout(Duration::from_millis(500), client_rx.recv())
+        .await
+        .expect("timeout waiting for client to receive response")
+        .expect("client channel closed");
+
+    assert!(client_msg.is_response());
+    assert_eq!(client_msg.id(), Some(&serde_json::json!("auth-1")));
+}
+
+// ── 18. Excluded capability bypasses auth ───────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn excluded_capability_bypasses_auth() {
+    let allowed_keys = Keys::generate(); // a DIFFERENT pubkey, NOT the client
+    let (client_pool, server_pool) = MockRelayPool::create_pair();
+    let server_pubkey = server_pool.mock_public_key();
+
+    let mut server = NostrServerTransport::with_relay_pool(
+        NostrServerTransportConfig {
+            allowed_public_keys: vec![allowed_keys.public_key().to_hex()],
+            excluded_capabilities: vec![CapabilityExclusion {
+                method: "tools/list".to_string(),
+                name: None,
+            }],
+            encryption_mode: EncryptionMode::Disabled,
+            ..Default::default()
+        },
+        as_pool(server_pool),
+    )
+    .await
+    .expect("create server transport");
+
+    let mut server_rx = server
+        .take_message_receiver()
+        .expect("server message receiver");
+    server.start().await.expect("server start");
+
+    let mut client = NostrClientTransport::with_relay_pool(
+        NostrClientTransportConfig {
+            server_pubkey: server_pubkey.to_hex(),
+            encryption_mode: EncryptionMode::Disabled,
+            ..Default::default()
+        },
+        as_pool(client_pool),
+    )
+    .await
+    .expect("create client transport");
+
+    client.start().await.expect("client start");
+    let_event_loops_start().await;
+
+    // Client's pubkey is NOT in the allowlist, but "tools/list" is excluded from auth.
+    let request = JsonRpcMessage::Request(JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: serde_json::json!("excl-1"),
+        method: "tools/list".to_string(),
+        params: None,
+    });
+    client.send(&request).await.expect("send request");
+
+    // Server should receive it because the method is in excluded_capabilities.
+    let incoming = tokio::time::timeout(Duration::from_millis(500), server_rx.recv())
+        .await
+        .expect("timeout waiting for server to receive excluded-capability request")
+        .expect("server channel closed");
+
+    assert_eq!(
+        incoming.message.method(),
+        Some("tools/list"),
+        "excluded capability must bypass auth allowlist"
+    );
+}
+
+// ── 19. Publish resources produces correct kind ─────────────────────────────
+
+#[tokio::test]
+async fn publish_resources_produces_correct_kind() {
+    let pool = Arc::new(MockRelayPool::new());
+
+    let mut server = NostrServerTransport::with_relay_pool(
+        NostrServerTransportConfig {
+            encryption_mode: EncryptionMode::Disabled,
+            ..Default::default()
+        },
+        Arc::clone(&pool) as Arc<dyn RelayPoolTrait>,
+    )
+    .await
+    .expect("create server transport");
+
+    server.start().await.expect("server start");
+
+    let resources = vec![serde_json::json!({
+        "uri": "file:///readme.md",
+        "name": "readme",
+        "mimeType": "text/markdown"
+    })];
+    server
+        .publish_resources(resources)
+        .await
+        .expect("publish resources");
+
+    let events = pool.stored_events().await;
+    let event = events
+        .iter()
+        .find(|e| e.kind == Kind::Custom(RESOURCES_LIST_KIND))
+        .expect("kind 11318 event must be published");
+
+    let content: serde_json::Value =
+        serde_json::from_str(&event.content).expect("content must be JSON");
+    let arr = content["resources"]
+        .as_array()
+        .expect("resources must be an array");
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["name"], "readme");
+}
+
+// ── 20. Publish prompts produces correct kind ───────────────────────────────
+
+#[tokio::test]
+async fn publish_prompts_produces_correct_kind() {
+    let pool = Arc::new(MockRelayPool::new());
+
+    let mut server = NostrServerTransport::with_relay_pool(
+        NostrServerTransportConfig {
+            encryption_mode: EncryptionMode::Disabled,
+            ..Default::default()
+        },
+        Arc::clone(&pool) as Arc<dyn RelayPoolTrait>,
+    )
+    .await
+    .expect("create server transport");
+
+    server.start().await.expect("server start");
+
+    let prompts = vec![serde_json::json!({
+        "name": "summarize",
+        "description": "Summarize text"
+    })];
+    server
+        .publish_prompts(prompts)
+        .await
+        .expect("publish prompts");
+
+    let events = pool.stored_events().await;
+    let event = events
+        .iter()
+        .find(|e| e.kind == Kind::Custom(PROMPTS_LIST_KIND))
+        .expect("kind 11320 event must be published");
+
+    let content: serde_json::Value =
+        serde_json::from_str(&event.content).expect("content must be JSON");
+    let arr = content["prompts"]
+        .as_array()
+        .expect("prompts must be an array");
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["name"], "summarize");
+}
+
+// ── 21. Publish resource templates produces correct kind ────────────────────
+
+#[tokio::test]
+async fn publish_resource_templates_produces_correct_kind() {
+    let pool = Arc::new(MockRelayPool::new());
+
+    let mut server = NostrServerTransport::with_relay_pool(
+        NostrServerTransportConfig {
+            encryption_mode: EncryptionMode::Disabled,
+            ..Default::default()
+        },
+        Arc::clone(&pool) as Arc<dyn RelayPoolTrait>,
+    )
+    .await
+    .expect("create server transport");
+
+    server.start().await.expect("server start");
+
+    let templates = vec![serde_json::json!({
+        "uriTemplate": "file:///{path}",
+        "name": "file",
+        "mimeType": "application/octet-stream"
+    })];
+    server
+        .publish_resource_templates(templates)
+        .await
+        .expect("publish resource templates");
+
+    let events = pool.stored_events().await;
+    let event = events
+        .iter()
+        .find(|e| e.kind == Kind::Custom(RESOURCETEMPLATES_LIST_KIND))
+        .expect("kind 11319 event must be published");
+
+    let content: serde_json::Value =
+        serde_json::from_str(&event.content).expect("content must be JSON");
+    let arr = content["resourceTemplates"]
+        .as_array()
+        .expect("resourceTemplates must be an array");
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["name"], "file");
+}
+
+// ── 22. Publish tools with empty list ───────────────────────────────────────
+
+#[tokio::test]
+async fn publish_tools_empty_list() {
+    let pool = Arc::new(MockRelayPool::new());
+
+    let mut server = NostrServerTransport::with_relay_pool(
+        NostrServerTransportConfig {
+            encryption_mode: EncryptionMode::Disabled,
+            ..Default::default()
+        },
+        Arc::clone(&pool) as Arc<dyn RelayPoolTrait>,
+    )
+    .await
+    .expect("create server transport");
+
+    server.start().await.expect("server start");
+    server
+        .publish_tools(vec![])
+        .await
+        .expect("publish empty tools");
+
+    let events = pool.stored_events().await;
+    let event = events
+        .iter()
+        .find(|e| e.kind == Kind::Custom(TOOLS_LIST_KIND))
+        .expect("kind 11317 event must be published for empty list");
+
+    let content: serde_json::Value =
+        serde_json::from_str(&event.content).expect("content must be JSON");
+    let arr = content["tools"].as_array().expect("tools must be an array");
+    assert!(arr.is_empty(), "empty tools list must produce tools: []");
+}
+
+// ── 23. Delete announcements k tags match kinds ─────────────────────────────
+
+#[tokio::test]
+async fn delete_announcements_k_tags_match_kinds() {
+    let pool = Arc::new(MockRelayPool::new());
+
+    let mut server = NostrServerTransport::with_relay_pool(
+        NostrServerTransportConfig {
+            is_announced_server: true,
+            server_info: Some(ServerInfo {
+                name: Some("KTag-Server".to_string()),
+                ..Default::default()
+            }),
+            encryption_mode: EncryptionMode::Disabled,
+            ..Default::default()
+        },
+        Arc::clone(&pool) as Arc<dyn RelayPoolTrait>,
+    )
+    .await
+    .expect("create server transport");
+
+    server.start().await.expect("server start");
+    server.announce().await.expect("server announce");
+    server
+        .delete_announcements("shutting down")
+        .await
+        .expect("delete announcements");
+
+    let events = pool.stored_events().await;
+    let kind5_events: Vec<_> = events
+        .iter()
+        .filter(|e| e.kind == Kind::Custom(5))
+        .collect();
+
+    assert_eq!(kind5_events.len(), 5);
+
+    // Collect k tag values from all kind-5 events.
+    let mut k_values: Vec<u16> = kind5_events
+        .iter()
+        .filter_map(|e| {
+            contextvm_sdk::core::serializers::get_tag_value(&e.tags, "k")
+                .and_then(|v| v.parse::<u16>().ok())
+        })
+        .collect();
+    k_values.sort();
+
+    let mut expected = vec![
+        SERVER_ANNOUNCEMENT_KIND,
+        TOOLS_LIST_KIND,
+        RESOURCES_LIST_KIND,
+        RESOURCETEMPLATES_LIST_KIND,
+        PROMPTS_LIST_KIND,
+    ];
+    expected.sort();
+
+    assert_eq!(
+        k_values, expected,
+        "each kind-5 event must have a k tag matching one announcement kind"
+    );
+}
+
+// ── 24. Encryption Disabled server rejects gift-wrap ────────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn encryption_disabled_server_rejects_gift_wrap() {
+    let (client_pool, server_pool) = MockRelayPool::create_pair();
+    let server_pubkey = server_pool.mock_public_key();
+
+    // Server has encryption disabled — must reject gift-wrap events.
+    let mut server = NostrServerTransport::with_relay_pool(
+        NostrServerTransportConfig {
+            encryption_mode: EncryptionMode::Disabled,
+            ..Default::default()
+        },
+        as_pool(server_pool),
+    )
+    .await
+    .expect("create server transport");
+
+    let mut server_rx = server
+        .take_message_receiver()
+        .expect("server message receiver");
+    server.start().await.expect("server start");
+
+    // Client requires encryption — sends gift-wrap (kind 1059).
+    let mut client = NostrClientTransport::with_relay_pool(
+        NostrClientTransportConfig {
+            server_pubkey: server_pubkey.to_hex(),
+            encryption_mode: EncryptionMode::Required,
+            ..Default::default()
+        },
+        as_pool(client_pool),
+    )
+    .await
+    .expect("create client transport");
+
+    client.start().await.expect("client start");
+    let_event_loops_start().await;
+
+    let request = JsonRpcMessage::Request(JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: serde_json::json!("gw-reject"),
+        method: "tools/list".to_string(),
+        params: None,
+    });
+    client.send(&request).await.expect("send encrypted request");
+
+    let result = tokio::time::timeout(Duration::from_millis(500), server_rx.recv()).await;
+    assert!(
+        result.is_err(),
+        "Disabled-mode server must drop gift-wrap events"
+    );
+}
+
+// ── 25. Response mirrors client encryption format ───────────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn response_mirrors_client_encryption_format() {
+    // Part A: Disabled client → Optional server → response must be plaintext (kind 25910).
+    {
+        let (client_pool, server_pool) = MockRelayPool::create_pair();
+        let server_pubkey = server_pool.mock_public_key();
+        let server_pool = Arc::new(server_pool);
+
+        let mut server = NostrServerTransport::with_relay_pool(
+            NostrServerTransportConfig {
+                encryption_mode: EncryptionMode::Optional,
+                ..Default::default()
+            },
+            Arc::clone(&server_pool) as Arc<dyn RelayPoolTrait>,
+        )
+        .await
+        .expect("create server transport");
+
+        let mut client = NostrClientTransport::with_relay_pool(
+            NostrClientTransportConfig {
+                server_pubkey: server_pubkey.to_hex(),
+                encryption_mode: EncryptionMode::Disabled,
+                ..Default::default()
+            },
+            as_pool(client_pool),
+        )
+        .await
+        .expect("create client transport");
+
+        let mut server_rx = server
+            .take_message_receiver()
+            .expect("server message receiver");
+        let mut client_rx = client
+            .take_message_receiver()
+            .expect("client message receiver");
+
+        server.start().await.expect("server start");
+        client.start().await.expect("client start");
+        let_event_loops_start().await;
+
+        let request = JsonRpcMessage::Request(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: serde_json::json!("mirror-plain"),
+            method: "tools/list".to_string(),
+            params: None,
+        });
+        client.send(&request).await.expect("send plaintext request");
+
+        let incoming = tokio::time::timeout(Duration::from_millis(500), server_rx.recv())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
+        assert!(!incoming.is_encrypted);
+
+        let response = JsonRpcMessage::Response(JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: serde_json::json!("mirror-plain"),
+            result: serde_json::json!({ "tools": [] }),
+        });
+        server
+            .send_response(&incoming.event_id, response)
+            .await
+            .expect("send plaintext response");
+
+        // Client receives the response.
+        let _ = tokio::time::timeout(Duration::from_millis(500), client_rx.recv())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
+
+        // Verify response event is plaintext kind 25910, not gift-wrap.
+        let events = server_pool.stored_events().await;
+        let response_events: Vec<_> = events
+            .iter()
+            .filter(|e| e.pubkey == server_pubkey && e.content.contains("mirror-plain"))
+            .collect();
+        assert!(
+            !response_events.is_empty(),
+            "server must publish a response event"
+        );
+        assert!(
+            response_events
+                .iter()
+                .all(|e| e.kind == Kind::Custom(CTXVM_MESSAGES_KIND)),
+            "response to plaintext client must be kind {} (plaintext)",
+            CTXVM_MESSAGES_KIND
+        );
+    }
+
+    // Part B: Required client → Optional server → response must be gift-wrap (kind 1059).
+    {
+        let (client_pool, server_pool) = MockRelayPool::create_pair();
+        let server_pubkey = server_pool.mock_public_key();
+        let server_pool = Arc::new(server_pool);
+
+        let mut server = NostrServerTransport::with_relay_pool(
+            NostrServerTransportConfig {
+                encryption_mode: EncryptionMode::Optional,
+                ..Default::default()
+            },
+            Arc::clone(&server_pool) as Arc<dyn RelayPoolTrait>,
+        )
+        .await
+        .expect("create server transport");
+
+        let mut client = NostrClientTransport::with_relay_pool(
+            NostrClientTransportConfig {
+                server_pubkey: server_pubkey.to_hex(),
+                encryption_mode: EncryptionMode::Required,
+                ..Default::default()
+            },
+            as_pool(client_pool),
+        )
+        .await
+        .expect("create client transport");
+
+        let mut server_rx = server
+            .take_message_receiver()
+            .expect("server message receiver");
+        let mut client_rx = client
+            .take_message_receiver()
+            .expect("client message receiver");
+
+        server.start().await.expect("server start");
+        client.start().await.expect("client start");
+        let_event_loops_start().await;
+
+        let request = JsonRpcMessage::Request(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: serde_json::json!("mirror-enc"),
+            method: "tools/list".to_string(),
+            params: None,
+        });
+        client.send(&request).await.expect("send encrypted request");
+
+        let incoming = tokio::time::timeout(Duration::from_millis(500), server_rx.recv())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
+        assert!(incoming.is_encrypted);
+
+        // Snapshot gift-wrap count before server responds.
+        let gw_before = server_pool
+            .stored_events()
+            .await
+            .iter()
+            .filter(|e| e.kind == Kind::Custom(GIFT_WRAP_KIND))
+            .count();
+
+        let response = JsonRpcMessage::Response(JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: serde_json::json!("mirror-enc"),
+            result: serde_json::json!({ "tools": [] }),
+        });
+        server
+            .send_response(&incoming.event_id, response)
+            .await
+            .expect("send encrypted response");
+
+        // Client receives the response.
+        let _ = tokio::time::timeout(Duration::from_millis(500), client_rx.recv())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
+
+        // Verify server published exactly one new gift-wrap for the response.
+        let gw_after = server_pool
+            .stored_events()
+            .await
+            .iter()
+            .filter(|e| e.kind == Kind::Custom(GIFT_WRAP_KIND))
+            .count();
+        assert_eq!(
+            gw_after,
+            gw_before + 1,
+            "server must publish one new gift-wrap (kind {}) as the response",
+            GIFT_WRAP_KIND
+        );
+    }
 }
