@@ -112,6 +112,7 @@ impl BaseTransport {
         kind: u16,
         tags: Vec<Tag>,
         is_encrypted: Option<bool>,
+        gift_wrap_kind: Option<u16>,
     ) -> Result<EventId> {
         let should_encrypt = self.should_encrypt(kind, is_encrypted);
 
@@ -128,13 +129,20 @@ impl BaseTransport {
                 .signer()
                 .await
                 .map_err(|e| Error::Encryption(e.to_string()))?;
-            let gift_wrap_event =
-                encryption::gift_wrap_single_layer(&signer, recipient, &event_json).await?;
+            let selected_gift_wrap_kind = gift_wrap_kind.unwrap_or(GIFT_WRAP_KIND);
+            let gift_wrap_event = encryption::gift_wrap_single_layer_with_kind(
+                &signer,
+                recipient,
+                &event_json,
+                selected_gift_wrap_kind,
+            )
+            .await?;
             self.relay_pool.publish_event(&gift_wrap_event).await?;
             tracing::debug!(
                 target: LOG_TARGET,
                 signed_event_id = %signed_event_id,
                 envelope_id = %gift_wrap_event.id,
+                gift_wrap_kind = selected_gift_wrap_kind,
                 "Sent encrypted MCP message"
             );
         } else {

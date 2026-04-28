@@ -21,6 +21,7 @@ async fn make_stateless_transport() -> (
         relay_urls: Vec::new(),
         server_pubkey: server_keys.public_key().to_hex(),
         encryption_mode: EncryptionMode::Optional,
+        gift_wrap_mode: GiftWrapMode::Optional,
         is_stateless: true,
         timeout: Duration::from_secs(1),
         log_file_path: None,
