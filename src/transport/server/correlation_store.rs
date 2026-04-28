@@ -7,6 +7,8 @@ use std::sync::Arc;
 use lru::LruCache;
 use tokio::sync::RwLock;
 
+use crate::core::constants::DEFAULT_LRU_SIZE;
+
 /// A route entry for an in-flight request.
 #[derive(Debug, Clone)]
 pub struct RouteEntry {
@@ -29,11 +31,9 @@ struct Inner {
 }
 
 impl Inner {
-    fn new(max_routes: Option<usize>) -> Self {
-        let routes = match max_routes {
-            Some(n) => LruCache::new(NonZeroUsize::new(n).expect("max_routes must be non-zero")),
-            None => LruCache::unbounded(),
-        };
+    fn new(max_routes: usize) -> Self {
+        let routes =
+            LruCache::new(NonZeroUsize::new(max_routes).expect("max_routes must be non-zero"));
         Self {
             routes,
             progress_token_to_event: HashMap::new(),
@@ -80,7 +80,7 @@ impl Default for ServerEventRouteStore {
 impl ServerEventRouteStore {
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(RwLock::new(Inner::new(None))),
+            inner: Arc::new(RwLock::new(Inner::new(DEFAULT_LRU_SIZE))),
         }
     }
 
@@ -88,7 +88,7 @@ impl ServerEventRouteStore {
     /// When the limit is reached the oldest entry is evicted.
     pub fn with_max_routes(max_routes: usize) -> Self {
         Self {
-            inner: Arc::new(RwLock::new(Inner::new(Some(max_routes)))),
+            inner: Arc::new(RwLock::new(Inner::new(max_routes))),
         }
     }
 
@@ -302,5 +302,19 @@ mod tests {
         store.clear().await;
         assert!(store.get("e1").await.is_none());
         assert!(store.get("e2").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn default_store_is_bounded() {
+        let store = ServerEventRouteStore::new();
+        for i in 0..=DEFAULT_LRU_SIZE {
+            store
+                .register(format!("e{i}"), "pk1".into(), json!(i), None)
+                .await;
+        }
+
+        assert_eq!(store.event_route_count().await, DEFAULT_LRU_SIZE);
+        assert!(!store.has_event_route("e0").await);
+        assert!(store.has_event_route(&format!("e{DEFAULT_LRU_SIZE}")).await);
     }
 }

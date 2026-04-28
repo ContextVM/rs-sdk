@@ -6,6 +6,8 @@ use std::sync::Arc;
 use lru::LruCache;
 use tokio::sync::RwLock;
 
+use crate::core::constants::DEFAULT_LRU_SIZE;
+
 /// A pending request tracked by the correlation store.
 #[derive(Debug, Clone)]
 pub struct PendingRequest {
@@ -32,9 +34,7 @@ impl Default for ClientCorrelationStore {
 
 impl ClientCorrelationStore {
     pub fn new() -> Self {
-        Self {
-            pending_requests: Arc::new(RwLock::new(LruCache::unbounded())),
-        }
+        Self::with_max_pending(DEFAULT_LRU_SIZE)
     }
 
     /// Create a store with an upper bound on pending requests.
@@ -135,5 +135,19 @@ mod tests {
         assert!(store.contains("e1").await);
         assert!(store.remove("e1").await);
         assert!(!store.contains("e1").await);
+    }
+
+    #[tokio::test]
+    async fn default_store_is_bounded() {
+        let store = ClientCorrelationStore::new();
+        for i in 0..=DEFAULT_LRU_SIZE {
+            store
+                .register(format!("e{i}"), serde_json::Value::Null, false)
+                .await;
+        }
+
+        assert_eq!(store.count().await, DEFAULT_LRU_SIZE);
+        assert!(!store.contains("e0").await);
+        assert!(store.contains(&format!("e{DEFAULT_LRU_SIZE}")).await);
     }
 }
