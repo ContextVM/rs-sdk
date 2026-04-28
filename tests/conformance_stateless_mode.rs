@@ -6,7 +6,7 @@ use contextvm_sdk::core::constants::{mcp_protocol_version, INITIALIZE_METHOD};
 use contextvm_sdk::core::types::{
     EncryptionMode, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest,
 };
-use contextvm_sdk::signer;
+use contextvm_sdk::{GiftWrapMode, signer};
 use contextvm_sdk::transport::client::{NostrClientTransport, NostrClientTransportConfig};
 use tokio::time::timeout;
 
