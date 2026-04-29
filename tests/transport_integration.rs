@@ -2006,7 +2006,7 @@ async fn send_response_publish_failure_allows_one_successful_retry() {
         Arc::clone(&server_pool),
         1,
     ));
-    
+
     let mut server = NostrServerTransport::with_relay_pool(
         NostrServerTransportConfig {
             encryption_mode: EncryptionMode::Disabled,
