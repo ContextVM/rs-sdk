@@ -101,6 +101,58 @@ impl BaseTransport {
         self.relay_pool.sign(builder).await
     }
 
+    /// Prepare an MCP message for publishing without actually publishing it.
+    ///
+    /// Signs (and optionally gift-wraps) the event, returning the inner signed
+    /// event ID together with the final event that should be published to relays.
+    pub async fn prepare_mcp_message(
+        &self,
+        message: &JsonRpcMessage,
+        recipient: &PublicKey,
+        kind: u16,
+        tags: Vec<Tag>,
+        is_encrypted: Option<bool>,
+        gift_wrap_kind: Option<u16>,
+    ) -> Result<(EventId, Event)> {
+        let should_encrypt = self.should_encrypt(kind, is_encrypted);
+
+        let event = self.create_signed_event(message, kind, tags).await?;
+        let signed_event_id = event.id;
+
+        if should_encrypt {
+            let event_json =
+                serde_json::to_string(&event).map_err(|e| Error::Encryption(e.to_string()))?;
+            let signer = self
+                .relay_pool
+                .signer()
+                .await
+                .map_err(|e| Error::Encryption(e.to_string()))?;
+            let selected_gift_wrap_kind = gift_wrap_kind.unwrap_or(GIFT_WRAP_KIND);
+            let gift_wrap_event = encryption::gift_wrap_single_layer_with_kind(
+                &signer,
+                recipient,
+                &event_json,
+                selected_gift_wrap_kind,
+            )
+            .await?;
+            tracing::debug!(
+                target: LOG_TARGET,
+                signed_event_id = %signed_event_id,
+                envelope_id = %gift_wrap_event.id,
+                gift_wrap_kind = selected_gift_wrap_kind,
+                "Prepared encrypted MCP message"
+            );
+            Ok((signed_event_id, gift_wrap_event))
+        } else {
+            tracing::debug!(
+                target: LOG_TARGET,
+                signed_event_id = %signed_event_id,
+                "Prepared unencrypted MCP message"
+            );
+            Ok((signed_event_id, event))
+        }
+    }
+
     /// Send an MCP message to a recipient, optionally encrypting.
     ///
     /// Returns the signed MCP event ID.

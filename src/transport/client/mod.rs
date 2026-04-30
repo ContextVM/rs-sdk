@@ -274,9 +274,10 @@ impl NostrClientTransport {
         }
 
         let tags = BaseTransport::create_recipient_tags(&self.server_pubkey);
-        let event_id = self
+
+        let (event_id, publishable_event) = self
             .base
-            .send_mcp_message(
+            .prepare_mcp_message(
                 message,
                 &self.server_pubkey,
                 CTXVM_MESSAGES_KIND,
@@ -291,7 +292,7 @@ impl NostrClientTransport {
                     error = %error,
                     server_pubkey = %self.server_pubkey.to_hex(),
                     method = ?message.method(),
-                    "Failed to send client message"
+                    "Failed to prepare client message"
                 );
                 error
             })?;
@@ -301,6 +302,18 @@ impl NostrClientTransport {
             self.pending_requests
                 .register(event_id.to_hex(), req.id.clone(), is_initialize)
                 .await;
+        }
+
+        if let Err(error) = self.base.relay_pool.publish_event(&publishable_event).await {
+            self.pending_requests.remove(&event_id.to_hex()).await;
+            tracing::error!(
+                target: LOG_TARGET,
+                error = %error,
+                server_pubkey = %self.server_pubkey.to_hex(),
+                method = ?message.method(),
+                "Failed to publish client message"
+            );
+            return Err(error);
         }
 
         tracing::debug!(
@@ -502,6 +515,28 @@ impl NostrClientTransport {
 
                 // Parse MCP message
                 if let Some(mcp_msg) = validation::validate_and_parse(&actual_event_content) {
+                    // Drop uncorrelated responses and server-to-client requests (matches TS SDK).
+                    match &mcp_msg {
+                        JsonRpcMessage::Response(_) | JsonRpcMessage::ErrorResponse(_)
+                            if e_tag.is_none() =>
+                        {
+                            tracing::warn!(
+                                target: LOG_TARGET,
+                                "Dropping response/error without correlation `e` tag"
+                            );
+                            continue;
+                        }
+                        JsonRpcMessage::Request(_) => {
+                            tracing::warn!(
+                                target: LOG_TARGET,
+                                method = ?mcp_msg.method(),
+                                "Dropping server-to-client request (invalid in MCP)"
+                            );
+                            continue;
+                        }
+                        _ => {}
+                    }
+
                     // Clean up pending request
                     if let Some(ref correlated_id) = e_tag {
                         pending.remove(correlated_id.as_str()).await;
