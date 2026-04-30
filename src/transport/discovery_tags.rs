@@ -1,10 +1,8 @@
 //! Discovery tag utilities for CEP-35 capability exchange.
 //!
 //! Ports the TS SDK's `discovery-tags.ts` module. Provides functions to filter,
-//! parse, learn, and merge discovery tags on Nostr events exchanged between
-//! MCP clients and servers.
-
-use std::collections::HashSet;
+//! parse, and learn discovery tags on Nostr events exchanged between MCP clients
+//! and servers.
 
 use nostr_sdk::prelude::*;
 
@@ -82,24 +80,6 @@ pub fn parse_discovered_peer_capabilities(tags: &[Tag]) -> DiscoveredPeerCapabil
         discovery_tags,
         capabilities,
     }
-}
-
-/// Merges incoming discovery tags into the current set, preserving order and
-/// deduplicating by full tag content (all elements must match).
-///
-/// Mirrors TS SDK `mergeDiscoveryTags()`.
-pub fn merge_discovery_tags(current: &[Tag], incoming: &[Tag]) -> Vec<Tag> {
-    let mut merged: Vec<Tag> = current.to_vec();
-    let mut seen: HashSet<Vec<String>> = merged.iter().map(|t| t.clone().to_vec()).collect();
-
-    for tag in incoming {
-        let key = tag.clone().to_vec();
-        if seen.insert(key) {
-            merged.push(tag.clone());
-        }
-    }
-
-    merged
 }
 
 #[cfg(test)]
@@ -268,70 +248,6 @@ mod tests {
         let result = parse_discovered_peer_capabilities(&[]);
         assert!(result.discovery_tags.is_empty());
         assert_eq!(result.capabilities, PeerCapabilities::default());
-    }
-
-    // ── merge_discovery_tags ────────────────────────────────────────
-
-    #[test]
-    fn merge_discovery_tags_appends_new() {
-        let current = vec![make_tag(&["support_encryption"])];
-        let incoming = vec![make_tag(&["name", "Server"])];
-        let merged = merge_discovery_tags(&current, &incoming);
-        assert_eq!(merged.len(), 2);
-        assert_eq!(tag_name(&merged[0]), "support_encryption");
-        assert_eq!(tag_name(&merged[1]), "name");
-    }
-
-    #[test]
-    fn merge_discovery_tags_deduplicates() {
-        let tag_a = make_tag(&["support_encryption"]);
-        let tag_b = make_tag(&["support_encryption"]);
-        let current = vec![tag_a];
-        let incoming = vec![tag_b];
-        let merged = merge_discovery_tags(&current, &incoming);
-        assert_eq!(merged.len(), 1);
-    }
-
-    #[test]
-    fn merge_discovery_tags_deduplicates_with_values() {
-        let current = vec![make_tag(&["name", "Server"])];
-        let incoming = vec![
-            make_tag(&["name", "Server"]),       // exact dup
-            make_tag(&["name", "Other Server"]), // same tag name, different value — not a dup
-        ];
-        let merged = merge_discovery_tags(&current, &incoming);
-        assert_eq!(merged.len(), 2);
-    }
-
-    #[test]
-    fn merge_discovery_tags_preserves_order() {
-        let current = vec![make_tag(&["b_tag"]), make_tag(&["a_tag"])];
-        let incoming = vec![make_tag(&["c_tag"]), make_tag(&["a_tag"])];
-        let merged = merge_discovery_tags(&current, &incoming);
-        assert_eq!(merged.len(), 3);
-        assert_eq!(tag_name(&merged[0]), "b_tag");
-        assert_eq!(tag_name(&merged[1]), "a_tag");
-        assert_eq!(tag_name(&merged[2]), "c_tag");
-    }
-
-    #[test]
-    fn merge_discovery_tags_both_empty() {
-        let merged = merge_discovery_tags(&[], &[]);
-        assert!(merged.is_empty());
-    }
-
-    #[test]
-    fn merge_discovery_tags_current_empty() {
-        let incoming = vec![make_tag(&["support_encryption"])];
-        let merged = merge_discovery_tags(&[], &incoming);
-        assert_eq!(merged.len(), 1);
-    }
-
-    #[test]
-    fn merge_discovery_tags_incoming_empty() {
-        let current = vec![make_tag(&["support_encryption"])];
-        let merged = merge_discovery_tags(&current, &[]);
-        assert_eq!(merged.len(), 1);
     }
 
     // ── PeerCapabilities ────────────────────────────────────────────
