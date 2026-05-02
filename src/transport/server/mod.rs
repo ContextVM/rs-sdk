@@ -26,6 +26,7 @@ use crate::core::validation;
 use crate::encryption;
 use crate::relay::{RelayPool, RelayPoolTrait};
 use crate::transport::base::BaseTransport;
+use crate::transport::discovery_tags::learn_peer_capabilities;
 
 use crate::util::tracing_setup;
 
@@ -333,8 +334,8 @@ impl NostrServerTransport {
         let original_request_id = route.original_request_id;
         let progress_token = route.progress_token;
 
-        let sessions = self.sessions.read().await;
-        let session = sessions.get(&client_pubkey_hex).ok_or_else(|| {
+        let mut sessions_w = self.sessions.write().await;
+        let session = sessions_w.get_mut(&client_pubkey_hex).ok_or_else(|| {
             tracing::error!(
                 target: LOG_TARGET,
                 client_pubkey = %client_pubkey_hex,
@@ -351,7 +352,10 @@ impl NostrServerTransport {
         }
 
         let is_encrypted = session.is_encrypted;
-        drop(sessions);
+
+        // CEP-35: include discovery tags on first response to this client
+        let discovery_tags = self.take_pending_server_discovery_tags(session);
+        drop(sessions_w);
 
         // CEP-19: Look up the incoming wrap kind for mirroring
         let mirrored_wrap_kind = self
@@ -382,23 +386,8 @@ impl NostrServerTransport {
             Error::Other(error.to_string())
         })?;
 
-        let mut tags = BaseTransport::create_response_tags(&client_pubkey, &event_id_parsed);
-
-        // Send server info and capabilities on the first response.
-        let mut sent_common_tags = false;
-        let session_snapshot = self.sessions.get_session(&client_pubkey_hex).await;
-        if let Some(snap) = session_snapshot {
-            if !snap.has_sent_common_tags {
-                Self::append_common_response_tags(
-                    &mut tags,
-                    self.config.server_info.as_ref(),
-                    &self.extra_common_tags,
-                    self.config.encryption_mode,
-                    self.config.gift_wrap_mode,
-                );
-                sent_common_tags = true;
-            }
-        }
+        let base_tags = BaseTransport::create_response_tags(&client_pubkey, &event_id_parsed);
+        let tags = BaseTransport::compose_outbound_tags(&base_tags, &discovery_tags, &[]);
 
         if let Err(error) = self
             .base
@@ -437,16 +426,7 @@ impl NostrServerTransport {
             return Err(error);
         }
 
-        if sent_common_tags {
-            self.sessions
-                .mark_common_tags_sent(&client_pubkey_hex)
-                .await;
-        }
-
-        // Clean up only after successful send
-        self.event_routes.pop(event_id).await;
-
-        // Clean up wrap-kind tracking and reverse mapping
+        // Clean up wrap-kind tracking
         self.request_wrap_kinds.write().await.remove(event_id);
 
         let mut sessions = self.sessions.write().await;
@@ -477,22 +457,27 @@ impl NostrServerTransport {
         notification: &JsonRpcMessage,
         correlated_event_id: Option<&str>,
     ) -> Result<()> {
-        let sessions = self.sessions.read().await;
+        let mut sessions = self.sessions.write().await;
         let session = sessions
-            .get(client_pubkey_hex)
+            .get_mut(client_pubkey_hex)
             .ok_or_else(|| Error::Other(format!("No session for {client_pubkey_hex}")))?;
         let is_encrypted = session.is_encrypted;
         let supports_ephemeral = session.supports_ephemeral_gift_wrap;
+
+        // CEP-35: include discovery tags on first message to this client
+        let discovery_tags = self.take_pending_server_discovery_tags(session);
         drop(sessions);
 
         let client_pubkey =
             PublicKey::from_hex(client_pubkey_hex).map_err(|e| Error::Other(e.to_string()))?;
 
-        let mut tags = BaseTransport::create_recipient_tags(&client_pubkey);
+        let mut base_tags = BaseTransport::create_recipient_tags(&client_pubkey);
         if let Some(eid) = correlated_event_id {
             let event_id = EventId::from_hex(eid).map_err(|e| Error::Other(e.to_string()))?;
-            tags.push(Tag::event(event_id));
+            base_tags.push(Tag::event(event_id));
         }
+
+        let tags = BaseTransport::compose_outbound_tags(&base_tags, &discovery_tags, &[]);
 
         // CEP-19: Look up mirrored wrap kind from correlated request
         let correlated_wrap_kind = if let Some(event_id) = correlated_event_id {
@@ -732,6 +717,70 @@ impl NostrServerTransport {
         self.publish_resource_templates(templates).await
     }
 
+    // ── CEP-35 discovery tag helpers ──────────────────────────────
+
+    /// Build common discovery tags from server config.
+    ///
+    /// Includes server info tags (name, about, website, picture) and capability
+    /// tags (support_encryption, support_encryption_ephemeral) based on the
+    /// transport's encryption and gift-wrap mode.
+    fn get_common_tags(&self) -> Vec<Tag> {
+        let mut tags = Vec::new();
+
+        // Server info tags
+        if let Some(ref info) = self.config.server_info {
+            if let Some(ref name) = info.name {
+                tags.push(Tag::custom(
+                    TagKind::Custom(tags::NAME.into()),
+                    vec![name.clone()],
+                ));
+            }
+            if let Some(ref about) = info.about {
+                tags.push(Tag::custom(
+                    TagKind::Custom(tags::ABOUT.into()),
+                    vec![about.clone()],
+                ));
+            }
+            if let Some(ref website) = info.website {
+                tags.push(Tag::custom(
+                    TagKind::Custom(tags::WEBSITE.into()),
+                    vec![website.clone()],
+                ));
+            }
+            if let Some(ref picture) = info.picture {
+                tags.push(Tag::custom(
+                    TagKind::Custom(tags::PICTURE.into()),
+                    vec![picture.clone()],
+                ));
+            }
+        }
+
+        // Capability tags
+        if self.config.encryption_mode != EncryptionMode::Disabled {
+            tags.push(Tag::custom(
+                TagKind::Custom(tags::SUPPORT_ENCRYPTION.into()),
+                Vec::<String>::new(),
+            ));
+            if self.config.gift_wrap_mode.supports_ephemeral() {
+                tags.push(Tag::custom(
+                    TagKind::Custom(tags::SUPPORT_ENCRYPTION_EPHEMERAL.into()),
+                    Vec::<String>::new(),
+                ));
+            }
+        }
+
+        tags
+    }
+
+    /// One-shot: returns common tags if not yet sent to this client, empty otherwise.
+    fn take_pending_server_discovery_tags(&self, session: &mut ClientSession) -> Vec<Tag> {
+        if session.has_sent_common_tags {
+            return vec![];
+        }
+        session.has_sent_common_tags = true;
+        self.get_common_tags()
+    }
+
     // ── Internal ────────────────────────────────────────────────
 
     fn is_capability_excluded(
@@ -792,7 +841,7 @@ impl NostrServerTransport {
                     continue;
                 }
 
-                let (content, sender_pubkey, event_id, is_encrypted) = if is_gift_wrap {
+                let (content, sender_pubkey, event_id, is_encrypted, inner_tags) = if is_gift_wrap {
                     if encryption_mode == EncryptionMode::Disabled {
                         tracing::warn!(
                             target: LOG_TARGET,
@@ -848,11 +897,13 @@ impl NostrServerTransport {
                                         };
                                         guard.put(event.id, ());
                                     }
+                                    let inner_tags: Vec<Tag> = inner.tags.to_vec();
                                     (
                                         inner.content,
                                         inner.pubkey.to_hex(),
                                         inner.id.to_hex(),
                                         true,
+                                        inner_tags,
                                     )
                                 }
                                 Err(error) => {
@@ -888,6 +939,7 @@ impl NostrServerTransport {
                         event.pubkey.to_hex(),
                         event.id.to_hex(),
                         false,
+                        event.tags.to_vec(),
                     )
                 };
 
@@ -1013,6 +1065,16 @@ impl NostrServerTransport {
                 if is_gift_wrap && outer_kind == EPHEMERAL_GIFT_WRAP_KIND {
                     session.supports_ephemeral_gift_wrap = true;
                 }
+
+                // CEP-35: learn client capabilities from inner event tags
+                let discovered = learn_peer_capabilities(&inner_tags);
+                session.supports_encryption |= discovered.supports_encryption;
+                session.supports_ephemeral_encryption |= discovered.supports_ephemeral_encryption;
+                // Only learn oversized support if CEP-22 is enabled on this server
+                // TODO: wire from config when CEP-22 lands
+                let oversized_enabled = false;
+                session.supports_oversized_transfer |=
+                    oversized_enabled && discovered.supports_oversized_transfer;
 
                 // Track request for correlation
                 if let JsonRpcMessage::Request(ref req) = mcp_msg {
@@ -1449,7 +1511,6 @@ mod tests {
 
     #[test]
     fn test_select_outbound_gift_wrap_kind_plaintext() {
-        // Plaintext: no encryption regardless of mode
         assert_eq!(
             NostrServerTransport::select_outbound_gift_wrap_kind(
                 GiftWrapMode::Optional,
@@ -1462,7 +1523,6 @@ mod tests {
 
     #[test]
     fn test_select_outbound_gift_wrap_kind_mirrors_incoming() {
-        // Mirrors ephemeral kind when Optional mode allows it
         assert_eq!(
             NostrServerTransport::select_outbound_gift_wrap_kind(
                 GiftWrapMode::Optional,
@@ -1475,7 +1535,6 @@ mod tests {
 
     #[test]
     fn test_select_outbound_gift_wrap_kind_persistent_mode_overrides_ephemeral() {
-        // Persistent mode: ephemeral mirror ignored, falls back to GIFT_WRAP_KIND
         assert_eq!(
             NostrServerTransport::select_outbound_gift_wrap_kind(
                 GiftWrapMode::Persistent,
@@ -1659,5 +1718,37 @@ mod tests {
             .find(|t| (*t).clone().to_vec().first().map(|s| s.as_str()) == Some("custom_tag"))
             .and_then(|t| t.clone().to_vec().get(1).cloned());
         assert_eq!(tag_value.as_deref(), Some("value"));
+    }
+
+    // ── CEP-35 discovery tag helpers ────────────────────────────
+
+    #[test]
+    fn test_cep35_client_session_new_fields_default_false() {
+        let session = ClientSession::new(false);
+        assert!(!session.has_sent_common_tags);
+        assert!(!session.supports_encryption);
+        assert!(!session.supports_ephemeral_encryption);
+        assert!(!session.supports_oversized_transfer);
+    }
+
+    #[test]
+    fn test_cep35_capability_or_assign() {
+        let mut session = ClientSession::new(false);
+
+        session.supports_encryption |= true;
+        session.supports_ephemeral_encryption |= false;
+
+        session.supports_encryption |= false;
+        session.supports_ephemeral_encryption |= true;
+
+        assert!(session.supports_encryption, "OR-assign must not downgrade");
+        assert!(session.supports_ephemeral_encryption);
+        assert!(!session.supports_oversized_transfer);
+    }
+
+    #[test]
+    fn test_config_gift_wrap_mode_default() {
+        let config = NostrServerTransportConfig::default();
+        assert_eq!(config.gift_wrap_mode, GiftWrapMode::Optional);
     }
 }

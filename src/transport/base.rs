@@ -232,6 +232,21 @@ impl BaseTransport {
     pub fn create_response_tags(pubkey: &PublicKey, event_id: &EventId) -> Vec<Tag> {
         vec![Tag::public_key(*pubkey), Tag::event(*event_id)]
     }
+
+    /// Compose outbound event tags in canonical order:
+    /// routing (p, e) -> discovery (one-shot caps) -> negotiation (pmi, persistent).
+    pub fn compose_outbound_tags(
+        base_tags: &[Tag],
+        discovery_tags: &[Tag],
+        negotiation_tags: &[Tag],
+    ) -> Vec<Tag> {
+        let mut tags =
+            Vec::with_capacity(base_tags.len() + discovery_tags.len() + negotiation_tags.len());
+        tags.extend_from_slice(base_tags);
+        tags.extend_from_slice(discovery_tags);
+        tags.extend_from_slice(negotiation_tags);
+        tags
+    }
 }
 
 #[cfg(test)]
@@ -395,5 +410,58 @@ mod tests {
     fn test_convert_event_to_mcp_oversized_message() {
         let big = "x".repeat(MAX_MESSAGE_SIZE + 1);
         assert!(!crate::core::validation::validate_message_size(&big));
+    }
+
+    // ── compose_outbound_tags ──────────────────────────────────
+
+    fn make_custom_tag(name: &str) -> Tag {
+        Tag::custom(TagKind::Custom(name.into()), Vec::<String>::new())
+    }
+
+    #[test]
+    fn compose_outbound_tags_ordering() {
+        let keys = Keys::generate();
+        let base = vec![Tag::public_key(keys.public_key())];
+        let discovery = vec![make_custom_tag("support_encryption")];
+        let negotiation = vec![make_custom_tag("pmi")];
+
+        let result = BaseTransport::compose_outbound_tags(&base, &discovery, &negotiation);
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].clone().to_vec()[0], "p");
+        assert_eq!(result[1].clone().to_vec()[0], "support_encryption");
+        assert_eq!(result[2].clone().to_vec()[0], "pmi");
+    }
+
+    #[test]
+    fn compose_outbound_tags_empty_discovery() {
+        let keys = Keys::generate();
+        let base = vec![Tag::public_key(keys.public_key())];
+        let negotiation = vec![make_custom_tag("pmi")];
+
+        let result = BaseTransport::compose_outbound_tags(&base, &[], &negotiation);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].clone().to_vec()[0], "p");
+        assert_eq!(result[1].clone().to_vec()[0], "pmi");
+    }
+
+    #[test]
+    fn compose_outbound_tags_all_empty() {
+        let result = BaseTransport::compose_outbound_tags(&[], &[], &[]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn compose_outbound_tags_preserves_all_elements() {
+        let discovery = vec![
+            make_custom_tag("support_encryption"),
+            make_custom_tag("support_encryption_ephemeral"),
+        ];
+        let result = BaseTransport::compose_outbound_tags(&[], &discovery, &[]);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].clone().to_vec()[0], "support_encryption");
+        assert_eq!(
+            result[1].clone().to_vec()[0],
+            "support_encryption_ephemeral"
+        );
     }
 }

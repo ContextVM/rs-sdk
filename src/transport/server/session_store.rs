@@ -218,4 +218,124 @@ mod tests {
         assert!(keys.contains(&"client-1"));
         assert!(keys.contains(&"client-2"));
     }
+
+    // ── CEP-35 capability fields ────────────────────────────────
+
+    #[tokio::test]
+    async fn new_session_capability_fields_default_false() {
+        let store = SessionStore::new();
+        store.get_or_create_session("client-1", false).await;
+
+        let sessions = store.read().await;
+        let session = sessions.get("client-1").unwrap();
+        assert!(!session.has_sent_common_tags);
+        assert!(!session.supports_encryption);
+        assert!(!session.supports_ephemeral_encryption);
+        assert!(!session.supports_oversized_transfer);
+    }
+
+    #[tokio::test]
+    async fn has_sent_common_tags_flag() {
+        let store = SessionStore::new();
+        store.get_or_create_session("client-1", false).await;
+
+        let mut sessions = store.write().await;
+        let session = sessions.get_mut("client-1").unwrap();
+        assert!(!session.has_sent_common_tags);
+        session.has_sent_common_tags = true;
+        assert!(session.has_sent_common_tags);
+    }
+
+    #[tokio::test]
+    async fn capability_or_assign_persists() {
+        let store = SessionStore::new();
+        store.get_or_create_session("client-1", false).await;
+
+        // First update: learn encryption support
+        {
+            let mut sessions = store.write().await;
+            let session = sessions.get_mut("client-1").unwrap();
+            session.supports_encryption |= true;
+            session.supports_ephemeral_encryption |= false;
+        }
+
+        // Second update: learn ephemeral support; encryption stays true
+        {
+            let mut sessions = store.write().await;
+            let session = sessions.get_mut("client-1").unwrap();
+            session.supports_encryption |= false; // should stay true
+            session.supports_ephemeral_encryption |= true;
+        }
+
+        let sessions = store.read().await;
+        let session = sessions.get("client-1").unwrap();
+        assert!(session.supports_encryption, "OR-assign must not downgrade");
+        assert!(session.supports_ephemeral_encryption);
+        assert!(!session.supports_oversized_transfer);
+    }
+
+    #[tokio::test]
+    async fn capability_fields_independent_per_client() {
+        let store = SessionStore::new();
+        store.get_or_create_session("client-a", false).await;
+        store.get_or_create_session("client-b", false).await;
+
+        {
+            let mut sessions = store.write().await;
+            let sa = sessions.get_mut("client-a").unwrap();
+            sa.supports_encryption = true;
+            sa.has_sent_common_tags = true;
+        }
+
+        let sessions = store.read().await;
+        let sa = sessions.get("client-a").unwrap();
+        let sb = sessions.get("client-b").unwrap();
+        assert!(sa.supports_encryption);
+        assert!(sa.has_sent_common_tags);
+        assert!(!sb.supports_encryption);
+        assert!(!sb.has_sent_common_tags);
+    }
+
+    #[tokio::test]
+    async fn get_or_create_preserves_capability_fields() {
+        let store = SessionStore::new();
+        store.get_or_create_session("client-1", false).await;
+
+        // Set capability fields
+        {
+            let mut sessions = store.write().await;
+            let session = sessions.get_mut("client-1").unwrap();
+            session.supports_encryption = true;
+            session.has_sent_common_tags = true;
+        }
+
+        // Re-enter via get_or_create (existing session)
+        let created = store.get_or_create_session("client-1", true).await;
+        assert!(!created);
+
+        // Capability fields must survive
+        let sessions = store.read().await;
+        let session = sessions.get("client-1").unwrap();
+        assert!(session.supports_encryption);
+        assert!(session.has_sent_common_tags);
+    }
+
+    #[tokio::test]
+    async fn clear_resets_capability_fields() {
+        let store = SessionStore::new();
+        store.get_or_create_session("client-1", false).await;
+        {
+            let mut sessions = store.write().await;
+            let s = sessions.get_mut("client-1").unwrap();
+            s.supports_encryption = true;
+        }
+
+        store.clear().await;
+        store.get_or_create_session("client-1", false).await;
+
+        let sessions = store.read().await;
+        let session = sessions.get("client-1").unwrap();
+        assert!(!session.supports_encryption);
+        assert!(!session.has_sent_common_tags);
+    }
 }

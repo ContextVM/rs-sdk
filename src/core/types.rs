@@ -91,10 +91,16 @@ pub struct ClientSession {
     pub is_initialized: bool,
     /// Whether the client's messages were encrypted.
     pub is_encrypted: bool,
-    /// Whether common discovery tags have been sent to this client.
+    /// Whether server discovery tags have been sent to this client (one-shot flag).
     pub has_sent_common_tags: bool,
-    /// Whether the client has demonstrated support for ephemeral gift wraps.
+    /// Whether the client has demonstrated support for ephemeral gift wraps (CEP-19).
     pub supports_ephemeral_gift_wrap: bool,
+    /// Learned from client discovery tags: peer supports NIP-44 encryption.
+    pub supports_encryption: bool,
+    /// Learned from client discovery tags: peer supports ephemeral gift wraps (CEP-19).
+    pub supports_ephemeral_encryption: bool,
+    /// Learned from client discovery tags: peer supports CEP-22 oversized transfer.
+    pub supports_oversized_transfer: bool,
     /// Last activity timestamp.
     pub last_activity: Instant,
     /// Pending requests: event_id → original request ID.
@@ -111,6 +117,9 @@ impl ClientSession {
             is_encrypted,
             has_sent_common_tags: false,
             supports_ephemeral_gift_wrap: false,
+            supports_encryption: false,
+            supports_ephemeral_encryption: false,
+            supports_oversized_transfer: false,
             last_activity: Instant::now(),
             pending_requests: HashMap::new(),
             event_to_progress_token: HashMap::new(),
