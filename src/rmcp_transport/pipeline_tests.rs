@@ -14,16 +14,13 @@
 
 #[cfg(all(test, feature = "rmcp"))]
 mod tests {
-    use std::collections::HashMap;
-
     use rmcp::model::{
         ClientJsonRpcMessage, ClientResult, RequestId, ServerJsonRpcMessage, ServerResult,
     };
 
     use crate::core::serializers;
     use crate::core::types::{
-        JsonRpcError, JsonRpcErrorResponse, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest,
-        JsonRpcResponse,
+        JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
     };
     use crate::rmcp_transport::convert::{
         internal_to_rmcp_client_rx, internal_to_rmcp_server_rx, rmcp_client_tx_to_internal,
@@ -210,89 +207,120 @@ mod tests {
         assert_eq!(v["result"]["tools"], serde_json::json!([]));
     }
 
-    // ── Layer 5: ID correlation map logic (mirrors NostrServerWorker) ────────
+    // ── Layer 5: event_id-based request correlation (mirrors NostrServerWorker) ──
 
     #[test]
-    fn layer5_worker_correlation_map_number_id() {
-        let mut request_id_to_event_id: HashMap<String, String> = HashMap::new();
-        let fake_event_id = "aaaaaa".to_string();
-
-        // Step 1: incoming request arrives — worker stores req_id → event_id
-        let req = JsonRpcMessage::Request(JsonRpcRequest {
+    fn layer5_worker_uses_event_id_as_request_id() {
+        // Simulate the worker rewriting req.id to the Nostr event_id.
+        let event_id = "abc123def456";
+        let mut req = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
             id: serde_json::json!(42),
             method: "tools/list".to_string(),
             params: None,
-        });
+        };
 
-        if let JsonRpcMessage::Request(ref r) = req {
-            let key = serde_json::to_string(&r.id).unwrap();
-            request_id_to_event_id.insert(key, fake_event_id.clone());
+        // Worker inbound path: rewrite id to event_id
+        req.id = serde_json::json!(event_id);
+        assert_eq!(req.id, serde_json::json!("abc123def456"));
+
+        // Convert through rmcp bridge — ID must survive the roundtrip
+        let msg = JsonRpcMessage::Request(req);
+        let rmcp_rx = internal_to_rmcp_server_rx(&msg).unwrap();
+        let v = serde_json::to_value(&rmcp_rx).unwrap();
+        assert_eq!(v["id"], serde_json::json!("abc123def456"));
+
+        // Simulate rmcp handler echoing the event_id back in the response
+        let rmcp_tx = ServerJsonRpcMessage::response(
+            ServerResult::empty(()),
+            RequestId::String(std::sync::Arc::from(event_id)),
+        );
+        let response = rmcp_server_tx_to_internal(rmcp_tx).unwrap();
+
+        // The response ID is the event_id — worker passes it directly to send_response
+        match response {
+            JsonRpcMessage::Response(r) => {
+                assert_eq!(r.id.as_str(), Some(event_id));
+            }
+            other => panic!("expected Response, got {other:?}"),
         }
+    }
 
-        // Step 2: rmcp response comes back with id=42
-        let response = JsonRpcMessage::Response(JsonRpcResponse {
+    #[test]
+    fn layer5_worker_two_clients_no_collision() {
+        // Two clients both send requests with id: 1.  The worker rewrites each
+        // to its unique Nostr event_id, so no collision occurs.
+        let event_id_a = "aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111";
+        let event_id_b = "bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222";
+
+        let mut req_a = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
-            id: serde_json::json!(42),
-            result: serde_json::json!({}),
-        });
+            id: serde_json::json!(1),
+            method: "tools/list".to_string(),
+            params: None,
+        };
+        let mut req_b = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: serde_json::json!(1),
+            method: "tools/list".to_string(),
+            params: None,
+        };
 
-        // Step 3: worker looks up the event_id to call send_response
-        if let JsonRpcMessage::Response(ref r) = response {
-            let key = serde_json::to_string(&r.id).unwrap();
-            let found = request_id_to_event_id.remove(&key);
-            assert_eq!(found, Some(fake_event_id));
-        } else {
-            panic!("expected Response");
-        }
+        // Worker rewrites both to their respective event IDs
+        req_a.id = serde_json::json!(event_id_a);
+        req_b.id = serde_json::json!(event_id_b);
 
-        // Map should be empty after handling
-        assert!(request_id_to_event_id.is_empty());
+        // After rewrite, the IDs are distinct even though both clients sent id: 1
+        assert_ne!(req_a.id, req_b.id);
+        assert_eq!(req_a.id.as_str(), Some(event_id_a));
+        assert_eq!(req_b.id.as_str(), Some(event_id_b));
+
+        // Responses echo back the event_id — each routes to the correct client
+        let rmcp_resp_a = ServerJsonRpcMessage::response(
+            ServerResult::empty(()),
+            RequestId::String(std::sync::Arc::from(event_id_a)),
+        );
+        let rmcp_resp_b = ServerJsonRpcMessage::response(
+            ServerResult::empty(()),
+            RequestId::String(std::sync::Arc::from(event_id_b)),
+        );
+
+        let resp_a = rmcp_server_tx_to_internal(rmcp_resp_a).unwrap();
+        let resp_b = rmcp_server_tx_to_internal(rmcp_resp_b).unwrap();
+
+        // Each response carries its own event_id — no cross-wiring
+        assert_eq!(resp_a.id().unwrap().as_str(), Some(event_id_a));
+        assert_eq!(resp_b.id().unwrap().as_str(), Some(event_id_b));
     }
 
     #[test]
-    fn layer5_worker_correlation_map_string_id() {
-        let mut request_id_to_event_id: HashMap<String, String> = HashMap::new();
-        let fake_event_id = "bbbbbb".to_string();
-
-        // String IDs serialize with surrounding quotes: "\"req-abc\""
-        let req_id = serde_json::json!("req-abc");
-        let key = serde_json::to_string(&req_id).unwrap();
-        request_id_to_event_id.insert(key.clone(), fake_event_id.clone());
-
-        // The response ID serializes identically
-        let resp_id = serde_json::json!("req-abc");
-        let resp_key = serde_json::to_string(&resp_id).unwrap();
-
-        // Key derived from response ID must match the one stored from request ID
-        assert_eq!(key, resp_key);
-        assert_eq!(
-            request_id_to_event_id.remove(&resp_key),
-            Some(fake_event_id)
-        );
-    }
-
-    #[test]
-    fn layer5_error_response_correlation_works() {
-        let mut map: HashMap<String, String> = HashMap::new();
-        map.insert(
-            serde_json::to_string(&serde_json::json!(5)).unwrap(),
-            "evt5".to_string(),
-        );
-
-        let error_response = JsonRpcMessage::ErrorResponse(JsonRpcErrorResponse {
+    fn layer5_error_response_carries_event_id() {
+        // Error responses also carry the event_id for routing.
+        let event_id = "deadbeef";
+        let mut req = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
             id: serde_json::json!(5),
-            error: JsonRpcError {
-                code: -32601,
-                message: "Method not found".to_string(),
+            method: "tools/call".to_string(),
+            params: None,
+        };
+        req.id = serde_json::json!(event_id);
+
+        // rmcp handler returns an error with the rewritten event_id
+        let rmcp_err = ServerJsonRpcMessage::error(
+            rmcp::model::ErrorData {
+                code: rmcp::model::ErrorCode::METHOD_NOT_FOUND,
+                message: "Method not found".into(),
                 data: None,
             },
-        });
+            RequestId::String(std::sync::Arc::from(event_id)),
+        );
+        let internal = rmcp_server_tx_to_internal(rmcp_err).unwrap();
 
-        if let JsonRpcMessage::ErrorResponse(ref r) = error_response {
-            let key = serde_json::to_string(&r.id).unwrap();
-            assert_eq!(map.remove(&key), Some("evt5".to_string()));
+        match internal {
+            JsonRpcMessage::ErrorResponse(r) => {
+                assert_eq!(r.id.as_str(), Some(event_id));
+            }
+            other => panic!("expected ErrorResponse, got {other:?}"),
         }
     }
 

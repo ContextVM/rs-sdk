@@ -48,6 +48,8 @@ pub struct NostrServerTransportConfig {
     pub allowed_public_keys: Vec<String>,
     /// Capabilities excluded from pubkey whitelisting.
     pub excluded_capabilities: Vec<CapabilityExclusion>,
+    /// Maximum number of concurrent client sessions (LRU-bounded, default: 1000).
+    pub max_sessions: usize,
     /// Session cleanup interval (default: 60s).
     pub cleanup_interval: Duration,
     /// Session timeout (default: 300s).
@@ -66,6 +68,7 @@ impl Default for NostrServerTransportConfig {
             is_announced_server: false,
             allowed_public_keys: Vec::new(),
             excluded_capabilities: Vec::new(),
+            max_sessions: session_store::DEFAULT_MAX_SESSIONS,
             cleanup_interval: Duration::from_secs(60),
             session_timeout: Duration::from_secs(300),
             log_file_path: None,
@@ -147,10 +150,10 @@ impl NostrServerTransport {
                 encryption_mode: config.encryption_mode,
                 is_connected: false,
             },
+            sessions: SessionStore::with_capacity(config.max_sessions),
             config,
             extra_common_tags: Vec::new(),
             pricing_tags: Vec::new(),
-            sessions: SessionStore::new(),
             event_routes: ServerEventRouteStore::new(),
             request_wrap_kinds: Arc::new(RwLock::new(HashMap::new())),
             seen_gift_wrap_ids,
@@ -184,10 +187,10 @@ impl NostrServerTransport {
                 encryption_mode: config.encryption_mode,
                 is_connected: false,
             },
+            sessions: SessionStore::with_capacity(config.max_sessions),
             config,
             extra_common_tags: Vec::new(),
             pricing_tags: Vec::new(),
-            sessions: SessionStore::new(),
             request_wrap_kinds: Arc::new(RwLock::new(HashMap::new())),
             event_routes: ServerEventRouteStore::new(),
             seen_gift_wrap_ids,
@@ -1054,10 +1057,21 @@ impl NostrServerTransport {
                 }
 
                 // Session management
+                let on_evicted_cb = sessions.eviction_callback();
                 let mut sessions_w = sessions.write().await;
-                let session = sessions_w
-                    .entry(sender_pubkey.clone())
-                    .or_insert_with(|| ClientSession::new(is_encrypted));
+                if !sessions_w.contains(&sender_pubkey) {
+                    let evicted =
+                        sessions_w.push(sender_pubkey.clone(), ClientSession::new(is_encrypted));
+                    SessionStore::handle_eviction(
+                        &sender_pubkey,
+                        evicted,
+                        &mut sessions_w,
+                        on_evicted_cb.as_ref(),
+                        &event_routes,
+                    )
+                    .await;
+                }
+                let session = sessions_w.get_mut(&sender_pubkey).unwrap();
                 session.update_activity();
                 session.is_encrypted = is_encrypted;
 
@@ -1156,21 +1170,25 @@ impl NostrServerTransport {
         let mut cleaned = 0;
         let mut stale_event_ids = Vec::new();
 
-        sessions_w.retain(|pubkey, session| {
-            if session.last_activity.elapsed() > timeout {
+        // LruCache has no retain(); collect expired keys then pop each one.
+        let expired_keys: Vec<String> = sessions_w
+            .iter()
+            .filter(|(_, session)| session.last_activity.elapsed() > timeout)
+            .map(|(k, _)| k.clone())
+            .collect();
+
+        for key in &expired_keys {
+            if let Some(session) = sessions_w.pop(key) {
                 stale_event_ids.extend(session.pending_requests.keys().cloned());
                 stale_event_ids.extend(session.event_to_progress_token.keys().cloned());
                 tracing::debug!(
                     target: LOG_TARGET,
-                    client_pubkey = %pubkey,
+                    client_pubkey = %key,
                     "Session expired"
                 );
                 cleaned += 1;
-                false
-            } else {
-                true
             }
-        });
+        }
         drop(sessions_w);
 
         {
@@ -1306,10 +1324,7 @@ mod tests {
         session
             .pending_requests
             .insert("evt1".to_string(), serde_json::json!(1));
-        sessions
-            .write()
-            .await
-            .insert("pubkey1".to_string(), session);
+        sessions.write().await.put("pubkey1".to_string(), session);
         event_routes
             .register(
                 "evt1".to_string(),
@@ -1352,7 +1367,9 @@ mod tests {
         let event_routes = ServerEventRouteStore::new();
         let request_wrap_kinds = Arc::new(RwLock::new(HashMap::new()));
 
-        sessions.get_or_create_session("active", false).await;
+        sessions
+            .get_or_create_session("active", false, &event_routes)
+            .await;
 
         let cleaned = NostrServerTransport::cleanup_sessions(
             &sessions,
@@ -1501,6 +1518,7 @@ mod tests {
         assert_eq!(config.gift_wrap_mode, GiftWrapMode::Optional);
         assert!(config.allowed_public_keys.is_empty());
         assert!(config.excluded_capabilities.is_empty());
+        assert_eq!(config.max_sessions, 1000);
         assert_eq!(config.cleanup_interval, Duration::from_secs(60));
         assert_eq!(config.session_timeout, Duration::from_secs(300));
         assert!(config.server_info.is_none());

@@ -126,6 +126,7 @@ mod tests {
             is_announced_server: true,
             allowed_public_keys: vec!["abc123".to_string()],
             excluded_capabilities: vec![],
+            max_sessions: 1000,
             cleanup_interval: Duration::from_secs(120),
             session_timeout: Duration::from_secs(600),
             log_file_path: None,

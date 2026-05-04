@@ -105,6 +105,24 @@ impl MockRelayPool {
         (a, b)
     }
 
+    /// Create `n` linked mock relay pools with different signing keys.
+    ///
+    /// All pools share the same event store and notification channel so events
+    /// published by any one pool are visible to all others' `notifications()`
+    /// receivers.  Useful for multi-client integration tests.
+    pub fn create_linked_group(n: usize) -> Vec<Self> {
+        assert!(n > 0, "group must have at least one pool");
+        let (tx, _rx) = tokio::sync::broadcast::channel(1024);
+        let inner = Arc::new(Mutex::new(MockRelayInner::new()));
+        (0..n)
+            .map(|_| Self {
+                inner: Arc::clone(&inner),
+                notification_tx: tx.clone(),
+                keys: Keys::generate(),
+            })
+            .collect()
+    }
+
     /// Clone of all events published so far (useful for assertions in tests).
     pub async fn stored_events(&self) -> Vec<Event> {
         self.inner.lock().await.events.clone()

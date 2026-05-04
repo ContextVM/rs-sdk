@@ -138,11 +138,16 @@ mod client_correlation_store {
 mod server_session_store {
     use super::*;
 
+    fn routes() -> ServerEventRouteStore {
+        ServerEventRouteStore::new()
+    }
+
     #[tokio::test]
     async fn create_and_retrieve_sessions() {
         let store = SessionStore::new();
+        let r = routes();
 
-        let created = store.get_or_create_session("client-1", true).await;
+        let created = store.get_or_create_session("client-1", true, &r).await;
         assert!(created);
 
         let session = store.get_session("client-1").await.unwrap();
@@ -156,7 +161,8 @@ mod server_session_store {
     #[tokio::test]
     async fn mark_sessions_as_initialized() {
         let store = SessionStore::new();
-        store.get_or_create_session("client-1", false).await;
+        let r = routes();
+        store.get_or_create_session("client-1", false, &r).await;
 
         let result = store.mark_initialized("client-1").await;
         assert!(result);
@@ -168,7 +174,8 @@ mod server_session_store {
     #[tokio::test]
     async fn remove_sessions() {
         let store = SessionStore::new();
-        store.get_or_create_session("client-1", false).await;
+        let r = routes();
+        store.get_or_create_session("client-1", false, &r).await;
 
         let result = store.remove_session("client-1").await;
         assert!(result);
@@ -178,8 +185,9 @@ mod server_session_store {
     #[tokio::test]
     async fn clear_all_sessions() {
         let store = SessionStore::new();
-        store.get_or_create_session("client-1", false).await;
-        store.get_or_create_session("client-2", true).await;
+        let r = routes();
+        store.get_or_create_session("client-1", false, &r).await;
+        store.get_or_create_session("client-2", true, &r).await;
 
         store.clear().await;
 
@@ -191,8 +199,9 @@ mod server_session_store {
     #[tokio::test]
     async fn iterate_over_all_sessions() {
         let store = SessionStore::new();
-        store.get_or_create_session("client-1", false).await;
-        store.get_or_create_session("client-2", true).await;
+        let r = routes();
+        store.get_or_create_session("client-1", false, &r).await;
+        store.get_or_create_session("client-2", true, &r).await;
 
         let sessions = store.get_all_sessions().await;
         assert_eq!(sessions.len(), 2);

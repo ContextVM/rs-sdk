@@ -3,8 +3,6 @@
 //! This file defines wrapper types that bind existing ContextVM Nostr
 //! transports to rmcp's worker abstraction.
 
-use std::collections::HashMap;
-
 use crate::core::error::Result;
 use crate::core::types::JsonRpcMessage;
 use crate::transport::client::{NostrClientTransport, NostrClientTransportConfig};
@@ -19,12 +17,16 @@ use super::convert::{
 const LOG_TARGET: &str = "contextvm_sdk::rmcp_transport::worker";
 
 /// rmcp server worker wrapper for ContextVM Nostr server transport.
+///
+/// Multiplexes all connected clients through a single rmcp service instance.
+/// Inbound requests have their JSON-RPC `id` rewritten to the Nostr `event_id`
+/// before being forwarded to the rmcp handler.  Since event IDs are globally
+/// unique (SHA-256 hashes), this eliminates collisions when different clients
+/// use the same JSON-RPC request IDs.  The transport's event-route store
+/// handles response routing back to the originating client; server-initiated
+/// notifications are broadcast to all initialized clients.
 pub struct NostrServerWorker {
     transport: NostrServerTransport,
-    // rmcp service instance is single-peer. Keep one active client per worker.
-    active_client_pubkey: Option<String>,
-    // Maps request id (serialized JSON value) -> incoming Nostr event id.
-    request_id_to_event_id: HashMap<String, String>,
 }
 
 impl NostrServerWorker {
@@ -34,11 +36,7 @@ impl NostrServerWorker {
         T: nostr_sdk::prelude::IntoNostrSigner,
     {
         let transport = NostrServerTransport::new(signer, config).await?;
-        Ok(Self {
-            transport,
-            active_client_pubkey: None,
-            request_id_to_event_id: HashMap::new(),
-        })
+        Ok(Self { transport })
     }
 
     /// Access the wrapped transport.
@@ -88,46 +86,18 @@ impl Worker for NostrServerWorker {
                     };
 
                     let crate::transport::server::IncomingRequest {
-                        message,
-                        client_pubkey,
+                        mut message,
                         event_id,
                         ..
                     } = incoming;
 
-                    match &self.active_client_pubkey {
-                        Some(active) if active != &client_pubkey => {
-                            tracing::warn!(
-                                target: LOG_TARGET,
-                                active_client = %active,
-                                ignored_client = %client_pubkey,
-                                "Ignoring message from second client: rmcp server worker currently supports one active client per worker"
-                            );
-                            continue;
-                        }
-                        None => {
-                            tracing::info!(
-                                target: LOG_TARGET,
-                                client_pubkey = %client_pubkey,
-                                "Binding rmcp server worker to first client session"
-                            );
-                            self.active_client_pubkey = Some(client_pubkey.clone());
-                        }
-                        _ => {}
-                    }
-
-                    if let JsonRpcMessage::Request(req) = &message {
-                        match serde_json::to_string(&req.id) {
-                            Ok(request_key) => {
-                                self.request_id_to_event_id.insert(request_key, event_id);
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    target: LOG_TARGET,
-                                    error = %e,
-                                    "Failed to serialize request id for correlation map"
-                                );
-                            }
-                        }
+                    // Rewrite the JSON-RPC request ID to the Nostr event_id.
+                    // Event IDs are globally unique (SHA-256), so no collision
+                    // across clients.  The transport's event-route store maps
+                    // event_id → (client_pubkey, original_request_id) and
+                    // restores the original ID in `send_response`.
+                    if let JsonRpcMessage::Request(ref mut req) = message {
+                        req.id = serde_json::json!(event_id);
                     }
 
                     if let Some(rmcp_msg) = internal_to_rmcp_server_rx(&message) {
@@ -276,76 +246,44 @@ impl Worker for NostrClientWorker {
 }
 
 impl NostrServerWorker {
+    /// Forward an outbound message from the rmcp handler to the Nostr transport.
+    ///
+    /// Response IDs carry the Nostr event_id set during ingest.  The transport's
+    /// `send_response` uses this to look up the route (client_pubkey +
+    /// original_request_id) and deliver the response to the correct client.
+    /// Notifications and server-initiated requests are broadcast to all
+    /// initialized clients.
     async fn forward_server_internal(&mut self, message: JsonRpcMessage) -> Result<()> {
         match message {
             JsonRpcMessage::Response(resp) => {
-                let request_key = serde_json::to_string(&resp.id).map_err(|e| {
-                    crate::core::error::Error::Validation(format!(
-                        "failed to serialize rmcp response id for correlation lookup: {e}"
-                    ))
+                let event_id = resp.id.as_str().map(str::to_owned).ok_or_else(|| {
+                    crate::core::error::Error::Validation(
+                        "rmcp server response id is not a string event_id".to_string(),
+                    )
                 })?;
-
-                let event_id =
-                    if let Some(event_id) = self.request_id_to_event_id.remove(&request_key) {
-                        event_id
-                    } else {
-                        resp.id.as_str().map(str::to_owned).ok_or_else(|| {
-                            crate::core::error::Error::Validation(
-							"rmcp server response id has no known correlation mapping and is not a string event id"
-								.to_string(),
-						)
-                        })?
-                    };
 
                 self.transport
                     .send_response(&event_id, JsonRpcMessage::Response(resp))
                     .await
             }
             JsonRpcMessage::ErrorResponse(resp) => {
-                let request_key = serde_json::to_string(&resp.id).map_err(|e| {
-                    crate::core::error::Error::Validation(format!(
-                        "failed to serialize rmcp error response id for correlation lookup: {e}"
-                    ))
+                let event_id = resp.id.as_str().map(str::to_owned).ok_or_else(|| {
+                    crate::core::error::Error::Validation(
+                        "rmcp server error response id is not a string event_id".to_string(),
+                    )
                 })?;
-
-                let event_id =
-                    if let Some(event_id) = self.request_id_to_event_id.remove(&request_key) {
-                        event_id
-                    } else {
-                        resp.id.as_str().map(str::to_owned).ok_or_else(|| {
-                            crate::core::error::Error::Validation(
-							"rmcp server error response id has no known correlation mapping and is not a string event id"
-								.to_string(),
-						)
-                        })?
-                    };
 
                 self.transport
                     .send_response(&event_id, JsonRpcMessage::ErrorResponse(resp))
                     .await
             }
             JsonRpcMessage::Notification(notification) => {
-                let target = self.active_client_pubkey.as_deref().ok_or_else(|| {
-                    crate::core::error::Error::Validation(
-                        "cannot forward rmcp server notification: no active client bound"
-                            .to_string(),
-                    )
-                })?;
                 let message = JsonRpcMessage::Notification(notification);
-                self.transport
-                    .send_notification(target, &message, None)
-                    .await
+                self.transport.broadcast_notification(&message).await
             }
             JsonRpcMessage::Request(request) => {
-                let target = self.active_client_pubkey.as_deref().ok_or_else(|| {
-                    crate::core::error::Error::Validation(
-                        "cannot forward rmcp server request: no active client bound".to_string(),
-                    )
-                })?;
                 let message = JsonRpcMessage::Request(request);
-                self.transport
-                    .send_notification(target, &message, None)
-                    .await
+                self.transport.broadcast_notification(&message).await
             }
         }
     }
