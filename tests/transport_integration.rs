@@ -3348,3 +3348,178 @@ async fn client_optional_encryption_emits_discovery_tags() {
         "inner event must carry support_encryption_ephemeral tag (Optional gift-wrap mode)"
     );
 }
+// ── Multi-client support ─────────────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn multi_client_concurrent_requests_both_get_responses() {
+    // Two different clients send requests to the same server; both must get
+    // their own response (the single-peer barrier is removed).
+    let mut pools = MockRelayPool::create_linked_group(3);
+    let server_pool = pools.remove(0);
+    let client_b_pool = pools.remove(1);
+    let client_a_pool = pools.remove(0);
+    let server_pubkey = server_pool.mock_public_key();
+
+    let mut server = NostrServerTransport::with_relay_pool(
+        NostrServerTransportConfig {
+            encryption_mode: EncryptionMode::Disabled,
+            ..Default::default()
+        },
+        as_pool(server_pool),
+    )
+    .await
+    .expect("create server transport");
+
+    let mut client_a = NostrClientTransport::with_relay_pool(
+        NostrClientTransportConfig {
+            server_pubkey: server_pubkey.to_hex(),
+            encryption_mode: EncryptionMode::Disabled,
+            ..Default::default()
+        },
+        as_pool(client_a_pool),
+    )
+    .await
+    .expect("create client A");
+
+    let mut client_b = NostrClientTransport::with_relay_pool(
+        NostrClientTransportConfig {
+            server_pubkey: server_pubkey.to_hex(),
+            encryption_mode: EncryptionMode::Disabled,
+            ..Default::default()
+        },
+        as_pool(client_b_pool),
+    )
+    .await
+    .expect("create client B");
+
+    let mut server_rx = server
+        .take_message_receiver()
+        .expect("server message receiver");
+    let mut client_a_rx = client_a
+        .take_message_receiver()
+        .expect("client A message receiver");
+    let mut client_b_rx = client_b
+        .take_message_receiver()
+        .expect("client B message receiver");
+
+    server.start().await.expect("server start");
+    client_a.start().await.expect("client A start");
+    client_b.start().await.expect("client B start");
+    let_event_loops_start().await;
+
+    // Client A sends a request.
+    let req_a = JsonRpcMessage::Request(JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: serde_json::json!(1),
+        method: "tools/list".to_string(),
+        params: None,
+    });
+    client_a.send(&req_a).await.expect("client A send");
+
+    // Client B sends a request.
+    let req_b = JsonRpcMessage::Request(JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: serde_json::json!(2),
+        method: "tools/list".to_string(),
+        params: None,
+    });
+    client_b.send(&req_b).await.expect("client B send");
+
+    // Server receives both requests (order may vary).
+    let incoming_1 = tokio::time::timeout(Duration::from_millis(500), server_rx.recv())
+        .await
+        .expect("timeout rx 1")
+        .expect("rx closed 1");
+    let incoming_2 = tokio::time::timeout(Duration::from_millis(500), server_rx.recv())
+        .await
+        .expect("timeout rx 2")
+        .expect("rx closed 2");
+
+    // Send responses to both.
+    let resp_1 = JsonRpcMessage::Response(JsonRpcResponse {
+        jsonrpc: "2.0".to_string(),
+        id: incoming_1.message.id().unwrap().clone(),
+        result: serde_json::json!({"tools": []}),
+    });
+    server
+        .send_response(&incoming_1.event_id, resp_1)
+        .await
+        .expect("server respond to 1");
+
+    let resp_2 = JsonRpcMessage::Response(JsonRpcResponse {
+        jsonrpc: "2.0".to_string(),
+        id: incoming_2.message.id().unwrap().clone(),
+        result: serde_json::json!({"tools": []}),
+    });
+    server
+        .send_response(&incoming_2.event_id, resp_2)
+        .await
+        .expect("server respond to 2");
+
+    // Both clients must receive their respective response.
+    let resp_a = tokio::time::timeout(Duration::from_millis(500), client_a_rx.recv())
+        .await
+        .expect("timeout client A response")
+        .expect("client A channel closed");
+    let resp_b = tokio::time::timeout(Duration::from_millis(500), client_b_rx.recv())
+        .await
+        .expect("timeout client B response")
+        .expect("client B channel closed");
+
+    assert!(
+        matches!(resp_a, JsonRpcMessage::Response(_)),
+        "client A must receive a response"
+    );
+    assert!(
+        matches!(resp_b, JsonRpcMessage::Response(_)),
+        "client B must receive a response"
+    );
+}
+
+// ── Session store LRU tests ─────────────────────────────────────────────────
+
+use contextvm_sdk::transport::server::SessionStore;
+use contextvm_sdk::ServerEventRouteStore;
+
+#[tokio::test]
+async fn session_store_lru_eviction() {
+    let store = SessionStore::with_capacity(3);
+    let r = ServerEventRouteStore::new();
+    store.get_or_create_session("a", false, &r).await;
+    store.get_or_create_session("b", false, &r).await;
+    store.get_or_create_session("c", false, &r).await;
+
+    // 4th session evicts the oldest ("a")
+    store.get_or_create_session("d", false, &r).await;
+
+    assert!(
+        store.get_session("a").await.is_none(),
+        "oldest session must be evicted when capacity is exceeded"
+    );
+    assert!(store.get_session("b").await.is_some());
+    assert!(store.get_session("c").await.is_some());
+    assert!(store.get_session("d").await.is_some());
+    assert_eq!(store.session_count().await, 3);
+}
+
+#[tokio::test]
+async fn session_store_eviction_callback_fires() {
+    let evicted_keys: Arc<std::sync::Mutex<Vec<String>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured = evicted_keys.clone();
+    let r = ServerEventRouteStore::new();
+
+    let mut store = SessionStore::with_capacity(2);
+    store.set_eviction_callback(std::sync::Arc::new(move |pubkey| {
+        captured.lock().unwrap().push(pubkey);
+    }));
+
+    store.get_or_create_session("x", false, &r).await;
+    store.get_or_create_session("y", false, &r).await;
+    // Adding "z" evicts "x"
+    store.get_or_create_session("z", false, &r).await;
+
+    let keys = evicted_keys.lock().unwrap();
+    assert_eq!(keys.len(), 1, "callback must fire exactly once");
+    assert_eq!(keys[0], "x", "evicted key must be the oldest session");
+}
