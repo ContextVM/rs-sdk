@@ -41,7 +41,11 @@ pub struct NostrClientTransportConfig {
     pub gift_wrap_mode: GiftWrapMode,
     /// Stateless mode: emulate initialize response locally.
     pub is_stateless: bool,
-    /// Response timeout (default: 30s).
+    /// Correlation-retention TTL for pending client requests (default: 30s).
+    ///
+    /// Stale pending entries older than this are swept from the correlation store.
+    /// This prevents leaks -- rmcp owns actual request timeout and cancellation.
+    /// Keep this value above your rmcp request timeout to avoid premature cleanup.
     pub timeout: Duration,
     /// Optional log file path. Logs always go to stdout and are also appended here when set.
     pub log_file_path: Option<String>,

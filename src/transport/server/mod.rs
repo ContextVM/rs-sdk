@@ -52,7 +52,11 @@ pub struct NostrServerTransportConfig {
     pub cleanup_interval: Duration,
     /// Session timeout (default: 300s).
     pub session_timeout: Duration,
-    /// Request route timeout (default: 60s). Stale routes older than this are swept.
+    /// Correlation-retention TTL for server-side event routes (default: 60s).
+    ///
+    /// Stale route entries older than this are swept from the correlation store.
+    /// This prevents leaks -- rmcp owns actual request timeout and cancellation.
+    /// Keep this value above your rmcp request timeout to avoid premature cleanup.
     pub request_timeout: Duration,
     /// Optional log file path. Logs always go to stdout and are also appended here when set.
     pub log_file_path: Option<String>,
