@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use lru::LruCache;
 use tokio::sync::RwLock;
@@ -21,6 +22,8 @@ pub struct RouteEntry {
     /// The outer gift-wrap event kind that carried this request (e.g. 1059 or 21059).
     /// Populated from the inbound event in a later PR; `None` until then.
     pub wrap_kind: Option<u16>,
+    /// When the route was registered.
+    pub registered_at: Instant,
 }
 
 /// Internal state behind the lock.
@@ -127,6 +130,7 @@ impl ServerEventRouteStore {
                 original_request_id,
                 progress_token,
                 wrap_kind: None,
+                registered_at: Instant::now(),
             },
         );
 
@@ -220,6 +224,26 @@ impl ServerEventRouteStore {
     /// Number of progress token mappings currently tracked.
     pub async fn progress_token_count(&self) -> usize {
         self.inner.read().await.progress_token_to_event.len()
+    }
+
+    /// Remove all route entries older than `timeout`.
+    /// (Routes for expired sessions are already cleaned by `cleanup_sessions`.)
+    /// Returns the event IDs of the removed entries.
+    pub async fn sweep_stale_routes(&self, timeout: Duration) -> Vec<String> {
+        let now = Instant::now();
+        let mut inner = self.inner.write().await;
+        let mut expired_keys = Vec::new();
+
+        for (key, entry) in inner.routes.iter() {
+            if now.duration_since(entry.registered_at) >= timeout {
+                expired_keys.push(key.clone());
+            }
+        }
+
+        for key in &expired_keys {
+            inner.remove_route(key);
+        }
+        expired_keys
     }
 
     pub async fn clear(&self) {
@@ -320,5 +344,44 @@ mod tests {
         assert_eq!(store.event_route_count().await, DEFAULT_LRU_SIZE);
         assert!(!store.has_event_route("e0").await);
         assert!(store.has_event_route(&format!("e{DEFAULT_LRU_SIZE}")).await);
+    }
+
+    #[tokio::test]
+    async fn sweep_stale_routes_removes_only_expired() {
+        let store = ServerEventRouteStore::new();
+
+        // Insert a route that will age past the threshold.
+        store
+            .register("old".into(), "pk1".into(), json!(1), Some("tok1".into()))
+            .await;
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Insert a fresh route.
+        store
+            .register("fresh".into(), "pk2".into(), json!(2), None)
+            .await;
+
+        // Sweep with 10ms timeout — "old" should be removed, "fresh" should remain.
+        let swept = store.sweep_stale_routes(Duration::from_millis(10)).await;
+        assert_eq!(swept.len(), 1);
+        assert_eq!(swept[0], "old");
+        assert!(!store.has_event_route("old").await);
+        assert!(store.has_event_route("fresh").await);
+        // Secondary indexes should also be cleaned.
+        assert!(!store.has_progress_token("tok1").await);
+        assert!(!store.has_active_routes_for_client("pk1").await);
+    }
+
+    #[tokio::test]
+    async fn sweep_stale_routes_returns_zero_when_nothing_expired() {
+        let store = ServerEventRouteStore::new();
+        store
+            .register("e1".into(), "pk1".into(), json!(1), None)
+            .await;
+
+        let swept = store.sweep_stale_routes(Duration::from_secs(60)).await;
+        assert!(swept.is_empty());
+        assert!(store.has_event_route("e1").await);
     }
 }

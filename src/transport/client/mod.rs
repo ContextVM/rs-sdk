@@ -41,7 +41,11 @@ pub struct NostrClientTransportConfig {
     pub gift_wrap_mode: GiftWrapMode,
     /// Stateless mode: emulate initialize response locally.
     pub is_stateless: bool,
-    /// Response timeout (default: 30s).
+    /// Correlation-retention TTL for pending client requests (default: 30s).
+    ///
+    /// Stale pending entries older than this are swept from the correlation store.
+    /// This prevents leaks -- rmcp owns actual request timeout and cancellation.
+    /// Keep this value above your rmcp request timeout to avoid premature cleanup.
     pub timeout: Duration,
     /// Optional log file path. Logs always go to stdout and are also appended here when set.
     pub log_file_path: Option<String>,
@@ -243,6 +247,7 @@ impl NostrClientTransport {
         let init_event = self.server_initialize_event.clone();
         let server_supports_ephemeral = self.server_supports_ephemeral.clone();
         let seen_gift_wrap_ids = self.seen_gift_wrap_ids.clone();
+        let timeout = self.config.timeout;
 
         tokio::spawn(async move {
             Self::event_loop(
@@ -256,6 +261,7 @@ impl NostrClientTransport {
                 init_event,
                 server_supports_ephemeral,
                 seen_gift_wrap_ids,
+                timeout,
             )
             .await;
         });
@@ -393,199 +399,46 @@ impl NostrClientTransport {
         init_event: Arc<Mutex<Option<Event>>>,
         server_supports_ephemeral: Arc<AtomicBool>,
         seen_gift_wrap_ids: Arc<Mutex<LruCache<EventId, ()>>>,
+        timeout: Duration,
     ) {
         let mut notifications = relay_pool.notifications();
+        // Sweep interval: half the timeout, clamped to [1s, 30s].
+        let sweep_interval = (timeout / 2).clamp(Duration::from_secs(1), Duration::from_secs(30));
+        let mut sweep_timer =
+            tokio::time::interval_at(tokio::time::Instant::now() + sweep_interval, sweep_interval);
 
-        while let Ok(notification) = notifications.recv().await {
-            if let RelayPoolNotification::Event { event, .. } = notification {
-                let is_gift_wrap = is_gift_wrap_kind(&event.kind);
-                let outer_kind = event.kind.as_u16();
-
-                // Enforce encryption mode before decrypt/parse.
-                if violates_encryption_policy(&event.kind, &encryption_mode) {
-                    if is_gift_wrap {
-                        tracing::warn!(
-                            target: LOG_TARGET,
-                            event_id = %event.id.to_hex(),
-                            event_kind = outer_kind,
-                            configured_mode = ?gift_wrap_mode,
-                            "Skipping encrypted response because client encryption is disabled"
-                        );
-                    } else {
-                        tracing::warn!(
-                            target: LOG_TARGET,
-                            event_id = %event.id.to_hex(),
-                            "Skipping plaintext response because client encryption is required"
-                        );
-                    }
-                    continue;
-                }
-
-                // Enforce CEP-19 gift-wrap-mode policy.
-                if is_gift_wrap && !gift_wrap_mode.allows_kind(outer_kind) {
-                    tracing::warn!(
-                        target: LOG_TARGET,
-                        event_id = %event.id.to_hex(),
-                        event_kind = outer_kind,
-                        configured_mode = ?gift_wrap_mode,
-                        "Skipping gift wrap due to CEP-19 policy"
-                    );
-                    continue;
-                }
-
-                // Handle gift-wrapped events
-                let (actual_event_content, actual_pubkey, e_tag, verified_tags, source_event) =
-                    if is_gift_wrap {
-                        {
-                            let guard = match seen_gift_wrap_ids.lock() {
-                                Ok(g) => g,
-                                Err(poisoned) => poisoned.into_inner(),
-                            };
-                            if guard.contains(&event.id) {
-                                tracing::debug!(
-                                    target: LOG_TARGET,
-                                    event_id = %event.id.to_hex(),
-                                    "Skipping duplicate gift-wrap (outer id)"
-                                );
-                                continue;
-                            }
-                        }
-                        // Single-layer NIP-44 decrypt (matches JS/TS SDK)
-                        let signer = match relay_pool.signer().await {
-                            Ok(s) => s,
-                            Err(error) => {
-                                tracing::error!(
-                                    target: LOG_TARGET,
-                                    error = %error,
-                                    "Failed to get signer"
-                                );
-                                continue;
-                            }
-                        };
-                        match encryption::decrypt_gift_wrap_single_layer(&signer, &event).await {
-                            Ok(decrypted_json) => {
-                                match serde_json::from_str::<Event>(&decrypted_json) {
-                                    Ok(inner) => {
-                                        if let Err(e) = inner.verify() {
-                                            tracing::warn!(
-                                                "Inner event signature verification failed: {e}"
-                                            );
-                                            continue;
-                                        }
-                                        {
-                                            let mut guard = match seen_gift_wrap_ids.lock() {
-                                                Ok(g) => g,
-                                                Err(poisoned) => poisoned.into_inner(),
-                                            };
-                                            guard.put(event.id, ());
-                                        }
-                                        let e_tag = serializers::get_tag_value(&inner.tags, "e");
-                                        let inner_clone = inner.clone();
-                                        (
-                                            inner.content,
-                                            inner.pubkey,
-                                            e_tag,
-                                            inner.tags,
-                                            inner_clone,
-                                        )
-                                    }
-                                    Err(error) => {
-                                        tracing::error!(
-                                            target: LOG_TARGET,
-                                            error = %error,
-                                            "Failed to parse inner event"
-                                        );
-                                        continue;
-                                    }
-                                }
-                            }
-                            Err(error) => {
-                                tracing::error!(
-                                    target: LOG_TARGET,
-                                    error = %error,
-                                    "Failed to decrypt gift wrap"
-                                );
-                                continue;
-                            }
-                        }
-                    } else {
-                        let e_tag = serializers::get_tag_value(&event.tags, "e");
-                        let event_clone = (*event).clone();
-                        (
-                            event.content.clone(),
-                            event.pubkey,
-                            e_tag,
-                            event.tags.clone(),
-                            event_clone,
-                        )
+        loop {
+            tokio::select! {
+                result = notifications.recv() => {
+                    let notification = match result {
+                        Ok(n) => n,
+                        Err(_) => break,
                     };
-
-                // Verify it's from our server
-                if actual_pubkey != server_pubkey {
-                    tracing::debug!(
-                        target: LOG_TARGET,
-                        event_pubkey = %actual_pubkey.to_hex(),
-                        expected_pubkey = %server_pubkey.to_hex(),
-                        "Skipping event from unexpected pubkey"
-                    );
-                    continue;
+                    Self::handle_notification(
+                        &notification,
+                        &pending,
+                        server_pubkey,
+                        &tx,
+                        encryption_mode,
+                        gift_wrap_mode,
+                        &discovered_caps,
+                        &init_event,
+                        &server_supports_ephemeral,
+                        &seen_gift_wrap_ids,
+                        &relay_pool,
+                    )
+                    .await;
                 }
-
-                // CEP-35: learn server capabilities from discovery tags
-                Self::learn_server_discovery(&discovered_caps, &init_event, &source_event);
-
-                // CEP-19: learn ephemeral support from server
-                if Self::should_learn_ephemeral_support(
-                    actual_pubkey,
-                    server_pubkey,
-                    if is_gift_wrap { Some(outer_kind) } else { None },
-                    &verified_tags,
-                ) {
-                    server_supports_ephemeral.store(true, Ordering::Relaxed);
-                }
-
-                // Correlate response
-                if let Some(ref correlated_id) = e_tag {
-                    let is_pending = pending.contains(correlated_id.as_str()).await;
-                    if !is_pending {
+                _ = sweep_timer.tick() => {
+                    let swept = pending.sweep_expired(timeout).await;
+                    if swept > 0 {
                         tracing::warn!(
                             target: LOG_TARGET,
-                            correlated_event_id = %correlated_id,
-                            "Response for unknown request"
+                            swept,
+                            timeout_ms = timeout.as_millis() as u64,
+                            "Swept stale pending requests (rmcp handles timeout errors)"
                         );
-                        continue;
                     }
-                }
-
-                // Parse MCP message
-                if let Some(mcp_msg) = validation::validate_and_parse(&actual_event_content) {
-                    // Drop uncorrelated responses and server-to-client requests (matches TS SDK).
-                    match &mcp_msg {
-                        JsonRpcMessage::Response(_) | JsonRpcMessage::ErrorResponse(_)
-                            if e_tag.is_none() =>
-                        {
-                            tracing::warn!(
-                                target: LOG_TARGET,
-                                "Dropping response/error without correlation `e` tag"
-                            );
-                            continue;
-                        }
-                        JsonRpcMessage::Request(_) => {
-                            tracing::warn!(
-                                target: LOG_TARGET,
-                                method = ?mcp_msg.method(),
-                                "Dropping server-to-client request (invalid in MCP)"
-                            );
-                            continue;
-                        }
-                        _ => {}
-                    }
-
-                    // Clean up pending request
-                    if let Some(ref correlated_id) = e_tag {
-                        pending.remove(correlated_id.as_str()).await;
-                    }
-                    let _ = tx.send(mcp_msg);
                 }
             }
         }
@@ -673,6 +526,206 @@ impl NostrClientTransport {
         *guard
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_notification(
+        notification: &RelayPoolNotification,
+        pending: &ClientCorrelationStore,
+        server_pubkey: PublicKey,
+        tx: &tokio::sync::mpsc::UnboundedSender<JsonRpcMessage>,
+        encryption_mode: EncryptionMode,
+        gift_wrap_mode: GiftWrapMode,
+        discovered_caps: &Arc<Mutex<PeerCapabilities>>,
+        init_event: &Arc<Mutex<Option<Event>>>,
+        server_supports_ephemeral: &Arc<AtomicBool>,
+        seen_gift_wrap_ids: &Arc<Mutex<LruCache<EventId, ()>>>,
+        relay_pool: &Arc<dyn RelayPoolTrait>,
+    ) {
+        let event = match notification {
+            RelayPoolNotification::Event { event, .. } => event,
+            _ => return,
+        };
+
+        let is_gift_wrap = is_gift_wrap_kind(&event.kind);
+        let outer_kind = event.kind.as_u16();
+
+        // Enforce encryption mode before decrypt/parse.
+        if violates_encryption_policy(&event.kind, &encryption_mode) {
+            if is_gift_wrap {
+                tracing::warn!(
+                    target: LOG_TARGET,
+                    event_id = %event.id.to_hex(),
+                    event_kind = outer_kind,
+                    configured_mode = ?gift_wrap_mode,
+                    "Skipping encrypted response because client encryption is disabled"
+                );
+            } else {
+                tracing::warn!(
+                    target: LOG_TARGET,
+                    event_id = %event.id.to_hex(),
+                    "Skipping plaintext response because client encryption is required"
+                );
+            }
+            return;
+        }
+
+        // Enforce CEP-19 gift-wrap-mode policy.
+        if is_gift_wrap && !gift_wrap_mode.allows_kind(outer_kind) {
+            tracing::warn!(
+                target: LOG_TARGET,
+                event_id = %event.id.to_hex(),
+                event_kind = outer_kind,
+                configured_mode = ?gift_wrap_mode,
+                "Skipping gift wrap due to CEP-19 policy"
+            );
+            return;
+        }
+
+        // Handle gift-wrapped events
+        let (actual_event_content, actual_pubkey, e_tag, verified_tags, source_event) =
+            if is_gift_wrap {
+                {
+                    let guard = match seen_gift_wrap_ids.lock() {
+                        Ok(g) => g,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    if guard.contains(&event.id) {
+                        tracing::debug!(
+                            target: LOG_TARGET,
+                            event_id = %event.id.to_hex(),
+                            "Skipping duplicate gift-wrap (outer id)"
+                        );
+                        return;
+                    }
+                }
+                // Single-layer NIP-44 decrypt (matches JS/TS SDK)
+                let signer = match relay_pool.signer().await {
+                    Ok(s) => s,
+                    Err(error) => {
+                        tracing::error!(
+                            target: LOG_TARGET,
+                            error = %error,
+                            "Failed to get signer"
+                        );
+                        return;
+                    }
+                };
+                match encryption::decrypt_gift_wrap_single_layer(&signer, event).await {
+                    Ok(decrypted_json) => match serde_json::from_str::<Event>(&decrypted_json) {
+                        Ok(inner) => {
+                            if let Err(e) = inner.verify() {
+                                tracing::warn!("Inner event signature verification failed: {e}");
+                                return;
+                            }
+                            {
+                                let mut guard = match seen_gift_wrap_ids.lock() {
+                                    Ok(g) => g,
+                                    Err(poisoned) => poisoned.into_inner(),
+                                };
+                                guard.put(event.id, ());
+                            }
+                            let e_tag = serializers::get_tag_value(&inner.tags, "e");
+                            let inner_clone = inner.clone();
+                            (inner.content, inner.pubkey, e_tag, inner.tags, inner_clone)
+                        }
+                        Err(error) => {
+                            tracing::error!(
+                                target: LOG_TARGET,
+                                error = %error,
+                                "Failed to parse inner event"
+                            );
+                            return;
+                        }
+                    },
+                    Err(error) => {
+                        tracing::error!(
+                            target: LOG_TARGET,
+                            error = %error,
+                            "Failed to decrypt gift wrap"
+                        );
+                        return;
+                    }
+                }
+            } else {
+                let e_tag = serializers::get_tag_value(&event.tags, "e");
+                let event_clone: Event = (**event).clone();
+                (
+                    event.content.clone(),
+                    event.pubkey,
+                    e_tag,
+                    event.tags.clone(),
+                    event_clone,
+                )
+            };
+
+        // Verify it's from our server
+        if actual_pubkey != server_pubkey {
+            tracing::debug!(
+                target: LOG_TARGET,
+                event_pubkey = %actual_pubkey.to_hex(),
+                expected_pubkey = %server_pubkey.to_hex(),
+                "Skipping event from unexpected pubkey"
+            );
+            return;
+        }
+
+        // CEP-35: learn server capabilities from discovery tags
+        Self::learn_server_discovery(discovered_caps, init_event, &source_event);
+
+        // CEP-19: learn ephemeral support from server
+        if Self::should_learn_ephemeral_support(
+            actual_pubkey,
+            server_pubkey,
+            if is_gift_wrap { Some(outer_kind) } else { None },
+            &verified_tags,
+        ) {
+            server_supports_ephemeral.store(true, Ordering::Relaxed);
+        }
+
+        // Correlate response
+        if let Some(ref correlated_id) = e_tag {
+            let is_pending = pending.contains(correlated_id.as_str()).await;
+            if !is_pending {
+                tracing::warn!(
+                    target: LOG_TARGET,
+                    correlated_event_id = %correlated_id,
+                    "Response for unknown request"
+                );
+                return;
+            }
+        }
+
+        // Parse MCP message
+        if let Some(mcp_msg) = validation::validate_and_parse(&actual_event_content) {
+            // Drop uncorrelated responses and server-to-client requests (matches TS SDK).
+            match &mcp_msg {
+                JsonRpcMessage::Response(_) | JsonRpcMessage::ErrorResponse(_)
+                    if e_tag.is_none() =>
+                {
+                    tracing::warn!(
+                        target: LOG_TARGET,
+                        "Dropping response/error without correlation `e` tag"
+                    );
+                    return;
+                }
+                JsonRpcMessage::Request(_) => {
+                    tracing::warn!(
+                        target: LOG_TARGET,
+                        method = ?mcp_msg.method(),
+                        "Dropping server-to-client request (invalid in MCP)"
+                    );
+                    return;
+                }
+                _ => {}
+            }
+
+            // Clean up pending request
+            if let Some(ref correlated_id) = e_tag {
+                pending.remove(correlated_id.as_str()).await;
+            }
+            let _ = tx.send(mcp_msg);
+        }
+    }
+
     fn choose_outbound_gift_wrap_kind(&self) -> u16 {
         match self.config.gift_wrap_mode {
             GiftWrapMode::Persistent => GIFT_WRAP_KIND,
@@ -750,6 +803,15 @@ mod tests {
             ..Default::default()
         };
         assert!(config.is_stateless);
+    }
+
+    #[test]
+    fn test_custom_timeout_config() {
+        let config = NostrClientTransportConfig {
+            timeout: Duration::from_secs(60),
+            ..Default::default()
+        };
+        assert_eq!(config.timeout, Duration::from_secs(60));
     }
 
     #[test]
