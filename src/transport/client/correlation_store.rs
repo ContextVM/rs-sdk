@@ -2,6 +2,7 @@
 
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use lru::LruCache;
 use tokio::sync::RwLock;
@@ -15,6 +16,8 @@ pub struct PendingRequest {
     pub original_id: serde_json::Value,
     /// Whether this request is an `initialize` handshake.
     pub is_initialize: bool,
+    /// When the request was registered.
+    pub registered_at: Instant,
 }
 
 /// Tracks pending request event IDs and their original request IDs on the client side.
@@ -59,6 +62,7 @@ impl ClientCorrelationStore {
             PendingRequest {
                 original_id,
                 is_initialize,
+                registered_at: Instant::now(),
             },
         );
     }
@@ -93,6 +97,25 @@ impl ClientCorrelationStore {
     /// Number of pending requests currently tracked.
     pub async fn count(&self) -> usize {
         self.pending_requests.read().await.len()
+    }
+
+    /// Remove all entries older than `timeout`. Returns the number of entries removed.
+    pub async fn sweep_expired(&self, timeout: Duration) -> usize {
+        let now = Instant::now();
+        let mut cache = self.pending_requests.write().await;
+        let mut expired_keys = Vec::new();
+
+        for (key, entry) in cache.iter() {
+            if now.duration_since(entry.registered_at) >= timeout {
+                expired_keys.push(key.clone());
+            }
+        }
+
+        let count = expired_keys.len();
+        for key in expired_keys {
+            cache.pop(&key);
+        }
+        count
     }
 
     pub async fn clear(&self) {
@@ -149,5 +172,41 @@ mod tests {
         assert_eq!(store.count().await, DEFAULT_LRU_SIZE);
         assert!(!store.contains("e0").await);
         assert!(store.contains(&format!("e{DEFAULT_LRU_SIZE}")).await);
+    }
+
+    #[tokio::test]
+    async fn sweep_expired_removes_only_stale_entries() {
+        let store = ClientCorrelationStore::new();
+
+        // Insert an entry that will be "old" by the time we sweep.
+        store
+            .register("old".into(), serde_json::json!(1), false)
+            .await;
+
+        // Sleep so "old" entry ages past the threshold.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Insert a fresh entry.
+        store
+            .register("fresh".into(), serde_json::json!(2), false)
+            .await;
+
+        // Sweep with a 10ms timeout — "old" should be removed, "fresh" should remain.
+        let swept = store.sweep_expired(Duration::from_millis(10)).await;
+        assert_eq!(swept, 1);
+        assert!(!store.contains("old").await);
+        assert!(store.contains("fresh").await);
+    }
+
+    #[tokio::test]
+    async fn sweep_expired_returns_zero_when_nothing_expired() {
+        let store = ClientCorrelationStore::new();
+        store
+            .register("e1".into(), serde_json::Value::Null, false)
+            .await;
+
+        let swept = store.sweep_expired(Duration::from_secs(60)).await;
+        assert_eq!(swept, 0);
+        assert!(store.contains("e1").await);
     }
 }

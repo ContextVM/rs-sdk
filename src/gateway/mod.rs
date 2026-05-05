@@ -128,6 +128,7 @@ mod tests {
             excluded_capabilities: vec![],
             cleanup_interval: Duration::from_secs(120),
             session_timeout: Duration::from_secs(600),
+            request_timeout: Duration::from_secs(60),
             log_file_path: None,
         };
 

@@ -52,6 +52,8 @@ pub struct NostrServerTransportConfig {
     pub cleanup_interval: Duration,
     /// Session timeout (default: 300s).
     pub session_timeout: Duration,
+    /// Request route timeout (default: 60s). Stale routes older than this are swept.
+    pub request_timeout: Duration,
     /// Optional log file path. Logs always go to stdout and are also appended here when set.
     pub log_file_path: Option<String>,
 }
@@ -68,6 +70,7 @@ impl Default for NostrServerTransportConfig {
             excluded_capabilities: Vec::new(),
             cleanup_interval: Duration::from_secs(60),
             session_timeout: Duration::from_secs(300),
+            request_timeout: Duration::from_secs(60),
             log_file_path: None,
         }
     }
@@ -277,6 +280,7 @@ impl NostrServerTransport {
         let request_wrap_kinds_cleanup = self.request_wrap_kinds.clone();
         let cleanup_interval = self.config.cleanup_interval;
         let session_timeout = self.config.session_timeout;
+        let request_timeout = self.config.request_timeout;
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(cleanup_interval);
@@ -294,6 +298,24 @@ impl NostrServerTransport {
                         target: LOG_TARGET,
                         cleaned_sessions = cleaned,
                         "Cleaned up inactive sessions"
+                    );
+                }
+
+                // Sweep stale route entries in active sessions (rmcp handles timeout errors).
+                let swept_event_ids = event_routes_cleanup
+                    .sweep_stale_routes(request_timeout)
+                    .await;
+                if !swept_event_ids.is_empty() {
+                    let mut kinds_w = request_wrap_kinds_cleanup.write().await;
+                    for event_id in &swept_event_ids {
+                        kinds_w.remove(event_id);
+                    }
+                    drop(kinds_w);
+                    tracing::warn!(
+                        target: LOG_TARGET,
+                        swept = swept_event_ids.len(),
+                        timeout_secs = request_timeout.as_secs(),
+                        "Swept stale event routes (rmcp handles timeout errors)"
                     );
                 }
             }
@@ -1503,6 +1525,7 @@ mod tests {
         assert!(config.excluded_capabilities.is_empty());
         assert_eq!(config.cleanup_interval, Duration::from_secs(60));
         assert_eq!(config.session_timeout, Duration::from_secs(300));
+        assert_eq!(config.request_timeout, Duration::from_secs(60));
         assert!(config.server_info.is_none());
         assert!(config.log_file_path.is_none());
     }
