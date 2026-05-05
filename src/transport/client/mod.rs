@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use lru::LruCache;
 use nostr_sdk::prelude::*;
+use tokio_util::sync::CancellationToken;
 
 use crate::core::constants::*;
 use crate::core::error::{Error, Result};
@@ -85,8 +86,12 @@ pub struct NostrClientTransport {
     /// so failed decrypt/verify can be retried on redelivery.
     seen_gift_wrap_ids: Arc<Mutex<LruCache<EventId, ()>>>,
     /// Channel for receiving processed MCP messages from the event loop.
-    message_tx: tokio::sync::mpsc::UnboundedSender<JsonRpcMessage>,
+    message_tx: Option<tokio::sync::mpsc::UnboundedSender<JsonRpcMessage>>,
     message_rx: Option<tokio::sync::mpsc::UnboundedReceiver<JsonRpcMessage>>,
+    /// Token used to cancel the spawned event loop on close().
+    cancellation_token: CancellationToken,
+    /// Handle for the spawned event loop task.
+    event_loop_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl NostrClientTransport {
@@ -142,8 +147,10 @@ impl NostrClientTransport {
             server_initialize_event: Arc::new(Mutex::new(None)),
             server_supports_ephemeral: Arc::new(AtomicBool::new(false)),
             seen_gift_wrap_ids,
-            message_tx: tx,
+            message_tx: Some(tx),
             message_rx: Some(rx),
+            cancellation_token: CancellationToken::new(),
+            event_loop_handle: None,
         })
     }
 
@@ -190,8 +197,10 @@ impl NostrClientTransport {
             server_initialize_event: Arc::new(Mutex::new(None)),
             server_supports_ephemeral: Arc::new(AtomicBool::new(false)),
             seen_gift_wrap_ids,
-            message_tx: tx,
+            message_tx: Some(tx),
             message_rx: Some(rx),
+            cancellation_token: CancellationToken::new(),
+            event_loop_handle: None,
         })
     }
 
@@ -236,11 +245,15 @@ impl NostrClientTransport {
                 error
             })?;
 
-        // Spawn event loop
+        // Spawn event loop with cancellation support
         let relay_pool = Arc::clone(&self.base.relay_pool);
         let pending = self.pending_requests.clone();
         let server_pubkey = self.server_pubkey;
-        let tx = self.message_tx.clone();
+        let tx = self
+            .message_tx
+            .as_ref()
+            .expect("message_tx must exist before start()")
+            .clone();
         let encryption_mode = self.config.encryption_mode;
         let gift_wrap_mode = self.config.gift_wrap_mode;
         let discovered_caps = self.discovered_server_capabilities.clone();
@@ -248,8 +261,9 @@ impl NostrClientTransport {
         let server_supports_ephemeral = self.server_supports_ephemeral.clone();
         let seen_gift_wrap_ids = self.seen_gift_wrap_ids.clone();
         let timeout = self.config.timeout;
+        let token = self.cancellation_token.child_token();
 
-        tokio::spawn(async move {
+        self.event_loop_handle = Some(tokio::spawn(async move {
             Self::event_loop(
                 relay_pool,
                 pending,
@@ -262,9 +276,10 @@ impl NostrClientTransport {
                 server_supports_ephemeral,
                 seen_gift_wrap_ids,
                 timeout,
+                token,
             )
             .await;
-        });
+        }));
 
         tracing::info!(
             target: LOG_TARGET,
@@ -274,8 +289,13 @@ impl NostrClientTransport {
         Ok(())
     }
 
-    /// Close the transport.
+    /// Close the transport — cancels the event loop and disconnects from relays.
     pub async fn close(&mut self) -> Result<()> {
+        self.cancellation_token.cancel();
+        if let Some(handle) = self.event_loop_handle.take() {
+            let _ = handle.await;
+        }
+        self.message_tx.take();
         self.base.disconnect().await
     }
 
@@ -384,7 +404,9 @@ impl NostrClientTransport {
                 }
             }),
         });
-        let _ = self.message_tx.send(response);
+        if let Some(ref tx) = self.message_tx {
+            let _ = tx.send(response);
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -400,6 +422,7 @@ impl NostrClientTransport {
         server_supports_ephemeral: Arc<AtomicBool>,
         seen_gift_wrap_ids: Arc<Mutex<LruCache<EventId, ()>>>,
         timeout: Duration,
+        cancel: CancellationToken,
     ) {
         let mut notifications = relay_pool.notifications();
         // Sweep interval: half the timeout, clamped to [1s, 30s].
@@ -409,6 +432,13 @@ impl NostrClientTransport {
 
         loop {
             tokio::select! {
+                _ = cancel.cancelled() => {
+                    tracing::info!(
+                        target: LOG_TARGET,
+                        "Client event loop cancelled"
+                    );
+                    break;
+                }
                 result = notifications.recv() => {
                     let notification = match result {
                         Ok(n) => n,
@@ -1035,8 +1065,10 @@ mod tests {
             server_initialize_event: Arc::new(Mutex::new(None)),
             server_supports_ephemeral: Arc::new(AtomicBool::new(false)),
             seen_gift_wrap_ids: Arc::new(Mutex::new(LruCache::new(NonZeroUsize::new(10).unwrap()))),
-            message_tx: tokio::sync::mpsc::unbounded_channel().0,
+            message_tx: Some(tokio::sync::mpsc::unbounded_channel().0),
             message_rx: None,
+            cancellation_token: CancellationToken::new(),
+            event_loop_handle: None,
         }
     }
 

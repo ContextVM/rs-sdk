@@ -3523,3 +3523,65 @@ async fn session_store_eviction_callback_fires() {
     assert_eq!(keys.len(), 1, "callback must fire exactly once");
     assert_eq!(keys[0], "x", "evicted key must be the oldest session");
 }
+
+// ── Event loop cancellation on close() ──────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn client_close_stops_event_loop() {
+    let (client_pool, server_pool) = MockRelayPool::create_pair();
+    let server_pubkey = server_pool.mock_public_key();
+
+    let mut client = NostrClientTransport::with_relay_pool(
+        NostrClientTransportConfig {
+            server_pubkey: server_pubkey.to_hex(),
+            encryption_mode: EncryptionMode::Disabled,
+            ..Default::default()
+        },
+        as_pool(client_pool),
+    )
+    .await
+    .expect("create client transport");
+
+    let mut rx = client.take_message_receiver().expect("message receiver");
+    client.start().await.expect("client start");
+    let_event_loops_start().await;
+
+    // Close should cancel the event loop, causing the rx channel to close.
+    client.close().await.expect("client close");
+
+    // The receiver must resolve to None (closed) within a short timeout.
+    let result = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await;
+    assert!(
+        matches!(result, Ok(None)),
+        "after close(), message receiver must yield None (channel closed)"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn server_close_stops_event_loop() {
+    let (_client_pool, server_pool) = MockRelayPool::create_pair();
+
+    let mut server = NostrServerTransport::with_relay_pool(
+        NostrServerTransportConfig {
+            encryption_mode: EncryptionMode::Disabled,
+            ..Default::default()
+        },
+        as_pool(server_pool),
+    )
+    .await
+    .expect("create server transport");
+
+    let mut rx = server.take_message_receiver().expect("message receiver");
+    server.start().await.expect("server start");
+    let_event_loops_start().await;
+
+    // Close should cancel both event loop and cleanup tasks.
+    server.close().await.expect("server close");
+
+    // The receiver must resolve to None (closed) within a short timeout.
+    let result = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await;
+    assert!(
+        matches!(result, Ok(None)),
+        "after close(), message receiver must yield None (channel closed)"
+    );
+}
