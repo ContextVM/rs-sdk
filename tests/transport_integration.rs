@@ -2554,16 +2554,6 @@ fn has_tag_name(event: &Event, name: &str) -> bool {
         .any(|v| v.first().map(|s| s.as_str()) == Some(name))
 }
 
-fn get_tag_value(event: &Event, name: &str) -> Option<String> {
-    event_tag_vecs(event).iter().find_map(|v| {
-        if v.first().map(|s| s.as_str()) == Some(name) {
-            v.get(1).cloned()
-        } else {
-            None
-        }
-    })
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn server_response_includes_encryption_tags_when_enabled() {
     let (client_pool, server_pool) = MockRelayPool::create_pair();
@@ -2864,4 +2854,497 @@ async fn server_disabled_encryption_omits_encryption_tags() {
         response_event,
         tags::SUPPORT_ENCRYPTION_EPHEMERAL
     ));
+}
+
+// ── CEP-35: Client-side discovery tag emission & capability learning ─────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn client_disabled_encryption_emits_no_discovery_tags() {
+    // Disabled encryption: client must not emit cap tags. Positive case (Optional
+    // mode emits tags) is covered by unit test client_capability_tags_encryption_optional.
+    let pool = Arc::new(MockRelayPool::new());
+    let server_keys = Keys::generate();
+
+    let mut client = NostrClientTransport::with_relay_pool(
+        NostrClientTransportConfig {
+            server_pubkey: server_keys.public_key().to_hex(),
+            encryption_mode: EncryptionMode::Disabled,
+            gift_wrap_mode: GiftWrapMode::Optional,
+            ..Default::default()
+        },
+        Arc::clone(&pool) as Arc<dyn RelayPoolTrait>,
+    )
+    .await
+    .unwrap();
+
+    client.start().await.unwrap();
+    let_event_loops_start().await;
+
+    // With Disabled encryption, no cap tags are emitted (correct per spec).
+    // Verify the event is published with p tag but without cap tags.
+    client
+        .send(&JsonRpcMessage::Request(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: serde_json::json!(1),
+            method: "initialize".to_string(),
+            params: None,
+        }))
+        .await
+        .unwrap();
+
+    let events = pool.stored_events().await;
+    let client_event = events
+        .iter()
+        .find(|e| e.kind == Kind::Custom(CTXVM_MESSAGES_KIND))
+        .expect("client must publish a request event");
+
+    // p tag must be present (routing)
+    assert!(has_tag_name(client_event, "p"));
+    // No encryption tags when Disabled (the unit test covers the Optional case)
+    assert!(
+        !has_tag_name(client_event, tags::SUPPORT_ENCRYPTION),
+        "Disabled client must not emit support_encryption"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn client_second_request_carries_no_discovery_tags() {
+    // Second request must never carry discovery tags. One-shot flag behavior
+    // is covered by unit test client_discovery_tags_sent_once.
+    let pool = Arc::new(MockRelayPool::new());
+    let server_keys = Keys::generate();
+
+    let mut client = NostrClientTransport::with_relay_pool(
+        NostrClientTransportConfig {
+            server_pubkey: server_keys.public_key().to_hex(),
+            encryption_mode: EncryptionMode::Disabled,
+            gift_wrap_mode: GiftWrapMode::Optional,
+            ..Default::default()
+        },
+        Arc::clone(&pool) as Arc<dyn RelayPoolTrait>,
+    )
+    .await
+    .unwrap();
+
+    client.start().await.unwrap();
+    let_event_loops_start().await;
+
+    // First request
+    client
+        .send(&JsonRpcMessage::Request(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: serde_json::json!(1),
+            method: "initialize".to_string(),
+            params: None,
+        }))
+        .await
+        .unwrap();
+
+    // Second request
+    client
+        .send(&JsonRpcMessage::Request(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: serde_json::json!(2),
+            method: "tools/list".to_string(),
+            params: None,
+        }))
+        .await
+        .unwrap();
+
+    let events = pool.stored_events().await;
+    let ctxvm_events: Vec<&Event> = events
+        .iter()
+        .filter(|e| e.kind == Kind::Custom(CTXVM_MESSAGES_KIND))
+        .collect();
+    assert!(ctxvm_events.len() >= 2);
+
+    let second_event = ctxvm_events
+        .iter()
+        .find(|e| e.content.contains("tools/list"))
+        .expect("second request event must exist");
+
+    assert!(
+        !has_tag_name(second_event, tags::SUPPORT_ENCRYPTION),
+        "second request must NOT include discovery tags"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn client_learns_server_capabilities_from_first_response() {
+    let (client_pool, server_pool) = MockRelayPool::create_pair();
+    let server_pubkey = server_pool.mock_public_key();
+
+    let mut server = NostrServerTransport::with_relay_pool(
+        NostrServerTransportConfig {
+            server_info: Some(ServerInfo {
+                name: Some("CapServer".to_string()),
+                ..Default::default()
+            }),
+            encryption_mode: EncryptionMode::Optional,
+            gift_wrap_mode: GiftWrapMode::Optional,
+            ..Default::default()
+        },
+        as_pool(server_pool),
+    )
+    .await
+    .unwrap();
+
+    let mut client = NostrClientTransport::with_relay_pool(
+        NostrClientTransportConfig {
+            server_pubkey: server_pubkey.to_hex(),
+            encryption_mode: EncryptionMode::Disabled,
+            ..Default::default()
+        },
+        as_pool(client_pool),
+    )
+    .await
+    .unwrap();
+
+    let mut server_rx = server.take_message_receiver().unwrap();
+    let mut client_rx = client.take_message_receiver().unwrap();
+    server.start().await.unwrap();
+    client.start().await.unwrap();
+    let_event_loops_start().await;
+
+    client
+        .send(&JsonRpcMessage::Request(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: serde_json::json!(1),
+            method: "initialize".to_string(),
+            params: None,
+        }))
+        .await
+        .unwrap();
+
+    let incoming = tokio::time::timeout(Duration::from_millis(500), server_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+
+    server
+        .send_response(
+            &incoming.event_id,
+            JsonRpcMessage::Response(JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id: serde_json::json!(1),
+                result: serde_json::json!({}),
+            }),
+        )
+        .await
+        .unwrap();
+
+    let _ = tokio::time::timeout(Duration::from_millis(500), client_rx.recv())
+        .await
+        .unwrap();
+
+    // Client should have learned capabilities from server's first response
+    let caps = client.discovered_server_capabilities();
+    assert!(
+        caps.supports_encryption,
+        "client must learn support_encryption from server response tags"
+    );
+    assert!(
+        caps.supports_ephemeral_encryption,
+        "client must learn support_encryption_ephemeral from server response tags"
+    );
+
+    let baseline = client.get_server_initialize_event();
+    assert!(baseline.is_some(), "baseline event must be set");
+}
+
+// ── CEP-35: OR-assign, baseline-freeze, and Optional emission ────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn client_or_assigns_capabilities_across_responses() {
+    // Server with Persistent gift-wrap emits support_encryption but NOT
+    // support_encryption_ephemeral on the first response.  A second event
+    // carrying support_encryption_ephemeral must OR-assign into the client's
+    // learned caps without downgrading the already-learned support_encryption.
+    let (client_pool, server_pool) = MockRelayPool::create_pair();
+    let server_pubkey = server_pool.mock_public_key();
+    let server_keys = server_pool.mock_keys();
+
+    let client_pool = Arc::new(client_pool);
+
+    let mut server = NostrServerTransport::with_relay_pool(
+        NostrServerTransportConfig {
+            server_info: Some(ServerInfo {
+                name: Some("PersistentServer".to_string()),
+                ..Default::default()
+            }),
+            encryption_mode: EncryptionMode::Optional,
+            gift_wrap_mode: GiftWrapMode::Persistent,
+            ..Default::default()
+        },
+        as_pool(server_pool),
+    )
+    .await
+    .unwrap();
+
+    let mut client = NostrClientTransport::with_relay_pool(
+        NostrClientTransportConfig {
+            server_pubkey: server_pubkey.to_hex(),
+            encryption_mode: EncryptionMode::Disabled,
+            ..Default::default()
+        },
+        Arc::clone(&client_pool) as Arc<dyn RelayPoolTrait>,
+    )
+    .await
+    .unwrap();
+
+    let mut server_rx = server.take_message_receiver().unwrap();
+    let mut client_rx = client.take_message_receiver().unwrap();
+    server.start().await.unwrap();
+    client.start().await.unwrap();
+    let_event_loops_start().await;
+
+    // First roundtrip — server responds with support_encryption only.
+    client
+        .send(&JsonRpcMessage::Request(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: serde_json::json!(1),
+            method: "initialize".to_string(),
+            params: None,
+        }))
+        .await
+        .unwrap();
+
+    let incoming = tokio::time::timeout(Duration::from_millis(500), server_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+
+    server
+        .send_response(
+            &incoming.event_id,
+            JsonRpcMessage::Response(JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id: serde_json::json!(1),
+                result: serde_json::json!({}),
+            }),
+        )
+        .await
+        .unwrap();
+
+    let _ = tokio::time::timeout(Duration::from_millis(500), client_rx.recv())
+        .await
+        .unwrap();
+
+    let caps_after_first = client.discovered_server_capabilities();
+    assert!(
+        caps_after_first.supports_encryption,
+        "first response must teach support_encryption"
+    );
+    assert!(
+        !caps_after_first.supports_ephemeral_encryption,
+        "Persistent server must NOT advertise ephemeral on first response"
+    );
+
+    // Inject a second plaintext event signed by the server, carrying
+    // support_encryption_ephemeral (simulates a capability upgrade).
+    let client_pubkey = client_pool.mock_public_key();
+    let second_response = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/progress"
+    });
+    let inject_event = EventBuilder::new(
+        Kind::Custom(CTXVM_MESSAGES_KIND),
+        second_response.to_string(),
+    )
+    .tags(vec![
+        Tag::public_key(client_pubkey),
+        Tag::custom(
+            TagKind::Custom(tags::SUPPORT_ENCRYPTION_EPHEMERAL.into()),
+            Vec::<String>::new(),
+        ),
+    ])
+    .sign_with_keys(&server_keys)
+    .unwrap();
+
+    client_pool.publish_event(&inject_event).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let caps_after_second = client.discovered_server_capabilities();
+    assert!(
+        caps_after_second.supports_encryption,
+        "support_encryption must survive OR-assign (not downgraded)"
+    );
+    assert!(
+        caps_after_second.supports_ephemeral_encryption,
+        "support_encryption_ephemeral must be OR-assigned from second event"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn client_baseline_event_not_replaced_by_later_responses() {
+    // The first inbound event carrying discovery tags becomes the baseline.
+    // Later events with different tags must NOT replace it.
+    let (client_pool, server_pool) = MockRelayPool::create_pair();
+    let server_pubkey = server_pool.mock_public_key();
+    let server_keys = server_pool.mock_keys();
+
+    let client_pool = Arc::new(client_pool);
+
+    let mut server = NostrServerTransport::with_relay_pool(
+        NostrServerTransportConfig {
+            server_info: Some(ServerInfo {
+                name: Some("BaselineServer".to_string()),
+                ..Default::default()
+            }),
+            encryption_mode: EncryptionMode::Optional,
+            gift_wrap_mode: GiftWrapMode::Optional,
+            ..Default::default()
+        },
+        as_pool(server_pool),
+    )
+    .await
+    .unwrap();
+
+    let mut client = NostrClientTransport::with_relay_pool(
+        NostrClientTransportConfig {
+            server_pubkey: server_pubkey.to_hex(),
+            encryption_mode: EncryptionMode::Disabled,
+            ..Default::default()
+        },
+        Arc::clone(&client_pool) as Arc<dyn RelayPoolTrait>,
+    )
+    .await
+    .unwrap();
+
+    let mut server_rx = server.take_message_receiver().unwrap();
+    let mut client_rx = client.take_message_receiver().unwrap();
+    server.start().await.unwrap();
+    client.start().await.unwrap();
+    let_event_loops_start().await;
+
+    // First roundtrip — establishes baseline.
+    client
+        .send(&JsonRpcMessage::Request(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: serde_json::json!(1),
+            method: "initialize".to_string(),
+            params: None,
+        }))
+        .await
+        .unwrap();
+
+    let incoming = tokio::time::timeout(Duration::from_millis(500), server_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+
+    server
+        .send_response(
+            &incoming.event_id,
+            JsonRpcMessage::Response(JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id: serde_json::json!(1),
+                result: serde_json::json!({}),
+            }),
+        )
+        .await
+        .unwrap();
+
+    let _ = tokio::time::timeout(Duration::from_millis(500), client_rx.recv())
+        .await
+        .unwrap();
+
+    let baseline = client.get_server_initialize_event();
+    assert!(
+        baseline.is_some(),
+        "baseline must be set after first response"
+    );
+    let baseline_id = baseline.unwrap().id;
+
+    // Inject a second event with different discovery tags.
+    let client_pubkey = client_pool.mock_public_key();
+    let notification = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/progress"
+    });
+    let inject_event =
+        EventBuilder::new(Kind::Custom(CTXVM_MESSAGES_KIND), notification.to_string())
+            .tags(vec![
+                Tag::public_key(client_pubkey),
+                Tag::custom(
+                    TagKind::Custom(tags::SUPPORT_ENCRYPTION.into()),
+                    Vec::<String>::new(),
+                ),
+            ])
+            .sign_with_keys(&server_keys)
+            .unwrap();
+
+    client_pool.publish_event(&inject_event).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let baseline_after = client.get_server_initialize_event();
+    assert_eq!(
+        baseline_after.unwrap().id,
+        baseline_id,
+        "baseline event must NOT be replaced by later events"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn client_optional_encryption_emits_discovery_tags() {
+    // Client with Optional encryption must include discovery tags in the
+    // inner signed event.  We decrypt the published gift wrap to verify.
+    let (client_pool, server_pool) = MockRelayPool::create_pair();
+    let server_pubkey = server_pool.mock_public_key();
+    let server_keys = server_pool.mock_keys();
+
+    let client_pool = Arc::new(client_pool);
+
+    let mut client = NostrClientTransport::with_relay_pool(
+        NostrClientTransportConfig {
+            server_pubkey: server_pubkey.to_hex(),
+            encryption_mode: EncryptionMode::Optional,
+            gift_wrap_mode: GiftWrapMode::Optional,
+            ..Default::default()
+        },
+        Arc::clone(&client_pool) as Arc<dyn RelayPoolTrait>,
+    )
+    .await
+    .unwrap();
+
+    client.start().await.unwrap();
+    let_event_loops_start().await;
+
+    client
+        .send(&JsonRpcMessage::Request(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: serde_json::json!(1),
+            method: "initialize".to_string(),
+            params: None,
+        }))
+        .await
+        .unwrap();
+
+    let events = client_pool.stored_events().await;
+    let gift_wrap = events
+        .iter()
+        .find(|e| {
+            e.kind == Kind::Custom(GIFT_WRAP_KIND)
+                || e.kind == Kind::Custom(EPHEMERAL_GIFT_WRAP_KIND)
+        })
+        .expect("Optional encryption must produce a gift-wrapped event");
+
+    // Decrypt using the server's keys (the recipient).
+    let signer: Arc<dyn NostrSigner> = Arc::new(server_keys);
+    let decrypted_json =
+        contextvm_sdk::encryption::decrypt_gift_wrap_single_layer(&signer, gift_wrap)
+            .await
+            .expect("gift wrap must be decryptable with server keys");
+
+    let inner: Event =
+        serde_json::from_str(&decrypted_json).expect("decrypted content must be a valid Event");
+
+    assert!(
+        has_tag_name(&inner, tags::SUPPORT_ENCRYPTION),
+        "inner event must carry support_encryption tag"
+    );
+    assert!(
+        has_tag_name(&inner, tags::SUPPORT_ENCRYPTION_EPHEMERAL),
+        "inner event must carry support_encryption_ephemeral tag (Optional gift-wrap mode)"
+    );
 }

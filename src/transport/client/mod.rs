@@ -23,6 +23,7 @@ use crate::core::validation;
 use crate::encryption;
 use crate::relay::{RelayPool, RelayPoolTrait};
 use crate::transport::base::BaseTransport;
+use crate::transport::discovery_tags::{parse_discovered_peer_capabilities, PeerCapabilities};
 
 use crate::util::tracing_setup;
 
@@ -67,6 +68,12 @@ pub struct NostrClientTransport {
     server_pubkey: PublicKey,
     /// Pending request event IDs awaiting responses.
     pending_requests: ClientCorrelationStore,
+    /// CEP-35: one-shot flag for client discovery tag emission.
+    has_sent_discovery_tags: AtomicBool,
+    /// CEP-35: learned server capabilities from inbound discovery tags.
+    discovered_server_capabilities: Arc<Mutex<PeerCapabilities>>,
+    /// CEP-35: first inbound event carrying discovery tags (session baseline).
+    server_initialize_event: Arc<Mutex<Option<Event>>>,
     /// Learned support for server-side ephemeral gift wraps.
     server_supports_ephemeral: Arc<AtomicBool>,
     /// Outer gift-wrap event IDs successfully decrypted and verified (inner `verify()`).
@@ -126,6 +133,9 @@ impl NostrClientTransport {
             config,
             server_pubkey,
             pending_requests: ClientCorrelationStore::new(),
+            has_sent_discovery_tags: AtomicBool::new(false),
+            discovered_server_capabilities: Arc::new(Mutex::new(PeerCapabilities::default())),
+            server_initialize_event: Arc::new(Mutex::new(None)),
             server_supports_ephemeral: Arc::new(AtomicBool::new(false)),
             seen_gift_wrap_ids,
             message_tx: tx,
@@ -171,6 +181,9 @@ impl NostrClientTransport {
             config,
             server_pubkey,
             pending_requests: ClientCorrelationStore::new(),
+            has_sent_discovery_tags: AtomicBool::new(false),
+            discovered_server_capabilities: Arc::new(Mutex::new(PeerCapabilities::default())),
+            server_initialize_event: Arc::new(Mutex::new(None)),
             server_supports_ephemeral: Arc::new(AtomicBool::new(false)),
             seen_gift_wrap_ids,
             message_tx: tx,
@@ -226,6 +239,8 @@ impl NostrClientTransport {
         let tx = self.message_tx.clone();
         let encryption_mode = self.config.encryption_mode;
         let gift_wrap_mode = self.config.gift_wrap_mode;
+        let discovered_caps = self.discovered_server_capabilities.clone();
+        let init_event = self.server_initialize_event.clone();
         let server_supports_ephemeral = self.server_supports_ephemeral.clone();
         let seen_gift_wrap_ids = self.seen_gift_wrap_ids.clone();
 
@@ -237,6 +252,8 @@ impl NostrClientTransport {
                 tx,
                 encryption_mode,
                 gift_wrap_mode,
+                discovered_caps,
+                init_event,
                 server_supports_ephemeral,
                 seen_gift_wrap_ids,
             )
@@ -273,7 +290,14 @@ impl NostrClientTransport {
             }
         }
 
-        let tags = BaseTransport::create_recipient_tags(&self.server_pubkey);
+        let is_request = message.is_request();
+        let base_tags = BaseTransport::create_recipient_tags(&self.server_pubkey);
+        let discovery_tags = if is_request {
+            self.get_pending_client_discovery_tags()
+        } else {
+            vec![]
+        };
+        let tags = BaseTransport::compose_outbound_tags(&base_tags, &discovery_tags, &[]);
 
         let (event_id, publishable_event) = self
             .base
@@ -314,6 +338,11 @@ impl NostrClientTransport {
                 "Failed to publish client message"
             );
             return Err(error);
+        }
+
+        // Flip one-shot flag only after successful publish
+        if is_request && !discovery_tags.is_empty() {
+            self.has_sent_discovery_tags.store(true, Ordering::Relaxed);
         }
 
         tracing::debug!(
@@ -360,6 +389,8 @@ impl NostrClientTransport {
         tx: tokio::sync::mpsc::UnboundedSender<JsonRpcMessage>,
         encryption_mode: EncryptionMode,
         gift_wrap_mode: GiftWrapMode,
+        discovered_caps: Arc<Mutex<PeerCapabilities>>,
+        init_event: Arc<Mutex<Option<Event>>>,
         server_supports_ephemeral: Arc<AtomicBool>,
         seen_gift_wrap_ids: Arc<Mutex<LruCache<EventId, ()>>>,
     ) {
@@ -403,81 +434,91 @@ impl NostrClientTransport {
                 }
 
                 // Handle gift-wrapped events
-                let (actual_event_content, actual_pubkey, e_tag, verified_tags) = if is_gift_wrap {
-                    {
-                        let guard = match seen_gift_wrap_ids.lock() {
-                            Ok(g) => g,
-                            Err(poisoned) => poisoned.into_inner(),
+                let (actual_event_content, actual_pubkey, e_tag, verified_tags, source_event) =
+                    if is_gift_wrap {
+                        {
+                            let guard = match seen_gift_wrap_ids.lock() {
+                                Ok(g) => g,
+                                Err(poisoned) => poisoned.into_inner(),
+                            };
+                            if guard.contains(&event.id) {
+                                tracing::debug!(
+                                    target: LOG_TARGET,
+                                    event_id = %event.id.to_hex(),
+                                    "Skipping duplicate gift-wrap (outer id)"
+                                );
+                                continue;
+                            }
+                        }
+                        // Single-layer NIP-44 decrypt (matches JS/TS SDK)
+                        let signer = match relay_pool.signer().await {
+                            Ok(s) => s,
+                            Err(error) => {
+                                tracing::error!(
+                                    target: LOG_TARGET,
+                                    error = %error,
+                                    "Failed to get signer"
+                                );
+                                continue;
+                            }
                         };
-                        if guard.contains(&event.id) {
-                            tracing::debug!(
-                                target: LOG_TARGET,
-                                event_id = %event.id.to_hex(),
-                                "Skipping duplicate gift-wrap (outer id)"
-                            );
-                            continue;
-                        }
-                    }
-                    // Single-layer NIP-44 decrypt (matches JS/TS SDK)
-                    let signer = match relay_pool.signer().await {
-                        Ok(s) => s,
-                        Err(error) => {
-                            tracing::error!(
-                                target: LOG_TARGET,
-                                error = %error,
-                                "Failed to get signer"
-                            );
-                            continue;
-                        }
-                    };
-                    match encryption::decrypt_gift_wrap_single_layer(&signer, &event).await {
-                        Ok(decrypted_json) => {
-                            match serde_json::from_str::<Event>(&decrypted_json) {
-                                Ok(inner) => {
-                                    if let Err(e) = inner.verify() {
-                                        tracing::warn!(
-                                            "Inner event signature verification failed: {e}"
+                        match encryption::decrypt_gift_wrap_single_layer(&signer, &event).await {
+                            Ok(decrypted_json) => {
+                                match serde_json::from_str::<Event>(&decrypted_json) {
+                                    Ok(inner) => {
+                                        if let Err(e) = inner.verify() {
+                                            tracing::warn!(
+                                                "Inner event signature verification failed: {e}"
+                                            );
+                                            continue;
+                                        }
+                                        {
+                                            let mut guard = match seen_gift_wrap_ids.lock() {
+                                                Ok(g) => g,
+                                                Err(poisoned) => poisoned.into_inner(),
+                                            };
+                                            guard.put(event.id, ());
+                                        }
+                                        let e_tag = serializers::get_tag_value(&inner.tags, "e");
+                                        let inner_clone = inner.clone();
+                                        (
+                                            inner.content,
+                                            inner.pubkey,
+                                            e_tag,
+                                            inner.tags,
+                                            inner_clone,
+                                        )
+                                    }
+                                    Err(error) => {
+                                        tracing::error!(
+                                            target: LOG_TARGET,
+                                            error = %error,
+                                            "Failed to parse inner event"
                                         );
                                         continue;
                                     }
-                                    {
-                                        let mut guard = match seen_gift_wrap_ids.lock() {
-                                            Ok(g) => g,
-                                            Err(poisoned) => poisoned.into_inner(),
-                                        };
-                                        guard.put(event.id, ());
-                                    }
-                                    let e_tag = serializers::get_tag_value(&inner.tags, "e");
-                                    (inner.content, inner.pubkey, e_tag, inner.tags)
-                                }
-                                Err(error) => {
-                                    tracing::error!(
-                                        target: LOG_TARGET,
-                                        error = %error,
-                                        "Failed to parse inner event"
-                                    );
-                                    continue;
                                 }
                             }
+                            Err(error) => {
+                                tracing::error!(
+                                    target: LOG_TARGET,
+                                    error = %error,
+                                    "Failed to decrypt gift wrap"
+                                );
+                                continue;
+                            }
                         }
-                        Err(error) => {
-                            tracing::error!(
-                                target: LOG_TARGET,
-                                error = %error,
-                                "Failed to decrypt gift wrap"
-                            );
-                            continue;
-                        }
-                    }
-                } else {
-                    let e_tag = serializers::get_tag_value(&event.tags, "e");
-                    (
-                        event.content.clone(),
-                        event.pubkey,
-                        e_tag,
-                        event.tags.clone(),
-                    )
-                };
+                    } else {
+                        let e_tag = serializers::get_tag_value(&event.tags, "e");
+                        let event_clone = (*event).clone();
+                        (
+                            event.content.clone(),
+                            event.pubkey,
+                            e_tag,
+                            event.tags.clone(),
+                            event_clone,
+                        )
+                    };
 
                 // Verify it's from our server
                 if actual_pubkey != server_pubkey {
@@ -489,6 +530,9 @@ impl NostrClientTransport {
                     );
                     continue;
                 }
+
+                // CEP-35: learn server capabilities from discovery tags
+                Self::learn_server_discovery(&discovered_caps, &init_event, &source_event);
 
                 // CEP-19: learn ephemeral support from server
                 if Self::should_learn_ephemeral_support(
@@ -545,6 +589,88 @@ impl NostrClientTransport {
                 }
             }
         }
+    }
+
+    // ── CEP-35 discovery tag helpers ──────────────────────────────
+
+    /// Constructs client capability tags based on config.
+    fn get_client_capability_tags(&self) -> Vec<Tag> {
+        let mut tags = Vec::new();
+        if self.config.encryption_mode != EncryptionMode::Disabled {
+            tags.push(Tag::custom(
+                TagKind::Custom(tags::SUPPORT_ENCRYPTION.into()),
+                Vec::<String>::new(),
+            ));
+            if self.config.gift_wrap_mode != GiftWrapMode::Persistent {
+                tags.push(Tag::custom(
+                    TagKind::Custom(tags::SUPPORT_ENCRYPTION_EPHEMERAL.into()),
+                    Vec::<String>::new(),
+                ));
+            }
+        }
+        tags
+    }
+
+    /// One-shot: returns capability tags if not yet sent, empty otherwise.
+    fn get_pending_client_discovery_tags(&self) -> Vec<Tag> {
+        if self.has_sent_discovery_tags.load(Ordering::Relaxed) {
+            vec![]
+        } else {
+            self.get_client_capability_tags()
+        }
+    }
+
+    /// Parses inbound event tags and updates learned server capabilities.
+    fn learn_server_discovery(
+        discovered_caps: &Mutex<PeerCapabilities>,
+        init_event: &Mutex<Option<Event>>,
+        event: &Event,
+    ) {
+        let tag_vec: Vec<Tag> = event.tags.clone().to_vec();
+        let discovered = parse_discovered_peer_capabilities(&tag_vec);
+        if discovered.discovery_tags.is_empty() {
+            return;
+        }
+
+        {
+            let mut caps = match discovered_caps.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            caps.supports_encryption |= discovered.capabilities.supports_encryption;
+            caps.supports_ephemeral_encryption |=
+                discovered.capabilities.supports_ephemeral_encryption;
+            caps.supports_oversized_transfer |= discovered.capabilities.supports_oversized_transfer;
+        }
+
+        let mut stored = match init_event.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        if stored.is_none() {
+            *stored = Some(event.clone());
+        }
+        // Note: TS SDK has an upgrade path where a later event with an InitializeResult
+        // replaces a non-initialize baseline. Not implemented here -- edge case only
+        // relevant if the first server message with discovery tags is a notification.
+    }
+
+    /// Returns a clone of the first inbound event that carried server discovery tags.
+    pub fn get_server_initialize_event(&self) -> Option<Event> {
+        let guard = match self.server_initialize_event.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        guard.clone()
+    }
+
+    /// Returns a snapshot of the learned server capabilities from discovery tags.
+    pub fn discovered_server_capabilities(&self) -> PeerCapabilities {
+        let guard = match self.discovered_server_capabilities.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        *guard
     }
 
     fn choose_outbound_gift_wrap_kind(&self) -> u16 {
@@ -818,6 +944,149 @@ mod tests {
         assert!(
             !violates_encryption_policy(&plaintext, &EncryptionMode::Disabled),
             "Disabled mode must accept plaintext events"
+        );
+    }
+
+    // ── CEP-35 client discovery tag emission ────────────────────
+
+    fn make_transport_for_tags(
+        encryption_mode: EncryptionMode,
+        gift_wrap_mode: GiftWrapMode,
+    ) -> NostrClientTransport {
+        let keys = Keys::generate();
+        NostrClientTransport {
+            base: BaseTransport {
+                relay_pool: Arc::new(crate::relay::mock::MockRelayPool::new()),
+                encryption_mode,
+                is_connected: false,
+            },
+            config: NostrClientTransportConfig {
+                encryption_mode,
+                gift_wrap_mode,
+                server_pubkey: Keys::generate().public_key().to_hex(),
+                ..Default::default()
+            },
+            server_pubkey: keys.public_key(),
+            pending_requests: ClientCorrelationStore::new(),
+            has_sent_discovery_tags: AtomicBool::new(false),
+            discovered_server_capabilities: Arc::new(Mutex::new(PeerCapabilities::default())),
+            server_initialize_event: Arc::new(Mutex::new(None)),
+            server_supports_ephemeral: Arc::new(AtomicBool::new(false)),
+            seen_gift_wrap_ids: Arc::new(Mutex::new(LruCache::new(NonZeroUsize::new(10).unwrap()))),
+            message_tx: tokio::sync::mpsc::unbounded_channel().0,
+            message_rx: None,
+        }
+    }
+
+    fn make_tag(parts: &[&str]) -> Tag {
+        let kind = TagKind::Custom(parts[0].into());
+        let values: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
+        Tag::custom(kind, values)
+    }
+
+    fn tag_names(tags: &[Tag]) -> Vec<String> {
+        tags.iter().map(|t| t.clone().to_vec()[0].clone()).collect()
+    }
+
+    #[test]
+    fn client_capability_tags_encryption_optional() {
+        let t = make_transport_for_tags(EncryptionMode::Optional, GiftWrapMode::Optional);
+        let tags = t.get_client_capability_tags();
+        let names = tag_names(&tags);
+        assert_eq!(
+            names,
+            vec!["support_encryption", "support_encryption_ephemeral"]
+        );
+    }
+
+    #[test]
+    fn client_capability_tags_encryption_disabled() {
+        let t = make_transport_for_tags(EncryptionMode::Disabled, GiftWrapMode::Optional);
+        let tags = t.get_client_capability_tags();
+        assert!(tags.is_empty());
+    }
+
+    #[test]
+    fn client_capability_tags_persistent_gift_wrap() {
+        let t = make_transport_for_tags(EncryptionMode::Optional, GiftWrapMode::Persistent);
+        let tags = t.get_client_capability_tags();
+        let names = tag_names(&tags);
+        assert_eq!(names, vec!["support_encryption"]);
+    }
+
+    #[test]
+    fn client_discovery_tags_sent_once() {
+        let t = make_transport_for_tags(EncryptionMode::Optional, GiftWrapMode::Optional);
+        let first = t.get_pending_client_discovery_tags();
+        assert!(!first.is_empty());
+
+        t.has_sent_discovery_tags.store(true, Ordering::Relaxed);
+        let second = t.get_pending_client_discovery_tags();
+        assert!(second.is_empty());
+    }
+
+    // ── CEP-35 client capability learning ───────────────────────
+
+    fn make_event_with_tags(tag_parts: &[&[&str]]) -> Event {
+        let keys = Keys::generate();
+        let tags: Vec<Tag> = tag_parts.iter().map(|p| make_tag(p)).collect();
+        let builder = EventBuilder::new(Kind::Custom(CTXVM_MESSAGES_KIND), "{}").tags(tags);
+        let unsigned = builder.build(keys.public_key());
+        unsigned.sign_with_keys(&keys).unwrap()
+    }
+
+    #[test]
+    fn client_learn_server_discovery_sets_baseline() {
+        let caps = Mutex::new(PeerCapabilities::default());
+        let init = Mutex::new(None);
+        let event = make_event_with_tags(&[&["support_encryption"], &["name", "TestServer"]]);
+
+        NostrClientTransport::learn_server_discovery(&caps, &init, &event);
+
+        let c = caps.lock().unwrap();
+        assert!(c.supports_encryption);
+        assert!(!c.supports_ephemeral_encryption);
+
+        let stored = init.lock().unwrap();
+        assert!(stored.is_some());
+        assert_eq!(stored.as_ref().unwrap().id, event.id);
+    }
+
+    #[test]
+    fn client_learn_server_discovery_or_assigns() {
+        let caps = Mutex::new(PeerCapabilities::default());
+        let init = Mutex::new(None);
+
+        let event1 = make_event_with_tags(&[&["support_encryption"]]);
+        NostrClientTransport::learn_server_discovery(&caps, &init, &event1);
+
+        // Second event with different caps does NOT downgrade
+        let event2 = make_event_with_tags(&[&["support_encryption_ephemeral"]]);
+        NostrClientTransport::learn_server_discovery(&caps, &init, &event2);
+
+        let c = caps.lock().unwrap();
+        assert!(c.supports_encryption, "must not downgrade");
+        assert!(c.supports_ephemeral_encryption, "must learn new cap");
+    }
+
+    #[test]
+    fn client_baseline_not_replaced_on_later_events() {
+        let caps = Mutex::new(PeerCapabilities::default());
+        let init = Mutex::new(None);
+
+        let event1 = make_event_with_tags(&[&["support_encryption"], &["name", "First"]]);
+        NostrClientTransport::learn_server_discovery(&caps, &init, &event1);
+        let first_id = event1.id;
+
+        let event2 =
+            make_event_with_tags(&[&["support_encryption_ephemeral"], &["name", "Second"]]);
+        NostrClientTransport::learn_server_discovery(&caps, &init, &event2);
+
+        let stored = init.lock().unwrap();
+        assert_eq!(
+            stored.as_ref().unwrap().id,
+            first_id,
+            "baseline must not be replaced"
         );
     }
 }

@@ -70,6 +70,11 @@ impl MockRelayPool {
         self.keys.public_key()
     }
 
+    /// The ephemeral signing keys (for manual event injection in tests).
+    pub fn mock_keys(&self) -> Keys {
+        self.keys.clone()
+    }
+
     /// Like [`new`](Self::new) but with caller-provided signing keys.
     pub fn with_keys(keys: Keys) -> Self {
         let (tx, _rx) = tokio::sync::broadcast::channel(1024);
