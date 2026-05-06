@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use lru::LruCache;
 use nostr_sdk::prelude::*;
+use tokio_util::sync::CancellationToken;
 
 use crate::core::constants::*;
 use crate::core::error::{Error, Result};
@@ -104,8 +105,12 @@ pub struct NostrServerTransport {
     /// so failed decrypt/verify can be retried on redelivery.
     seen_gift_wrap_ids: Arc<Mutex<LruCache<EventId, ()>>>,
     /// Channel for incoming MCP messages (consumed by the MCP server).
-    message_tx: tokio::sync::mpsc::UnboundedSender<IncomingRequest>,
+    message_tx: Option<tokio::sync::mpsc::UnboundedSender<IncomingRequest>>,
     message_rx: Option<tokio::sync::mpsc::UnboundedReceiver<IncomingRequest>>,
+    /// Token used to cancel spawned tasks (event loop + cleanup) on close().
+    cancellation_token: CancellationToken,
+    /// Handles for spawned tasks (event loop + cleanup).
+    task_handles: Vec<tokio::task::JoinHandle<()>>,
 }
 
 /// An incoming MCP request with metadata for routing the response.
@@ -164,8 +169,10 @@ impl NostrServerTransport {
             event_routes: ServerEventRouteStore::new(),
             request_wrap_kinds: Arc::new(RwLock::new(HashMap::new())),
             seen_gift_wrap_ids,
-            message_tx: tx,
+            message_tx: Some(tx),
             message_rx: Some(rx),
+            cancellation_token: CancellationToken::new(),
+            task_handles: Vec::new(),
         })
     }
 
@@ -201,8 +208,10 @@ impl NostrServerTransport {
             request_wrap_kinds: Arc::new(RwLock::new(HashMap::new())),
             event_routes: ServerEventRouteStore::new(),
             seen_gift_wrap_ids,
-            message_tx: tx,
+            message_tx: Some(tx),
             message_rx: Some(rx),
+            cancellation_token: CancellationToken::new(),
+            task_handles: Vec::new(),
         })
     }
 
@@ -247,12 +256,16 @@ impl NostrServerTransport {
                 error
             })?;
 
-        // Spawn event loop
+        // Spawn event loop with cancellation support
         let relay_pool = Arc::clone(&self.base.relay_pool);
         let sessions = self.sessions.clone();
         let event_routes = self.event_routes.clone();
         let request_wrap_kinds = self.request_wrap_kinds.clone();
-        let tx = self.message_tx.clone();
+        let tx = self
+            .message_tx
+            .as_ref()
+            .expect("message_tx must exist before start()")
+            .clone();
         let allowed = self.config.allowed_public_keys.clone();
         let excluded = self.config.excluded_capabilities.clone();
         let encryption_mode = self.config.encryption_mode;
@@ -261,8 +274,9 @@ impl NostrServerTransport {
         let server_info = self.config.server_info.clone();
         let extra_common_tags = self.extra_common_tags.clone();
         let seen_gift_wrap_ids = self.seen_gift_wrap_ids.clone();
+        let event_loop_token = self.cancellation_token.child_token();
 
-        tokio::spawn(async move {
+        let event_loop_handle = tokio::spawn(async move {
             Self::event_loop(
                 relay_pool,
                 sessions,
@@ -277,35 +291,47 @@ impl NostrServerTransport {
                 server_info,
                 extra_common_tags,
                 seen_gift_wrap_ids,
+                event_loop_token,
             )
             .await;
         });
 
-        // Spawn session cleanup
+        // Spawn session cleanup with cancellation support
         let sessions_cleanup = self.sessions.clone();
         let event_routes_cleanup = self.event_routes.clone();
         let request_wrap_kinds_cleanup = self.request_wrap_kinds.clone();
         let cleanup_interval = self.config.cleanup_interval;
         let session_timeout = self.config.session_timeout;
         let request_timeout = self.config.request_timeout;
+        let cleanup_token = self.cancellation_token.child_token();
 
-        tokio::spawn(async move {
+        let cleanup_handle = tokio::spawn(async move {
             let mut interval = tokio::time::interval(cleanup_interval);
             loop {
-                interval.tick().await;
-                let cleaned = Self::cleanup_sessions(
-                    &sessions_cleanup,
-                    &event_routes_cleanup,
-                    &request_wrap_kinds_cleanup,
-                    session_timeout,
-                )
-                .await;
-                if cleaned > 0 {
-                    tracing::info!(
-                        target: LOG_TARGET,
-                        cleaned_sessions = cleaned,
-                        "Cleaned up inactive sessions"
-                    );
+                tokio::select! {
+                    _ = cleanup_token.cancelled() => {
+                        tracing::info!(
+                            target: LOG_TARGET,
+                            "Server cleanup task cancelled"
+                        );
+                        break;
+                    }
+                    _ = interval.tick() => {
+                        let cleaned = Self::cleanup_sessions(
+                            &sessions_cleanup,
+                            &event_routes_cleanup,
+                            &request_wrap_kinds_cleanup,
+                            session_timeout,
+                        )
+                        .await;
+                        if cleaned > 0 {
+                            tracing::info!(
+                                target: LOG_TARGET,
+                                cleaned_sessions = cleaned,
+                                "Cleaned up inactive sessions"
+                            );
+                        }
+                    }
                 }
 
                 // Sweep stale route entries in active sessions (rmcp handles timeout errors).
@@ -328,6 +354,9 @@ impl NostrServerTransport {
             }
         });
 
+        self.task_handles.push(event_loop_handle);
+        self.task_handles.push(cleanup_handle);
+
         tracing::info!(
             target: LOG_TARGET,
             relay_count = self.config.relay_urls.len(),
@@ -338,8 +367,13 @@ impl NostrServerTransport {
         Ok(())
     }
 
-    /// Close the transport.
+    /// Close the transport — cancels event loop and cleanup tasks, then disconnects.
     pub async fn close(&mut self) -> Result<()> {
+        self.cancellation_token.cancel();
+        for handle in self.task_handles.drain(..) {
+            let _ = handle.await;
+        }
+        self.message_tx.take();
         self.base.disconnect().await?;
         self.sessions.clear().await;
         self.event_routes.clear().await;
@@ -849,10 +883,26 @@ impl NostrServerTransport {
         server_info: Option<ServerInfo>,
         extra_common_tags: Vec<Tag>,
         seen_gift_wrap_ids: Arc<Mutex<LruCache<EventId, ()>>>,
+        cancel: CancellationToken,
     ) {
         let mut notifications = relay_pool.notifications();
 
-        while let Ok(notification) = notifications.recv().await {
+        loop {
+            let notification = tokio::select! {
+                _ = cancel.cancelled() => {
+                    tracing::info!(
+                        target: LOG_TARGET,
+                        "Server event loop cancelled"
+                    );
+                    break;
+                }
+                result = notifications.recv() => {
+                    match result {
+                        Ok(n) => n,
+                        Err(_) => break,
+                    }
+                }
+            };
             if let RelayPoolNotification::Event { event, .. } = notification {
                 let is_gift_wrap = event.kind == Kind::Custom(GIFT_WRAP_KIND)
                     || event.kind == Kind::Custom(EPHEMERAL_GIFT_WRAP_KIND);

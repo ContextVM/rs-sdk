@@ -31,6 +31,9 @@ rmcp = { version = "0.16.0", features = ["server", "client", "macros", "transpor
 # LRU cache for gift-wrap (outer event id) deduplication
 lru = "0.12"
 
+# CancellationToken for graceful event-loop shutdown
+tokio-util = { version = "0.7", features = ["rt"] }
+
 [features]
 # Enable rmcp by default while keeping legacy APIs available.
 default = ["rmcp"]
