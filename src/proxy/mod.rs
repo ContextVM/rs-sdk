@@ -73,7 +73,7 @@ impl NostrMCPProxy {
     /// Start a proxy directly from an rmcp client handler.
     ///
     /// This additive API keeps the existing `new/start/send` flow intact,
-    /// while allowing rmcp-first usage through the worker adapter.
+    /// while also allowing direct `handler.serve(transport)` style usage.
     pub async fn serve_client_handler<T, H>(
         signer: T,
         config: ProxyConfig,
@@ -83,12 +83,12 @@ impl NostrMCPProxy {
         T: nostr_sdk::prelude::IntoNostrSigner,
         H: rmcp::ClientHandler,
     {
-        use crate::rmcp_transport::NostrClientWorker;
+        use crate::NostrClientTransport;
         use rmcp::ServiceExt;
 
-        let worker = NostrClientWorker::new(signer, config.nostr_config).await?;
+        let transport = NostrClientTransport::new(signer, config.nostr_config).await?;
         handler
-            .serve(worker)
+            .serve(transport)
             .await
             .map_err(|e| Error::Other(format!("rmcp client initialization failed: {e}")))
     }

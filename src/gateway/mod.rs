@@ -84,7 +84,7 @@ impl NostrMCPGateway {
     /// Start a gateway directly from an rmcp server handler.
     ///
     /// This additive API keeps the existing `new/start/send_response` flow intact,
-    /// while allowing rmcp-first usage through the worker adapter.
+    /// while also allowing direct `handler.serve(transport)` style usage.
     pub async fn serve_handler<T, H>(
         signer: T,
         config: GatewayConfig,
@@ -94,12 +94,12 @@ impl NostrMCPGateway {
         T: nostr_sdk::prelude::IntoNostrSigner,
         H: rmcp::ServerHandler,
     {
-        use crate::rmcp_transport::NostrServerWorker;
+        use crate::NostrServerTransport;
         use rmcp::ServiceExt;
 
-        let worker = NostrServerWorker::new(signer, config.nostr_config).await?;
+        let transport = NostrServerTransport::new(signer, config.nostr_config).await?;
         handler
-            .serve(worker)
+            .serve(transport)
             .await
             .map_err(|e| Error::Other(format!("rmcp server initialization failed: {e}")))
     }

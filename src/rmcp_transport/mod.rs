@@ -1,8 +1,10 @@
-//! RMCP integration scaffolding.
+//! rmcp integration for ContextVM Nostr transports.
 //!
-//! This module bridges the existing Nostr transport implementation with rmcp services.
+//! This module contains the conversion helpers and worker bridge that let raw
+//! ContextVM transports plug directly into rmcp service APIs.
 
 pub mod convert;
+pub mod transport;
 pub mod worker;
 
 #[cfg(test)]
