@@ -8,9 +8,17 @@ use crate::core::types::JsonRpcMessage;
 use crate::transport::server::{IncomingRequest, NostrServerTransport, NostrServerTransportConfig};
 
 /// Configuration for the gateway.
+#[non_exhaustive]
 pub struct GatewayConfig {
     /// Nostr server transport configuration.
     pub nostr_config: NostrServerTransportConfig,
+}
+
+impl GatewayConfig {
+    /// Create a new gateway configuration.
+    pub fn new(nostr_config: NostrServerTransportConfig) -> Self {
+        Self { nostr_config }
+    }
 }
 
 /// Gateway that bridges a local MCP server to Nostr.

@@ -31,6 +31,7 @@ use crate::util::tracing_setup;
 const LOG_TARGET: &str = "contextvm_sdk::transport::client";
 
 /// Configuration for the client transport.
+#[non_exhaustive]
 pub struct NostrClientTransportConfig {
     /// Relay URLs to connect to.
     pub relay_urls: Vec<String>,
@@ -63,6 +64,44 @@ impl Default for NostrClientTransportConfig {
             timeout: Duration::from_secs(30),
             log_file_path: None,
         }
+    }
+}
+
+impl NostrClientTransportConfig {
+    /// Set the server's public key (hex).
+    pub fn with_server_pubkey(mut self, pubkey: impl Into<String>) -> Self {
+        self.server_pubkey = pubkey.into();
+        self
+    }
+    /// Set the encryption mode.
+    pub fn with_encryption_mode(mut self, mode: EncryptionMode) -> Self {
+        self.encryption_mode = mode;
+        self
+    }
+    /// Set the gift-wrap mode (CEP-19).
+    pub fn with_gift_wrap_mode(mut self, mode: GiftWrapMode) -> Self {
+        self.gift_wrap_mode = mode;
+        self
+    }
+    /// Enable or disable stateless mode.
+    pub fn with_stateless(mut self, stateless: bool) -> Self {
+        self.is_stateless = stateless;
+        self
+    }
+    /// Set the relay URLs to connect to.
+    pub fn with_relay_urls(mut self, urls: Vec<String>) -> Self {
+        self.relay_urls = urls;
+        self
+    }
+    /// Set the correlation-retention TTL.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+    /// Set the log file path.
+    pub fn with_log_file_path(mut self, path: impl Into<String>) -> Self {
+        self.log_file_path = Some(path.into());
+        self
     }
 }
 
@@ -442,7 +481,15 @@ impl NostrClientTransport {
                 result = notifications.recv() => {
                     let notification = match result {
                         Ok(n) => n,
-                        Err(_) => break,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            tracing::warn!(
+                                target: LOG_TARGET,
+                                skipped = n,
+                                "Relay broadcast lagged, skipping missed events"
+                            );
+                            continue;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     };
                     Self::handle_notification(
                         &notification,

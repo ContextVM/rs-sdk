@@ -8,9 +8,17 @@ use crate::core::types::JsonRpcMessage;
 use crate::transport::client::{NostrClientTransport, NostrClientTransportConfig};
 
 /// Configuration for the proxy.
+#[non_exhaustive]
 pub struct ProxyConfig {
     /// Nostr client transport configuration.
     pub nostr_config: NostrClientTransportConfig,
+}
+
+impl ProxyConfig {
+    /// Create a new proxy configuration.
+    pub fn new(nostr_config: NostrClientTransportConfig) -> Self {
+        Self { nostr_config }
+    }
 }
 
 /// Proxy that connects to a remote MCP server via Nostr.
