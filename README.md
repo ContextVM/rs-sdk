@@ -168,6 +168,22 @@ async fn main() -> contextvm_sdk::Result<()> {
 }
 ```
 
+## Documentation
+
+The in-repo Rust SDK guides live in [`docs/README.md`](docs/README.md):
+
+- For most users, the main pattern is: build an `rmcp` server or client, then attach [`NostrServerTransport`](src/transport/server/mod.rs:87) or [`NostrClientTransport`](src/transport/client/mod.rs:69).
+
+- [`docs/overview.md`](docs/overview.md)
+- [`docs/server-transport.md`](docs/server-transport.md)
+- [`docs/client-transport.md`](docs/client-transport.md)
+- [`docs/discovery.md`](docs/discovery.md)
+- [`docs/encryption.md`](docs/encryption.md)
+- [`docs/rmcp.md`](docs/rmcp.md)
+- [`docs/transports.md`](docs/transports.md)
+- [`docs/gateway.md`](docs/gateway.md)
+- [`docs/proxy.md`](docs/proxy.md)
+
 ## Module Overview
 
 | Module         | Description                                                    |
