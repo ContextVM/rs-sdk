@@ -83,12 +83,14 @@ impl NostrMCPProxy {
         T: nostr_sdk::prelude::IntoNostrSigner,
         H: rmcp::ClientHandler,
     {
-        use crate::rmcp_transport::NostrClientWorker;
+        use crate::NostrClientTransport;
         use rmcp::ServiceExt;
 
-        let worker = NostrClientWorker::new(signer, config.nostr_config).await?;
+        let transport = NostrClientTransport::new(signer, config.nostr_config)
+            .await?
+            .into_rmcp_transport();
         handler
-            .serve(worker)
+            .serve(transport)
             .await
             .map_err(|e| Error::Other(format!("rmcp client initialization failed: {e}")))
     }

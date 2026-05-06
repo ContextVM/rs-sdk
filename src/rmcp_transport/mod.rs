@@ -3,6 +3,7 @@
 //! This module bridges the existing Nostr transport implementation with rmcp services.
 
 pub mod convert;
+pub mod transport;
 pub mod worker;
 
 #[cfg(test)]
@@ -12,4 +13,5 @@ pub use convert::{
     internal_to_rmcp_client_rx, internal_to_rmcp_server_rx, rmcp_client_tx_to_internal,
     rmcp_server_tx_to_internal,
 };
+pub use transport::{NostrClientRmcpTransport, NostrServerRmcpTransport};
 pub use worker::{NostrClientWorker, NostrServerWorker};

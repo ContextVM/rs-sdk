@@ -39,6 +39,11 @@ impl NostrServerWorker {
         Ok(Self { transport })
     }
 
+    /// Create a worker from an already-constructed raw transport.
+    pub fn from_transport(transport: NostrServerTransport) -> Self {
+        Self { transport }
+    }
+
     /// Access the wrapped transport.
     pub fn transport(&self) -> &NostrServerTransport {
         &self.transport
@@ -155,6 +160,11 @@ impl NostrClientWorker {
     {
         let transport = NostrClientTransport::new(signer, config).await?;
         Ok(Self { transport })
+    }
+
+    /// Create a worker from an already-constructed raw transport.
+    pub fn from_transport(transport: NostrClientTransport) -> Self {
+        Self { transport }
     }
 
     /// Access the wrapped transport.
