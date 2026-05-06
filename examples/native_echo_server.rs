@@ -98,9 +98,7 @@ async fn main() -> Result<()> {
     )
     .await?;
 
-    let service = EchoServer::new()
-        .serve(transport.into_rmcp_transport())
-        .await?;
+    let service = EchoServer::new().serve(transport).await?;
     println!("Server ready. Press Ctrl+C to stop.");
     service.waiting().await?;
     Ok(())

@@ -50,7 +50,7 @@ async fn main() -> Result<()> {
     )
     .await?;
 
-    let client = EchoClient.serve(transport.into_rmcp_transport()).await?;
+    let client = EchoClient.serve(transport).await?;
 
     let peer_info = client
         .peer_info()
