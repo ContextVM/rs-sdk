@@ -571,30 +571,24 @@ async fn run_relay_rmcp_case(relay_url: &str) -> Result<()> {
 }
 
 fn server_config(relay_url: &str) -> GatewayConfig {
-    GatewayConfig {
-        nostr_config: NostrServerTransportConfig {
-            relay_urls: vec![relay_url.to_string()],
-            encryption_mode: EncryptionMode::Optional,
-            server_info: Some(CtxServerInfo {
-                name: Some("rmcp-matrix-server".to_string()),
-                about: Some("rmcp matrix coverage server".to_string()),
-                ..Default::default()
-            }),
-            is_announced_server: false,
-            ..Default::default()
-        },
-    }
+    let nostr_config = NostrServerTransportConfig::default()
+        .with_relay_urls(vec![relay_url.to_string()])
+        .with_encryption_mode(EncryptionMode::Optional)
+        .with_server_info(
+            CtxServerInfo::default()
+                .with_name("rmcp-matrix-server")
+                .with_about("rmcp matrix coverage server"),
+        )
+        .with_announced_server(false);
+    GatewayConfig::new(nostr_config)
 }
 
 fn client_config(relay_url: &str, server_pubkey: String) -> ProxyConfig {
-    ProxyConfig {
-        nostr_config: NostrClientTransportConfig {
-            relay_urls: vec![relay_url.to_string()],
-            server_pubkey,
-            encryption_mode: EncryptionMode::Optional,
-            ..Default::default()
-        },
-    }
+    let nostr_config = NostrClientTransportConfig::default()
+        .with_relay_urls(vec![relay_url.to_string()])
+        .with_server_pubkey(server_pubkey)
+        .with_encryption_mode(EncryptionMode::Optional);
+    ProxyConfig::new(nostr_config)
 }
 
 async fn send_legacy_request_and_wait(

@@ -34,6 +34,7 @@ use crate::util::tracing_setup;
 const LOG_TARGET: &str = "contextvm_sdk::transport::server";
 
 /// Configuration for the server transport.
+#[non_exhaustive]
 pub struct NostrServerTransportConfig {
     /// Relay URLs to connect to.
     pub relay_urls: Vec<String>,
@@ -113,8 +114,72 @@ pub struct NostrServerTransport {
     task_handles: Vec<tokio::task::JoinHandle<()>>,
 }
 
+impl NostrServerTransportConfig {
+    /// Set the encryption mode.
+    pub fn with_encryption_mode(mut self, mode: EncryptionMode) -> Self {
+        self.encryption_mode = mode;
+        self
+    }
+    /// Set the gift-wrap mode (CEP-19).
+    pub fn with_gift_wrap_mode(mut self, mode: GiftWrapMode) -> Self {
+        self.gift_wrap_mode = mode;
+        self
+    }
+    /// Set server information for announcements.
+    pub fn with_server_info(mut self, info: ServerInfo) -> Self {
+        self.server_info = Some(info);
+        self
+    }
+    /// Enable or disable public announcement publishing (CEP-6).
+    pub fn with_announced_server(mut self, announced: bool) -> Self {
+        self.is_announced_server = announced;
+        self
+    }
+    /// Set the allowed client public keys (hex). Empty = allow all.
+    pub fn with_allowed_public_keys(mut self, keys: Vec<String>) -> Self {
+        self.allowed_public_keys = keys;
+        self
+    }
+    /// Set capabilities excluded from pubkey whitelisting.
+    pub fn with_excluded_capabilities(mut self, caps: Vec<CapabilityExclusion>) -> Self {
+        self.excluded_capabilities = caps;
+        self
+    }
+    /// Set the maximum number of concurrent client sessions.
+    pub fn with_max_sessions(mut self, max: usize) -> Self {
+        self.max_sessions = max;
+        self
+    }
+    /// Set the relay URLs to connect to.
+    pub fn with_relay_urls(mut self, urls: Vec<String>) -> Self {
+        self.relay_urls = urls;
+        self
+    }
+    /// Set the session cleanup interval.
+    pub fn with_cleanup_interval(mut self, interval: Duration) -> Self {
+        self.cleanup_interval = interval;
+        self
+    }
+    /// Set the session timeout.
+    pub fn with_session_timeout(mut self, timeout: Duration) -> Self {
+        self.session_timeout = timeout;
+        self
+    }
+    /// Set the correlation-retention TTL for event routes.
+    pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = timeout;
+        self
+    }
+    /// Set the log file path.
+    pub fn with_log_file_path(mut self, path: impl Into<String>) -> Self {
+        self.log_file_path = Some(path.into());
+        self
+    }
+}
+
 /// An incoming MCP request with metadata for routing the response.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct IncomingRequest {
     /// The parsed MCP message.
     pub message: JsonRpcMessage,
@@ -899,7 +964,15 @@ impl NostrServerTransport {
                 result = notifications.recv() => {
                     match result {
                         Ok(n) => n,
-                        Err(_) => break,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            tracing::warn!(
+                                target: LOG_TARGET,
+                                skipped = n,
+                                "Relay broadcast lagged, skipping missed events"
+                            );
+                            continue;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }
             };

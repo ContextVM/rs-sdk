@@ -41,15 +41,13 @@ async fn main() -> contextvm_sdk::Result<()> {
     let keys = signer::generate();
     println!("Client pubkey: {}", keys.public_key().to_hex());
 
-    let config = ProxyConfig {
-        nostr_config: NostrClientTransportConfig {
-            relay_urls: vec!["wss://relay.damus.io".to_string()],
-            server_pubkey: server_pubkey_hex,
-            encryption_mode: EncryptionMode::Optional,
-            log_file_path,
-            ..Default::default()
-        },
-    };
+    let mut nostr_config = NostrClientTransportConfig::default()
+        .with_server_pubkey(server_pubkey_hex)
+        .with_encryption_mode(EncryptionMode::Optional);
+    if let Some(path) = log_file_path {
+        nostr_config = nostr_config.with_log_file_path(path);
+    }
+    let config = ProxyConfig::new(nostr_config);
 
     let mut proxy = NostrMCPProxy::new(keys, config).await?;
     let mut rx = proxy.start().await?;

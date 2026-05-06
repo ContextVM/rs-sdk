@@ -136,21 +136,16 @@ async fn full_initialization_handshake() {
     let server_pubkey = server_pool.mock_public_key();
 
     let mut server = NostrServerTransport::with_relay_pool(
-        NostrServerTransportConfig {
-            encryption_mode: EncryptionMode::Disabled,
-            ..Default::default()
-        },
+        NostrServerTransportConfig::default().with_encryption_mode(EncryptionMode::Disabled),
         as_pool(server_pool),
     )
     .await
     .expect("create server transport");
 
     let mut client = NostrClientTransport::with_relay_pool(
-        NostrClientTransportConfig {
-            server_pubkey: server_pubkey.to_hex(),
-            encryption_mode: EncryptionMode::Disabled,
-            ..Default::default()
-        },
+        NostrClientTransportConfig::default()
+            .with_server_pubkey(server_pubkey.to_hex())
+            .with_encryption_mode(EncryptionMode::Disabled),
         as_pool(client_pool),
     )
     .await
@@ -227,15 +222,10 @@ async fn server_announcement_publishing() {
     let pool = Arc::new(MockRelayPool::new());
 
     let mut server = NostrServerTransport::with_relay_pool(
-        NostrServerTransportConfig {
-            is_announced_server: true,
-            server_info: Some(ServerInfo {
-                name: Some("Phase3-Test-Server".to_string()),
-                ..Default::default()
-            }),
-            encryption_mode: EncryptionMode::Disabled,
-            ..Default::default()
-        },
+        NostrServerTransportConfig::default()
+            .with_encryption_mode(EncryptionMode::Disabled)
+            .with_server_info(ServerInfo::default().with_name("Phase3-Test-Server".to_string()))
+            .with_announced_server(true),
         Arc::clone(&pool) as Arc<dyn RelayPoolTrait>,
     )
     .await
@@ -273,10 +263,7 @@ async fn encryption_mode_optional_accepts_plaintext() {
 
     // Server uses Optional — should accept both encrypted and plaintext.
     let mut server = NostrServerTransport::with_relay_pool(
-        NostrServerTransportConfig {
-            encryption_mode: EncryptionMode::Optional,
-            ..Default::default()
-        },
+        NostrServerTransportConfig::default().with_encryption_mode(EncryptionMode::Optional),
         as_pool(server_pool),
     )
     .await
@@ -289,11 +276,9 @@ async fn encryption_mode_optional_accepts_plaintext() {
 
     // Client uses Disabled — sends plaintext kind 25910.
     let mut client = NostrClientTransport::with_relay_pool(
-        NostrClientTransportConfig {
-            server_pubkey: server_pubkey.to_hex(),
-            encryption_mode: EncryptionMode::Disabled,
-            ..Default::default()
-        },
+        NostrClientTransportConfig::default()
+            .with_server_pubkey(server_pubkey.to_hex())
+            .with_encryption_mode(EncryptionMode::Disabled),
         as_pool(client_pool),
     )
     .await
@@ -337,11 +322,9 @@ async fn auth_allowlist_blocks_disallowed_pubkey() {
 
     // Server allows only `allowed_keys` — client_keys is NOT allowed.
     let mut server = NostrServerTransport::with_relay_pool(
-        NostrServerTransportConfig {
-            allowed_public_keys: vec![allowed_keys.public_key().to_hex()],
-            encryption_mode: EncryptionMode::Disabled,
-            ..Default::default()
-        },
+        NostrServerTransportConfig::default()
+            .with_encryption_mode(EncryptionMode::Disabled)
+            .with_allowed_public_keys(vec![allowed_keys.public_key().to_hex()]),
         as_pool(server_pool),
     )
     .await
@@ -353,11 +336,9 @@ async fn auth_allowlist_blocks_disallowed_pubkey() {
     server.start().await.expect("server start");
 
     let mut client = NostrClientTransport::with_relay_pool(
-        NostrClientTransportConfig {
-            server_pubkey: server_pubkey.to_hex(),
-            encryption_mode: EncryptionMode::Disabled,
-            ..Default::default()
-        },
+        NostrClientTransportConfig::default()
+            .with_server_pubkey(server_pubkey.to_hex())
+            .with_encryption_mode(EncryptionMode::Disabled),
         as_pool(client_pool),
     )
     .await
@@ -392,10 +373,7 @@ async fn encryption_mode_required_drops_plaintext() {
 
     // Server requires encryption — plaintext must be dropped.
     let mut server = NostrServerTransport::with_relay_pool(
-        NostrServerTransportConfig {
-            encryption_mode: EncryptionMode::Required,
-            ..Default::default()
-        },
+        NostrServerTransportConfig::default().with_encryption_mode(EncryptionMode::Required),
         as_pool(server_pool),
     )
     .await
@@ -408,11 +386,9 @@ async fn encryption_mode_required_drops_plaintext() {
 
     // Client sends plaintext (Disabled mode).
     let mut client = NostrClientTransport::with_relay_pool(
-        NostrClientTransportConfig {
-            server_pubkey: server_pubkey.to_hex(),
-            encryption_mode: EncryptionMode::Disabled,
-            ..Default::default()
-        },
+        NostrClientTransportConfig::default()
+            .with_server_pubkey(server_pubkey.to_hex())
+            .with_encryption_mode(EncryptionMode::Disabled),
         as_pool(client_pool),
     )
     .await
@@ -446,21 +422,16 @@ async fn encrypted_gift_wrap_roundtrip() {
     let server_pool = Arc::new(server_pool);
 
     let mut server = NostrServerTransport::with_relay_pool(
-        NostrServerTransportConfig {
-            encryption_mode: EncryptionMode::Required,
-            ..Default::default()
-        },
+        NostrServerTransportConfig::default().with_encryption_mode(EncryptionMode::Required),
         Arc::clone(&server_pool) as Arc<dyn RelayPoolTrait>,
     )
     .await
     .expect("create server transport");
 
     let mut client = NostrClientTransport::with_relay_pool(
-        NostrClientTransportConfig {
-            server_pubkey: server_pubkey.to_hex(),
-            encryption_mode: EncryptionMode::Required,
-            ..Default::default()
-        },
+        NostrClientTransportConfig::default()
+            .with_server_pubkey(server_pubkey.to_hex())
+            .with_encryption_mode(EncryptionMode::Required),
         as_pool(client_pool),
     )
     .await
@@ -534,21 +505,16 @@ async fn gift_wrap_dedup_skips_duplicate_delivery() {
     let server_pool = Arc::new(server_pool);
 
     let mut server = NostrServerTransport::with_relay_pool(
-        NostrServerTransportConfig {
-            encryption_mode: EncryptionMode::Required,
-            ..Default::default()
-        },
+        NostrServerTransportConfig::default().with_encryption_mode(EncryptionMode::Required),
         Arc::clone(&server_pool) as Arc<dyn RelayPoolTrait>,
     )
     .await
     .expect("create server transport");
 
     let mut client = NostrClientTransport::with_relay_pool(
-        NostrClientTransportConfig {
-            server_pubkey: server_pubkey.to_hex(),
-            encryption_mode: EncryptionMode::Required,
-            ..Default::default()
-        },
+        NostrClientTransportConfig::default()
+            .with_server_pubkey(server_pubkey.to_hex())
+            .with_encryption_mode(EncryptionMode::Required),
         as_pool(client_pool),
     )
     .await
@@ -608,21 +574,16 @@ async fn correlated_notification_has_e_tag() {
     let server_pool = Arc::new(server_pool);
 
     let mut server = NostrServerTransport::with_relay_pool(
-        NostrServerTransportConfig {
-            encryption_mode: EncryptionMode::Disabled,
-            ..Default::default()
-        },
+        NostrServerTransportConfig::default().with_encryption_mode(EncryptionMode::Disabled),
         Arc::clone(&server_pool) as Arc<dyn RelayPoolTrait>,
     )
     .await
     .expect("create server transport");
 
     let mut client = NostrClientTransport::with_relay_pool(
-        NostrClientTransportConfig {
-            server_pubkey: server_pubkey.to_hex(),
-            encryption_mode: EncryptionMode::Disabled,
-            ..Default::default()
-        },
+        NostrClientTransportConfig::default()
+            .with_server_pubkey(server_pubkey.to_hex())
+            .with_encryption_mode(EncryptionMode::Disabled),
         as_pool(client_pool),
     )
     .await
@@ -707,21 +668,16 @@ async fn encryption_required_client_optional_server() {
     let server_pubkey = server_pool.mock_public_key();
 
     let mut server = NostrServerTransport::with_relay_pool(
-        NostrServerTransportConfig {
-            encryption_mode: EncryptionMode::Optional,
-            ..Default::default()
-        },
+        NostrServerTransportConfig::default().with_encryption_mode(EncryptionMode::Optional),
         as_pool(server_pool),
     )
     .await
     .expect("create server transport");
 
     let mut client = NostrClientTransport::with_relay_pool(
-        NostrClientTransportConfig {
-            server_pubkey: server_pubkey.to_hex(),
-            encryption_mode: EncryptionMode::Required,
-            ..Default::default()
-        },
+        NostrClientTransportConfig::default()
+            .with_server_pubkey(server_pubkey.to_hex())
+            .with_encryption_mode(EncryptionMode::Required),
         as_pool(client_pool),
     )
     .await
@@ -769,21 +725,16 @@ async fn encryption_optional_both_sides_encrypted_path() {
     let server_pubkey = server_pool.mock_public_key();
 
     let mut server = NostrServerTransport::with_relay_pool(
-        NostrServerTransportConfig {
-            encryption_mode: EncryptionMode::Optional,
-            ..Default::default()
-        },
+        NostrServerTransportConfig::default().with_encryption_mode(EncryptionMode::Optional),
         as_pool(server_pool),
     )
     .await
     .expect("create server transport");
 
     let mut client = NostrClientTransport::with_relay_pool(
-        NostrClientTransportConfig {
-            server_pubkey: server_pubkey.to_hex(),
-            encryption_mode: EncryptionMode::Optional,
-            ..Default::default()
-        },
+        NostrClientTransportConfig::default()
+            .with_server_pubkey(server_pubkey.to_hex())
+            .with_encryption_mode(EncryptionMode::Optional),
         as_pool(client_pool),
     )
     .await
@@ -824,15 +775,10 @@ async fn announce_includes_encryption_tags() {
     let pool = Arc::new(MockRelayPool::new());
 
     let mut server = NostrServerTransport::with_relay_pool(
-        NostrServerTransportConfig {
-            is_announced_server: true,
-            server_info: Some(ServerInfo {
-                name: Some("Encrypted-Server".to_string()),
-                ..Default::default()
-            }),
-            encryption_mode: EncryptionMode::Required,
-            ..Default::default()
-        },
+        NostrServerTransportConfig::default()
+            .with_encryption_mode(EncryptionMode::Required)
+            .with_server_info(ServerInfo::default().with_name("Encrypted-Server".to_string()))
+            .with_announced_server(true),
         Arc::clone(&pool) as Arc<dyn RelayPoolTrait>,
     )
     .await
@@ -873,18 +819,16 @@ async fn announce_includes_server_metadata_tags() {
     let pool = Arc::new(MockRelayPool::new());
 
     let mut server = NostrServerTransport::with_relay_pool(
-        NostrServerTransportConfig {
-            is_announced_server: true,
-            server_info: Some(ServerInfo {
-                name: Some("Meta-Server".to_string()),
-                about: Some("A test server".to_string()),
-                website: Some("https://example.com".to_string()),
-                picture: Some("https://example.com/pic.png".to_string()),
-                ..Default::default()
-            }),
-            encryption_mode: EncryptionMode::Disabled,
-            ..Default::default()
-        },
+        NostrServerTransportConfig::default()
+            .with_encryption_mode(EncryptionMode::Disabled)
+            .with_server_info(
+                ServerInfo::default()
+                    .with_name("Meta-Server".to_string())
+                    .with_about("A test server".to_string())
+                    .with_website("https://example.com".to_string())
+                    .with_picture("https://example.com/pic.png".to_string()),
+            )
+            .with_announced_server(true),
         Arc::clone(&pool) as Arc<dyn RelayPoolTrait>,
     )
     .await
@@ -935,15 +879,10 @@ async fn publish_tools_produces_correct_kind() {
     let pool = Arc::new(MockRelayPool::new());
 
     let mut server = NostrServerTransport::with_relay_pool(
-        NostrServerTransportConfig {
-            is_announced_server: true,
-            server_info: Some(ServerInfo {
-                name: Some("Tools-Server".to_string()),
-                ..Default::default()
-            }),
-            encryption_mode: EncryptionMode::Disabled,
-            ..Default::default()
-        },
+        NostrServerTransportConfig::default()
+            .with_encryption_mode(EncryptionMode::Disabled)
+            .with_server_info(ServerInfo::default().with_name("Tools-Server".to_string()))
+            .with_announced_server(true),
         Arc::clone(&pool) as Arc<dyn RelayPoolTrait>,
     )
     .await
@@ -984,10 +923,7 @@ async fn broadcast_notification_reaches_initialized_client() {
     let server_pk = s_pool.mock_public_key();
 
     let mut server = NostrServerTransport::with_relay_pool(
-        NostrServerTransportConfig {
-            encryption_mode: EncryptionMode::Disabled,
-            ..Default::default()
-        },
+        NostrServerTransportConfig::default().with_encryption_mode(EncryptionMode::Disabled),
         as_pool(s_pool),
     )
     .await
@@ -999,11 +935,9 @@ async fn broadcast_notification_reaches_initialized_client() {
     server.start().await.expect("server start");
 
     let mut client = NostrClientTransport::with_relay_pool(
-        NostrClientTransportConfig {
-            server_pubkey: server_pk.to_hex(),
-            encryption_mode: EncryptionMode::Disabled,
-            ..Default::default()
-        },
+        NostrClientTransportConfig::default()
+            .with_server_pubkey(server_pk.to_hex())
+            .with_encryption_mode(EncryptionMode::Disabled),
         as_pool(c1_pool),
     )
     .await
@@ -1106,21 +1040,16 @@ async fn uncorrelated_notification_passes_through() {
     let server_pubkey = server_pool.mock_public_key();
 
     let mut server = NostrServerTransport::with_relay_pool(
-        NostrServerTransportConfig {
-            encryption_mode: EncryptionMode::Disabled,
-            ..Default::default()
-        },
+        NostrServerTransportConfig::default().with_encryption_mode(EncryptionMode::Disabled),
         as_pool(server_pool),
     )
     .await
     .expect("create server transport");
 
     let mut client = NostrClientTransport::with_relay_pool(
-        NostrClientTransportConfig {
-            server_pubkey: server_pubkey.to_hex(),
-            encryption_mode: EncryptionMode::Disabled,
-            ..Default::default()
-        },
+        NostrClientTransportConfig::default()
+            .with_server_pubkey(server_pubkey.to_hex())
+            .with_encryption_mode(EncryptionMode::Disabled),
         as_pool(client_pool),
     )
     .await
@@ -1204,21 +1133,16 @@ async fn correlated_notification_unknown_e_tag_is_dropped() {
     let server_pubkey = server_pool.mock_public_key();
 
     let mut server = NostrServerTransport::with_relay_pool(
-        NostrServerTransportConfig {
-            encryption_mode: EncryptionMode::Disabled,
-            ..Default::default()
-        },
+        NostrServerTransportConfig::default().with_encryption_mode(EncryptionMode::Disabled),
         as_pool(server_pool),
     )
     .await
     .expect("create server transport");
 
     let mut client = NostrClientTransport::with_relay_pool(
-        NostrClientTransportConfig {
-            server_pubkey: server_pubkey.to_hex(),
-            encryption_mode: EncryptionMode::Disabled,
-            ..Default::default()
-        },
+        NostrClientTransportConfig::default()
+            .with_server_pubkey(server_pubkey.to_hex())
+            .with_encryption_mode(EncryptionMode::Disabled),
         as_pool(client_pool),
     )
     .await
@@ -1299,11 +1223,9 @@ async fn auth_allowed_pubkey_receives_response() {
     let client_pubkey = client_pool.mock_public_key();
 
     let mut server = NostrServerTransport::with_relay_pool(
-        NostrServerTransportConfig {
-            allowed_public_keys: vec![client_pubkey.to_hex()],
-            encryption_mode: EncryptionMode::Disabled,
-            ..Default::default()
-        },
+        NostrServerTransportConfig::default()
+            .with_encryption_mode(EncryptionMode::Disabled)
+            .with_allowed_public_keys(vec![client_pubkey.to_hex()]),
         as_pool(server_pool),
     )
     .await
@@ -1315,11 +1237,9 @@ async fn auth_allowed_pubkey_receives_response() {
     server.start().await.expect("server start");
 
     let mut client = NostrClientTransport::with_relay_pool(
-        NostrClientTransportConfig {
-            server_pubkey: server_pubkey.to_hex(),
-            encryption_mode: EncryptionMode::Disabled,
-            ..Default::default()
-        },
+        NostrClientTransportConfig::default()
+            .with_server_pubkey(server_pubkey.to_hex())
+            .with_encryption_mode(EncryptionMode::Disabled),
         as_pool(client_pool),
     )
     .await
@@ -1378,15 +1298,13 @@ async fn excluded_capability_bypasses_auth() {
     let server_pubkey = server_pool.mock_public_key();
 
     let mut server = NostrServerTransport::with_relay_pool(
-        NostrServerTransportConfig {
-            allowed_public_keys: vec![allowed_keys.public_key().to_hex()],
-            excluded_capabilities: vec![CapabilityExclusion {
+        NostrServerTransportConfig::default()
+            .with_encryption_mode(EncryptionMode::Disabled)
+            .with_allowed_public_keys(vec![allowed_keys.public_key().to_hex()])
+            .with_excluded_capabilities(vec![CapabilityExclusion {
                 method: "tools/list".to_string(),
                 name: None,
-            }],
-            encryption_mode: EncryptionMode::Disabled,
-            ..Default::default()
-        },
+            }]),
         as_pool(server_pool),
     )
     .await
@@ -1398,11 +1316,9 @@ async fn excluded_capability_bypasses_auth() {
     server.start().await.expect("server start");
 
     let mut client = NostrClientTransport::with_relay_pool(
-        NostrClientTransportConfig {
-            server_pubkey: server_pubkey.to_hex(),
-            encryption_mode: EncryptionMode::Disabled,
-            ..Default::default()
-        },
+        NostrClientTransportConfig::default()
+            .with_server_pubkey(server_pubkey.to_hex())
+            .with_encryption_mode(EncryptionMode::Disabled),
         as_pool(client_pool),
     )
     .await
@@ -1440,10 +1356,7 @@ async fn publish_resources_produces_correct_kind() {
     let pool = Arc::new(MockRelayPool::new());
 
     let mut server = NostrServerTransport::with_relay_pool(
-        NostrServerTransportConfig {
-            encryption_mode: EncryptionMode::Disabled,
-            ..Default::default()
-        },
+        NostrServerTransportConfig::default().with_encryption_mode(EncryptionMode::Disabled),
         Arc::clone(&pool) as Arc<dyn RelayPoolTrait>,
     )
     .await
@@ -1483,10 +1396,7 @@ async fn publish_prompts_produces_correct_kind() {
     let pool = Arc::new(MockRelayPool::new());
 
     let mut server = NostrServerTransport::with_relay_pool(
-        NostrServerTransportConfig {
-            encryption_mode: EncryptionMode::Disabled,
-            ..Default::default()
-        },
+        NostrServerTransportConfig::default().with_encryption_mode(EncryptionMode::Disabled),
         Arc::clone(&pool) as Arc<dyn RelayPoolTrait>,
     )
     .await
@@ -1525,10 +1435,7 @@ async fn publish_resource_templates_produces_correct_kind() {
     let pool = Arc::new(MockRelayPool::new());
 
     let mut server = NostrServerTransport::with_relay_pool(
-        NostrServerTransportConfig {
-            encryption_mode: EncryptionMode::Disabled,
-            ..Default::default()
-        },
+        NostrServerTransportConfig::default().with_encryption_mode(EncryptionMode::Disabled),
         Arc::clone(&pool) as Arc<dyn RelayPoolTrait>,
     )
     .await
@@ -1568,10 +1475,7 @@ async fn publish_tools_empty_list() {
     let pool = Arc::new(MockRelayPool::new());
 
     let mut server = NostrServerTransport::with_relay_pool(
-        NostrServerTransportConfig {
-            encryption_mode: EncryptionMode::Disabled,
-            ..Default::default()
-        },
+        NostrServerTransportConfig::default().with_encryption_mode(EncryptionMode::Disabled),
         Arc::clone(&pool) as Arc<dyn RelayPoolTrait>,
     )
     .await
@@ -1602,15 +1506,10 @@ async fn delete_announcements_k_tags_match_kinds() {
     let pool = Arc::new(MockRelayPool::new());
 
     let mut server = NostrServerTransport::with_relay_pool(
-        NostrServerTransportConfig {
-            is_announced_server: true,
-            server_info: Some(ServerInfo {
-                name: Some("KTag-Server".to_string()),
-                ..Default::default()
-            }),
-            encryption_mode: EncryptionMode::Disabled,
-            ..Default::default()
-        },
+        NostrServerTransportConfig::default()
+            .with_encryption_mode(EncryptionMode::Disabled)
+            .with_server_info(ServerInfo::default().with_name("KTag-Server".to_string()))
+            .with_announced_server(true),
         Arc::clone(&pool) as Arc<dyn RelayPoolTrait>,
     )
     .await
@@ -1665,10 +1564,7 @@ async fn encryption_disabled_server_rejects_gift_wrap() {
 
     // Server has encryption disabled — must reject gift-wrap events.
     let mut server = NostrServerTransport::with_relay_pool(
-        NostrServerTransportConfig {
-            encryption_mode: EncryptionMode::Disabled,
-            ..Default::default()
-        },
+        NostrServerTransportConfig::default().with_encryption_mode(EncryptionMode::Disabled),
         as_pool(server_pool),
     )
     .await
@@ -1681,11 +1577,9 @@ async fn encryption_disabled_server_rejects_gift_wrap() {
 
     // Client requires encryption — sends gift-wrap (kind 1059).
     let mut client = NostrClientTransport::with_relay_pool(
-        NostrClientTransportConfig {
-            server_pubkey: server_pubkey.to_hex(),
-            encryption_mode: EncryptionMode::Required,
-            ..Default::default()
-        },
+        NostrClientTransportConfig::default()
+            .with_server_pubkey(server_pubkey.to_hex())
+            .with_encryption_mode(EncryptionMode::Required),
         as_pool(client_pool),
     )
     .await
@@ -1720,21 +1614,16 @@ async fn response_mirrors_client_encryption_format() {
         let server_pool = Arc::new(server_pool);
 
         let mut server = NostrServerTransport::with_relay_pool(
-            NostrServerTransportConfig {
-                encryption_mode: EncryptionMode::Optional,
-                ..Default::default()
-            },
+            NostrServerTransportConfig::default().with_encryption_mode(EncryptionMode::Optional),
             Arc::clone(&server_pool) as Arc<dyn RelayPoolTrait>,
         )
         .await
         .expect("create server transport");
 
         let mut client = NostrClientTransport::with_relay_pool(
-            NostrClientTransportConfig {
-                server_pubkey: server_pubkey.to_hex(),
-                encryption_mode: EncryptionMode::Disabled,
-                ..Default::default()
-            },
+            NostrClientTransportConfig::default()
+                .with_server_pubkey(server_pubkey.to_hex())
+                .with_encryption_mode(EncryptionMode::Disabled),
             as_pool(client_pool),
         )
         .await
@@ -1807,21 +1696,16 @@ async fn response_mirrors_client_encryption_format() {
         let server_pool = Arc::new(server_pool);
 
         let mut server = NostrServerTransport::with_relay_pool(
-            NostrServerTransportConfig {
-                encryption_mode: EncryptionMode::Optional,
-                ..Default::default()
-            },
+            NostrServerTransportConfig::default().with_encryption_mode(EncryptionMode::Optional),
             Arc::clone(&server_pool) as Arc<dyn RelayPoolTrait>,
         )
         .await
         .expect("create server transport");
 
         let mut client = NostrClientTransport::with_relay_pool(
-            NostrClientTransportConfig {
-                server_pubkey: server_pubkey.to_hex(),
-                encryption_mode: EncryptionMode::Required,
-                ..Default::default()
-            },
+            NostrClientTransportConfig::default()
+                .with_server_pubkey(server_pubkey.to_hex())
+                .with_encryption_mode(EncryptionMode::Required),
             as_pool(client_pool),
         )
         .await
@@ -1908,21 +1792,16 @@ async fn send_response_is_one_shot_under_concurrency() {
     ));
 
     let mut server = NostrServerTransport::with_relay_pool(
-        NostrServerTransportConfig {
-            encryption_mode: EncryptionMode::Disabled,
-            ..Default::default()
-        },
+        NostrServerTransportConfig::default().with_encryption_mode(EncryptionMode::Disabled),
         delayed_server_pool,
     )
     .await
     .expect("create server transport");
 
     let mut client = NostrClientTransport::with_relay_pool(
-        NostrClientTransportConfig {
-            server_pubkey: server_pubkey.to_hex(),
-            encryption_mode: EncryptionMode::Disabled,
-            ..Default::default()
-        },
+        NostrClientTransportConfig::default()
+            .with_server_pubkey(server_pubkey.to_hex())
+            .with_encryption_mode(EncryptionMode::Disabled),
         as_pool(client_pool),
     )
     .await
@@ -2010,21 +1889,16 @@ async fn send_response_publish_failure_allows_one_successful_retry() {
     ));
 
     let mut server = NostrServerTransport::with_relay_pool(
-        NostrServerTransportConfig {
-            encryption_mode: EncryptionMode::Disabled,
-            ..Default::default()
-        },
+        NostrServerTransportConfig::default().with_encryption_mode(EncryptionMode::Disabled),
         Arc::clone(&failing_server_pool) as Arc<dyn RelayPoolTrait>,
     )
     .await
     .expect("create server transport");
 
     let mut client = NostrClientTransport::with_relay_pool(
-        NostrClientTransportConfig {
-            server_pubkey: server_pubkey.to_hex(),
-            encryption_mode: EncryptionMode::Disabled,
-            ..Default::default()
-        },
+        NostrClientTransportConfig::default()
+            .with_server_pubkey(server_pubkey.to_hex())
+            .with_encryption_mode(EncryptionMode::Disabled),
         as_pool(client_pool),
     )
     .await
@@ -2132,12 +2006,10 @@ async fn announced_server_sends_unauthorized_error_response() {
 
     // Announced server with an allowlist that does NOT include the client.
     let mut server = NostrServerTransport::with_relay_pool(
-        NostrServerTransportConfig {
-            allowed_public_keys: vec![allowed_keys.public_key().to_hex()],
-            is_announced_server: true,
-            encryption_mode: EncryptionMode::Disabled,
-            ..Default::default()
-        },
+        NostrServerTransportConfig::default()
+            .with_encryption_mode(EncryptionMode::Disabled)
+            .with_announced_server(true)
+            .with_allowed_public_keys(vec![allowed_keys.public_key().to_hex()]),
         as_pool(server_pool),
     )
     .await
@@ -2149,11 +2021,9 @@ async fn announced_server_sends_unauthorized_error_response() {
     server.start().await.expect("server start");
 
     let mut client = NostrClientTransport::with_relay_pool(
-        NostrClientTransportConfig {
-            server_pubkey: server_pubkey.to_hex(),
-            encryption_mode: EncryptionMode::Disabled,
-            ..Default::default()
-        },
+        NostrClientTransportConfig::default()
+            .with_server_pubkey(server_pubkey.to_hex())
+            .with_encryption_mode(EncryptionMode::Disabled),
         as_pool(client_pool),
     )
     .await
@@ -2212,11 +2082,9 @@ async fn private_server_silently_drops_unauthorized_request() {
 
     // Private server (is_announced_server defaults to false).
     let mut server = NostrServerTransport::with_relay_pool(
-        NostrServerTransportConfig {
-            allowed_public_keys: vec![allowed_keys.public_key().to_hex()],
-            encryption_mode: EncryptionMode::Disabled,
-            ..Default::default()
-        },
+        NostrServerTransportConfig::default()
+            .with_encryption_mode(EncryptionMode::Disabled)
+            .with_allowed_public_keys(vec![allowed_keys.public_key().to_hex()]),
         as_pool(server_pool),
     )
     .await
@@ -2228,11 +2096,9 @@ async fn private_server_silently_drops_unauthorized_request() {
     server.start().await.expect("server start");
 
     let mut client = NostrClientTransport::with_relay_pool(
-        NostrClientTransportConfig {
-            server_pubkey: server_pubkey.to_hex(),
-            encryption_mode: EncryptionMode::Disabled,
-            ..Default::default()
-        },
+        NostrClientTransportConfig::default()
+            .with_server_pubkey(server_pubkey.to_hex())
+            .with_encryption_mode(EncryptionMode::Disabled),
         as_pool(client_pool),
     )
     .await
@@ -2276,12 +2142,10 @@ async fn announced_server_does_not_error_on_unauthorized_notification() {
     let server_pubkey = server_pool.mock_public_key();
 
     let mut server = NostrServerTransport::with_relay_pool(
-        NostrServerTransportConfig {
-            allowed_public_keys: vec![allowed_keys.public_key().to_hex()],
-            is_announced_server: true,
-            encryption_mode: EncryptionMode::Disabled,
-            ..Default::default()
-        },
+        NostrServerTransportConfig::default()
+            .with_encryption_mode(EncryptionMode::Disabled)
+            .with_announced_server(true)
+            .with_allowed_public_keys(vec![allowed_keys.public_key().to_hex()]),
         as_pool(server_pool),
     )
     .await
@@ -2293,11 +2157,9 @@ async fn announced_server_does_not_error_on_unauthorized_notification() {
     server.start().await.expect("server start");
 
     let mut client = NostrClientTransport::with_relay_pool(
-        NostrClientTransportConfig {
-            server_pubkey: server_pubkey.to_hex(),
-            encryption_mode: EncryptionMode::Disabled,
-            ..Default::default()
-        },
+        NostrClientTransportConfig::default()
+            .with_server_pubkey(server_pubkey.to_hex())
+            .with_encryption_mode(EncryptionMode::Disabled),
         as_pool(client_pool),
     )
     .await
@@ -2341,27 +2203,20 @@ async fn first_response_includes_discovery_tags() {
     let s_pool = Arc::new(server_pool);
 
     let mut server = NostrServerTransport::with_relay_pool(
-        NostrServerTransportConfig {
-            is_announced_server: true,
-            server_info: Some(ServerInfo {
-                name: Some("Disco-Server".to_string()),
-                ..Default::default()
-            }),
-            encryption_mode: EncryptionMode::Optional,
-            gift_wrap_mode: GiftWrapMode::Optional,
-            ..Default::default()
-        },
+        NostrServerTransportConfig::default()
+            .with_encryption_mode(EncryptionMode::Optional)
+            .with_gift_wrap_mode(GiftWrapMode::Optional)
+            .with_server_info(ServerInfo::default().with_name("Disco-Server".to_string()))
+            .with_announced_server(true),
         Arc::clone(&s_pool) as Arc<dyn RelayPoolTrait>,
     )
     .await
     .expect("create server transport");
 
     let mut client = NostrClientTransport::with_relay_pool(
-        NostrClientTransportConfig {
-            server_pubkey: server_pubkey.to_hex(),
-            encryption_mode: EncryptionMode::Disabled,
-            ..Default::default()
-        },
+        NostrClientTransportConfig::default()
+            .with_server_pubkey(server_pubkey.to_hex())
+            .with_encryption_mode(EncryptionMode::Disabled),
         as_pool(client_pool),
     )
     .await
@@ -2472,23 +2327,19 @@ async fn notification_mirror_selection_wrt_cep_19() {
     let s_pool = Arc::new(server_pool);
 
     let mut server = NostrServerTransport::with_relay_pool(
-        NostrServerTransportConfig {
-            encryption_mode: EncryptionMode::Optional,
-            gift_wrap_mode: GiftWrapMode::Optional,
-            ..Default::default()
-        },
+        NostrServerTransportConfig::default()
+            .with_encryption_mode(EncryptionMode::Optional)
+            .with_gift_wrap_mode(GiftWrapMode::Optional),
         Arc::clone(&s_pool) as Arc<dyn RelayPoolTrait>,
     )
     .await
     .expect("create server transport");
 
     let mut client = NostrClientTransport::with_relay_pool(
-        NostrClientTransportConfig {
-            server_pubkey: server_pubkey.to_hex(),
-            encryption_mode: EncryptionMode::Optional,
-            gift_wrap_mode: GiftWrapMode::Ephemeral,
-            ..Default::default()
-        },
+        NostrClientTransportConfig::default()
+            .with_server_pubkey(server_pubkey.to_hex())
+            .with_encryption_mode(EncryptionMode::Optional)
+            .with_gift_wrap_mode(GiftWrapMode::Ephemeral),
         as_pool(client_pool),
     )
     .await
@@ -2561,22 +2412,18 @@ async fn server_response_includes_encryption_tags_when_enabled() {
     let server_pool_arc = Arc::new(server_pool);
 
     let mut server = NostrServerTransport::with_relay_pool(
-        NostrServerTransportConfig {
-            encryption_mode: EncryptionMode::Optional,
-            gift_wrap_mode: GiftWrapMode::Optional,
-            ..Default::default()
-        },
+        NostrServerTransportConfig::default()
+            .with_encryption_mode(EncryptionMode::Optional)
+            .with_gift_wrap_mode(GiftWrapMode::Optional),
         Arc::clone(&server_pool_arc) as Arc<dyn RelayPoolTrait>,
     )
     .await
     .unwrap();
 
     let mut client = NostrClientTransport::with_relay_pool(
-        NostrClientTransportConfig {
-            server_pubkey: server_pubkey.to_hex(),
-            encryption_mode: EncryptionMode::Disabled,
-            ..Default::default()
-        },
+        NostrClientTransportConfig::default()
+            .with_server_pubkey(server_pubkey.to_hex())
+            .with_encryption_mode(EncryptionMode::Disabled),
         as_pool(client_pool),
     )
     .await
@@ -2639,22 +2486,18 @@ async fn server_response_excludes_ephemeral_tag_when_persistent() {
     let server_pool_arc = Arc::new(server_pool);
 
     let mut server = NostrServerTransport::with_relay_pool(
-        NostrServerTransportConfig {
-            encryption_mode: EncryptionMode::Optional,
-            gift_wrap_mode: GiftWrapMode::Persistent,
-            ..Default::default()
-        },
+        NostrServerTransportConfig::default()
+            .with_encryption_mode(EncryptionMode::Optional)
+            .with_gift_wrap_mode(GiftWrapMode::Persistent),
         Arc::clone(&server_pool_arc) as Arc<dyn RelayPoolTrait>,
     )
     .await
     .unwrap();
 
     let mut client = NostrClientTransport::with_relay_pool(
-        NostrClientTransportConfig {
-            server_pubkey: server_pubkey.to_hex(),
-            encryption_mode: EncryptionMode::Disabled,
-            ..Default::default()
-        },
+        NostrClientTransportConfig::default()
+            .with_server_pubkey(server_pubkey.to_hex())
+            .with_encryption_mode(EncryptionMode::Disabled),
         as_pool(client_pool),
     )
     .await
@@ -2716,21 +2559,16 @@ async fn server_learns_capabilities_from_client_request() {
     let server_pubkey = server_pool.mock_public_key();
 
     let mut server = NostrServerTransport::with_relay_pool(
-        NostrServerTransportConfig {
-            encryption_mode: EncryptionMode::Disabled,
-            ..Default::default()
-        },
+        NostrServerTransportConfig::default().with_encryption_mode(EncryptionMode::Disabled),
         as_pool(server_pool),
     )
     .await
     .unwrap();
 
     let mut client = NostrClientTransport::with_relay_pool(
-        NostrClientTransportConfig {
-            server_pubkey: server_pubkey.to_hex(),
-            encryption_mode: EncryptionMode::Disabled,
-            ..Default::default()
-        },
+        NostrClientTransportConfig::default()
+            .with_server_pubkey(server_pubkey.to_hex())
+            .with_encryption_mode(EncryptionMode::Disabled),
         as_pool(client_pool),
     )
     .await
@@ -2781,25 +2619,18 @@ async fn server_disabled_encryption_omits_encryption_tags() {
     let server_pool_arc = Arc::new(server_pool);
 
     let mut server = NostrServerTransport::with_relay_pool(
-        NostrServerTransportConfig {
-            server_info: Some(ServerInfo {
-                name: Some("NoEncrypt".to_string()),
-                ..Default::default()
-            }),
-            encryption_mode: EncryptionMode::Disabled,
-            ..Default::default()
-        },
+        NostrServerTransportConfig::default()
+            .with_encryption_mode(EncryptionMode::Disabled)
+            .with_server_info(ServerInfo::default().with_name("NoEncrypt".to_string())),
         Arc::clone(&server_pool_arc) as Arc<dyn RelayPoolTrait>,
     )
     .await
     .unwrap();
 
     let mut client = NostrClientTransport::with_relay_pool(
-        NostrClientTransportConfig {
-            server_pubkey: server_pubkey.to_hex(),
-            encryption_mode: EncryptionMode::Disabled,
-            ..Default::default()
-        },
+        NostrClientTransportConfig::default()
+            .with_server_pubkey(server_pubkey.to_hex())
+            .with_encryption_mode(EncryptionMode::Disabled),
         as_pool(client_pool),
     )
     .await
@@ -2866,12 +2697,10 @@ async fn client_disabled_encryption_emits_no_discovery_tags() {
     let server_keys = Keys::generate();
 
     let mut client = NostrClientTransport::with_relay_pool(
-        NostrClientTransportConfig {
-            server_pubkey: server_keys.public_key().to_hex(),
-            encryption_mode: EncryptionMode::Disabled,
-            gift_wrap_mode: GiftWrapMode::Optional,
-            ..Default::default()
-        },
+        NostrClientTransportConfig::default()
+            .with_server_pubkey(server_keys.public_key().to_hex())
+            .with_encryption_mode(EncryptionMode::Disabled)
+            .with_gift_wrap_mode(GiftWrapMode::Optional),
         Arc::clone(&pool) as Arc<dyn RelayPoolTrait>,
     )
     .await
@@ -2915,12 +2744,10 @@ async fn client_second_request_carries_no_discovery_tags() {
     let server_keys = Keys::generate();
 
     let mut client = NostrClientTransport::with_relay_pool(
-        NostrClientTransportConfig {
-            server_pubkey: server_keys.public_key().to_hex(),
-            encryption_mode: EncryptionMode::Disabled,
-            gift_wrap_mode: GiftWrapMode::Optional,
-            ..Default::default()
-        },
+        NostrClientTransportConfig::default()
+            .with_server_pubkey(server_keys.public_key().to_hex())
+            .with_encryption_mode(EncryptionMode::Disabled)
+            .with_gift_wrap_mode(GiftWrapMode::Optional),
         Arc::clone(&pool) as Arc<dyn RelayPoolTrait>,
     )
     .await
@@ -2975,26 +2802,19 @@ async fn client_learns_server_capabilities_from_first_response() {
     let server_pubkey = server_pool.mock_public_key();
 
     let mut server = NostrServerTransport::with_relay_pool(
-        NostrServerTransportConfig {
-            server_info: Some(ServerInfo {
-                name: Some("CapServer".to_string()),
-                ..Default::default()
-            }),
-            encryption_mode: EncryptionMode::Optional,
-            gift_wrap_mode: GiftWrapMode::Optional,
-            ..Default::default()
-        },
+        NostrServerTransportConfig::default()
+            .with_encryption_mode(EncryptionMode::Optional)
+            .with_gift_wrap_mode(GiftWrapMode::Optional)
+            .with_server_info(ServerInfo::default().with_name("CapServer".to_string())),
         as_pool(server_pool),
     )
     .await
     .unwrap();
 
     let mut client = NostrClientTransport::with_relay_pool(
-        NostrClientTransportConfig {
-            server_pubkey: server_pubkey.to_hex(),
-            encryption_mode: EncryptionMode::Disabled,
-            ..Default::default()
-        },
+        NostrClientTransportConfig::default()
+            .with_server_pubkey(server_pubkey.to_hex())
+            .with_encryption_mode(EncryptionMode::Disabled),
         as_pool(client_pool),
     )
     .await
@@ -3067,26 +2887,19 @@ async fn client_or_assigns_capabilities_across_responses() {
     let client_pool = Arc::new(client_pool);
 
     let mut server = NostrServerTransport::with_relay_pool(
-        NostrServerTransportConfig {
-            server_info: Some(ServerInfo {
-                name: Some("PersistentServer".to_string()),
-                ..Default::default()
-            }),
-            encryption_mode: EncryptionMode::Optional,
-            gift_wrap_mode: GiftWrapMode::Persistent,
-            ..Default::default()
-        },
+        NostrServerTransportConfig::default()
+            .with_encryption_mode(EncryptionMode::Optional)
+            .with_gift_wrap_mode(GiftWrapMode::Persistent)
+            .with_server_info(ServerInfo::default().with_name("PersistentServer".to_string())),
         as_pool(server_pool),
     )
     .await
     .unwrap();
 
     let mut client = NostrClientTransport::with_relay_pool(
-        NostrClientTransportConfig {
-            server_pubkey: server_pubkey.to_hex(),
-            encryption_mode: EncryptionMode::Disabled,
-            ..Default::default()
-        },
+        NostrClientTransportConfig::default()
+            .with_server_pubkey(server_pubkey.to_hex())
+            .with_encryption_mode(EncryptionMode::Disabled),
         Arc::clone(&client_pool) as Arc<dyn RelayPoolTrait>,
     )
     .await
@@ -3186,26 +2999,19 @@ async fn client_baseline_event_not_replaced_by_later_responses() {
     let client_pool = Arc::new(client_pool);
 
     let mut server = NostrServerTransport::with_relay_pool(
-        NostrServerTransportConfig {
-            server_info: Some(ServerInfo {
-                name: Some("BaselineServer".to_string()),
-                ..Default::default()
-            }),
-            encryption_mode: EncryptionMode::Optional,
-            gift_wrap_mode: GiftWrapMode::Optional,
-            ..Default::default()
-        },
+        NostrServerTransportConfig::default()
+            .with_encryption_mode(EncryptionMode::Optional)
+            .with_gift_wrap_mode(GiftWrapMode::Optional)
+            .with_server_info(ServerInfo::default().with_name("BaselineServer".to_string())),
         as_pool(server_pool),
     )
     .await
     .unwrap();
 
     let mut client = NostrClientTransport::with_relay_pool(
-        NostrClientTransportConfig {
-            server_pubkey: server_pubkey.to_hex(),
-            encryption_mode: EncryptionMode::Disabled,
-            ..Default::default()
-        },
+        NostrClientTransportConfig::default()
+            .with_server_pubkey(server_pubkey.to_hex())
+            .with_encryption_mode(EncryptionMode::Disabled),
         Arc::clone(&client_pool) as Arc<dyn RelayPoolTrait>,
     )
     .await
@@ -3296,12 +3102,10 @@ async fn client_optional_encryption_emits_discovery_tags() {
     let client_pool = Arc::new(client_pool);
 
     let mut client = NostrClientTransport::with_relay_pool(
-        NostrClientTransportConfig {
-            server_pubkey: server_pubkey.to_hex(),
-            encryption_mode: EncryptionMode::Optional,
-            gift_wrap_mode: GiftWrapMode::Optional,
-            ..Default::default()
-        },
+        NostrClientTransportConfig::default()
+            .with_server_pubkey(server_pubkey.to_hex())
+            .with_encryption_mode(EncryptionMode::Optional)
+            .with_gift_wrap_mode(GiftWrapMode::Optional),
         Arc::clone(&client_pool) as Arc<dyn RelayPoolTrait>,
     )
     .await
@@ -3361,32 +3165,25 @@ async fn multi_client_concurrent_requests_both_get_responses() {
     let server_pubkey = server_pool.mock_public_key();
 
     let mut server = NostrServerTransport::with_relay_pool(
-        NostrServerTransportConfig {
-            encryption_mode: EncryptionMode::Disabled,
-            ..Default::default()
-        },
+        NostrServerTransportConfig::default().with_encryption_mode(EncryptionMode::Disabled),
         as_pool(server_pool),
     )
     .await
     .expect("create server transport");
 
     let mut client_a = NostrClientTransport::with_relay_pool(
-        NostrClientTransportConfig {
-            server_pubkey: server_pubkey.to_hex(),
-            encryption_mode: EncryptionMode::Disabled,
-            ..Default::default()
-        },
+        NostrClientTransportConfig::default()
+            .with_server_pubkey(server_pubkey.to_hex())
+            .with_encryption_mode(EncryptionMode::Disabled),
         as_pool(client_a_pool),
     )
     .await
     .expect("create client A");
 
     let mut client_b = NostrClientTransport::with_relay_pool(
-        NostrClientTransportConfig {
-            server_pubkey: server_pubkey.to_hex(),
-            encryption_mode: EncryptionMode::Disabled,
-            ..Default::default()
-        },
+        NostrClientTransportConfig::default()
+            .with_server_pubkey(server_pubkey.to_hex())
+            .with_encryption_mode(EncryptionMode::Disabled),
         as_pool(client_b_pool),
     )
     .await
@@ -3532,11 +3329,9 @@ async fn client_close_stops_event_loop() {
     let server_pubkey = server_pool.mock_public_key();
 
     let mut client = NostrClientTransport::with_relay_pool(
-        NostrClientTransportConfig {
-            server_pubkey: server_pubkey.to_hex(),
-            encryption_mode: EncryptionMode::Disabled,
-            ..Default::default()
-        },
+        NostrClientTransportConfig::default()
+            .with_server_pubkey(server_pubkey.to_hex())
+            .with_encryption_mode(EncryptionMode::Disabled),
         as_pool(client_pool),
     )
     .await
@@ -3562,10 +3357,7 @@ async fn server_close_stops_event_loop() {
     let (_client_pool, server_pool) = MockRelayPool::create_pair();
 
     let mut server = NostrServerTransport::with_relay_pool(
-        NostrServerTransportConfig {
-            encryption_mode: EncryptionMode::Disabled,
-            ..Default::default()
-        },
+        NostrServerTransportConfig::default().with_encryption_mode(EncryptionMode::Disabled),
         as_pool(server_pool),
     )
     .await

@@ -39,6 +39,10 @@ tokio-util = { version = "0.7", features = ["rt"] }
 default = ["rmcp"]
 rmcp = ["dep:rmcp"]
 
+[[example]]
+name = "rmcp_integration_test"
+required-features = ["rmcp"]
+
 [dev-dependencies]
 tokio-test = "0.4"
 anyhow = "1"

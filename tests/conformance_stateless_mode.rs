@@ -17,15 +17,13 @@ async fn make_stateless_transport() -> (
     let server_keys = signer::generate();
     let client_keys = signer::generate();
 
-    let config = NostrClientTransportConfig {
-        relay_urls: Vec::new(),
-        server_pubkey: server_keys.public_key().to_hex(),
-        encryption_mode: EncryptionMode::Optional,
-        gift_wrap_mode: GiftWrapMode::Optional,
-        is_stateless: true,
-        timeout: Duration::from_secs(1),
-        log_file_path: None,
-    };
+    let config = NostrClientTransportConfig::default()
+        .with_relay_urls(Vec::new())
+        .with_server_pubkey(server_keys.public_key().to_hex())
+        .with_encryption_mode(EncryptionMode::Optional)
+        .with_gift_wrap_mode(GiftWrapMode::Optional)
+        .with_stateless(true)
+        .with_timeout(Duration::from_secs(1));
 
     let mut transport = NostrClientTransport::new(client_keys, config)
         .await
