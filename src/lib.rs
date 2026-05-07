@@ -47,8 +47,6 @@ pub mod transport;
 
 #[cfg(feature = "rmcp")]
 pub mod rmcp_transport;
-mod util;
-
 // Re-export commonly used types
 pub use core::error::{Error, Result};
 pub use core::types::{

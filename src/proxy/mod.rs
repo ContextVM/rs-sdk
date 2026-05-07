@@ -121,7 +121,6 @@ mod tests {
             gift_wrap_mode: GiftWrapMode::Optional,
             is_stateless: true,
             timeout: Duration::from_secs(60),
-            log_file_path: None,
         };
 
         let config = ProxyConfig { nostr_config };

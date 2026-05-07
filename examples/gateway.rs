@@ -3,7 +3,7 @@
 //! This demonstrates how to create a ContextVM gateway that receives
 //! MCP requests over Nostr and responds to them.
 //!
-//! Usage: cargo run --example gateway -- [--log-file <path>]
+//! Usage: cargo run --example gateway
 
 use contextvm_sdk::core::types::*;
 use contextvm_sdk::gateway::{GatewayConfig, NostrMCPGateway};
@@ -12,41 +12,20 @@ use contextvm_sdk::transport::server::NostrServerTransportConfig;
 
 #[tokio::main]
 async fn main() -> contextvm_sdk::Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let mut log_file_path: Option<String> = None;
-
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--log-file" => {
-                index += 1;
-                let Some(path) = args.get(index) else {
-                    panic!("Usage: gateway [--log-file <path>]");
-                };
-                log_file_path = Some(path.clone());
-            }
-            other => {
-                panic!("Unknown argument: {other}. Usage: gateway [--log-file <path>]");
-            }
-        }
-        index += 1;
-    }
+    tracing_subscriber::fmt::init();
 
     // Generate ephemeral keys for this session
     let keys = signer::generate();
     println!("Server pubkey: {}", keys.public_key().to_hex());
 
     // Configure the gateway
-    let mut nostr_config = NostrServerTransportConfig::default()
+    let nostr_config = NostrServerTransportConfig::default()
         .with_server_info(
             ServerInfo::default()
                 .with_name("Echo Server")
                 .with_about("A simple echo tool exposed via ContextVM"),
         )
         .with_announced_server(true);
-    if let Some(path) = log_file_path {
-        nostr_config = nostr_config.with_log_file_path(path);
-    }
     let config = GatewayConfig::new(nostr_config);
 
     let mut gateway = NostrMCPGateway::new(keys, config).await?;
