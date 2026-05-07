@@ -83,18 +83,16 @@ async fn main() -> Result<()> {
 
     let transport = NostrServerTransport::new(
         signer,
-        NostrServerTransportConfig {
-            relay_urls: vec![RELAY_URL.to_string()],
-            encryption_mode: EncryptionMode::Optional,
-            gift_wrap_mode: GiftWrapMode::Optional,
-            is_announced_server: false,
-            server_info: Some(ServerInfo {
-                name: Some("contextvm-native-echo".to_string()),
-                about: Some("Native rmcp echo server example".to_string()),
-                ..Default::default()
-            }),
-            ..Default::default()
-        },
+        NostrServerTransportConfig::default()
+            .with_relay_urls(vec![RELAY_URL.to_string()])
+            .with_encryption_mode(EncryptionMode::Optional)
+            .with_gift_wrap_mode(GiftWrapMode::Optional)
+            .with_announced_server(false)
+            .with_server_info(
+                ServerInfo::default()
+                    .with_name("contextvm-native-echo".to_string())
+                    .with_about("Native rmcp echo server example".to_string()),
+            ),
     )
     .await?;
 

@@ -40,13 +40,11 @@ async fn main() -> Result<()> {
 
     let transport = NostrClientTransport::new(
         signer,
-        NostrClientTransportConfig {
-            relay_urls: vec![RELAY_URL.to_string()],
-            server_pubkey,
-            encryption_mode: EncryptionMode::Optional,
-            gift_wrap_mode: GiftWrapMode::Optional,
-            ..Default::default()
-        },
+        NostrClientTransportConfig::default()
+            .with_relay_urls(vec![RELAY_URL.to_string()])
+            .with_server_pubkey(server_pubkey)
+            .with_encryption_mode(EncryptionMode::Optional)
+            .with_gift_wrap_mode(GiftWrapMode::Optional),
     )
     .await?;
 
