@@ -15,6 +15,7 @@ use super::convert::{
 };
 
 const LOG_TARGET: &str = "contextvm_sdk::rmcp_transport::worker";
+const STATELESS_SYNTHETIC_EVENT_ID: &str = "contextvm-stateless-init";
 
 /// rmcp server worker wrapper for ContextVM Nostr server transport.
 ///
@@ -96,18 +97,49 @@ impl Worker for NostrServerWorker {
                         ..
                     } = incoming;
 
-                    // Rewrite the JSON-RPC request ID to the Nostr event_id.
-                    // Event IDs are globally unique (SHA-256), so no collision
-                    // across clients.  The transport's event-route store maps
-                    // event_id → (client_pubkey, original_request_id) and
-                    // restores the original ID in `send_response`.
-                    if let JsonRpcMessage::Request(ref mut req) = message {
-                        req.id = serde_json::json!(event_id);
+                    let is_synthetic_initialize = matches!(
+                        &message,
+                        JsonRpcMessage::Request(req)
+                            if req.method == "initialize"
+                                && req.id == serde_json::json!(STATELESS_SYNTHETIC_EVENT_ID)
+                    );
+
+                    // Rewrite real wire requests to the Nostr event_id.
+                    // Synthetic stateless bootstrap messages must retain their
+                    // sentinel ID so their responses can be dropped before they
+                    // ever touch transport correlation.
+                    if !is_synthetic_initialize {
+                        if let JsonRpcMessage::Request(ref mut req) = message {
+                            req.id = serde_json::json!(event_id);
+                        }
                     }
 
                     if let Some(rmcp_msg) = internal_to_rmcp_server_rx(&message) {
                         if let Err(reason) = context.send_to_handler(rmcp_msg).await {
                             break reason;
+                        }
+
+                        if is_synthetic_initialize {
+                            let initialized = JsonRpcMessage::Notification(
+                                crate::core::types::JsonRpcNotification {
+                                    jsonrpc: "2.0".to_string(),
+                                    method: "notifications/initialized".to_string(),
+                                    params: None,
+                                },
+                            );
+
+                            let Some(rmcp_initialized) = internal_to_rmcp_server_rx(&initialized) else {
+                                break WorkerQuitReason::fatal(
+                                    Self::Error::Validation(
+                                        "failed converting synthetic initialized notification to rmcp format".to_string(),
+                                    ),
+                                    "converting synthetic initialized notification",
+                                );
+                            };
+
+                            if let Err(reason) = context.send_to_handler(rmcp_initialized).await {
+                                break reason;
+                            }
                         }
                     } else {
                         tracing::warn!(
@@ -272,6 +304,15 @@ impl NostrServerWorker {
                     )
                 })?;
 
+                if event_id == STATELESS_SYNTHETIC_EVENT_ID {
+                    tracing::debug!(
+                        target: LOG_TARGET,
+                        event_id = %event_id,
+                        "Dropping synthetic initialize response before wire transport"
+                    );
+                    return Ok(());
+                }
+
                 self.transport
                     .send_response(&event_id, JsonRpcMessage::Response(resp))
                     .await
@@ -282,6 +323,15 @@ impl NostrServerWorker {
                         "rmcp server error response id is not a string event_id".to_string(),
                     )
                 })?;
+
+                if event_id == STATELESS_SYNTHETIC_EVENT_ID {
+                    tracing::debug!(
+                        target: LOG_TARGET,
+                        event_id = %event_id,
+                        "Dropping synthetic initialize error before wire transport"
+                    );
+                    return Ok(());
+                }
 
                 self.transport
                     .send_response(&event_id, JsonRpcMessage::ErrorResponse(resp))
@@ -295,6 +345,90 @@ impl NostrServerWorker {
                 let message = JsonRpcMessage::Request(request);
                 self.transport.broadcast_notification(&message).await
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::types::{JsonRpcRequest, JsonRpcResponse};
+
+    #[test]
+    fn test_synthetic_initialize_keeps_sentinel_id() {
+        let mut message = JsonRpcMessage::Request(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: serde_json::json!(STATELESS_SYNTHETIC_EVENT_ID),
+            method: "initialize".to_string(),
+            params: Some(serde_json::json!({
+                "protocolVersion": crate::core::constants::mcp_protocol_version(),
+            })),
+        });
+
+        let is_synthetic_initialize = matches!(
+            &message,
+            JsonRpcMessage::Request(req)
+                if req.method == "initialize"
+                    && req.id == serde_json::json!(STATELESS_SYNTHETIC_EVENT_ID)
+        );
+
+        if !is_synthetic_initialize {
+            if let JsonRpcMessage::Request(ref mut req) = message {
+                req.id = serde_json::json!("real-event-id");
+            }
+        }
+
+        match message {
+            JsonRpcMessage::Request(req) => {
+                assert_eq!(req.id, serde_json::json!(STATELESS_SYNTHETIC_EVENT_ID));
+            }
+            other => panic!("expected request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_real_request_is_rewritten_to_event_id() {
+        let mut message = JsonRpcMessage::Request(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: serde_json::json!(1),
+            method: "tools/list".to_string(),
+            params: Some(serde_json::json!({})),
+        });
+
+        let is_synthetic_initialize = matches!(
+            &message,
+            JsonRpcMessage::Request(req)
+                if req.method == "initialize"
+                    && req.id == serde_json::json!(STATELESS_SYNTHETIC_EVENT_ID)
+        );
+
+        if !is_synthetic_initialize {
+            if let JsonRpcMessage::Request(ref mut req) = message {
+                req.id = serde_json::json!("real-event-id");
+            }
+        }
+
+        match message {
+            JsonRpcMessage::Request(req) => {
+                assert_eq!(req.id, serde_json::json!("real-event-id"));
+            }
+            other => panic!("expected request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_synthetic_initialize_response_uses_sentinel_for_drop() {
+        let message = JsonRpcMessage::Response(JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: serde_json::json!(STATELESS_SYNTHETIC_EVENT_ID),
+            result: serde_json::json!({}),
+        });
+
+        match message {
+            JsonRpcMessage::Response(resp) => {
+                assert_eq!(resp.id.as_str(), Some(STATELESS_SYNTHETIC_EVENT_ID));
+            }
+            other => panic!("expected response, got {other:?}"),
         }
     }
 }

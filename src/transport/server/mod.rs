@@ -919,6 +919,54 @@ impl NostrServerTransport {
         })
     }
 
+    #[cfg(feature = "rmcp")]
+    fn synthetic_initialize_message() -> JsonRpcMessage {
+        JsonRpcMessage::Request(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: serde_json::json!("contextvm-stateless-init"),
+            method: "initialize".to_string(),
+            params: Some(serde_json::json!({
+                "protocolVersion": crate::core::constants::mcp_protocol_version(),
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "contextvm-stateless-client",
+                    "version": "0.1.0"
+                }
+            })),
+        })
+    }
+
+    #[cfg(not(feature = "rmcp"))]
+    fn synthetic_initialize_message() -> JsonRpcMessage {
+        JsonRpcMessage::Request(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: serde_json::json!("contextvm-stateless-init"),
+            method: "initialize".to_string(),
+            params: Some(serde_json::json!({
+                "protocolVersion": crate::core::constants::mcp_protocol_version(),
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "contextvm-stateless-client",
+                    "version": "0.1.0"
+                }
+            })),
+        })
+    }
+
+    fn should_inject_synthetic_initialize(
+        session: &ClientSession,
+        mcp_msg: &JsonRpcMessage,
+    ) -> bool {
+        if session.is_initialized {
+            return false;
+        }
+
+        matches!(
+            mcp_msg,
+            JsonRpcMessage::Request(req) if req.method != "initialize"
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn event_loop(
         relay_pool: Arc<dyn RelayPoolTrait>,
@@ -1225,6 +1273,12 @@ impl NostrServerTransport {
                 session.supports_oversized_transfer |=
                     oversized_enabled && discovered.supports_oversized_transfer;
 
+                let should_inject_initialize =
+                    Self::should_inject_synthetic_initialize(session, &mcp_msg);
+                if should_inject_initialize {
+                    session.is_initialized = true;
+                }
+
                 // Track request for correlation
                 if let JsonRpcMessage::Request(ref req) = mcp_msg {
                     let original_id = req.id.clone();
@@ -1282,6 +1336,16 @@ impl NostrServerTransport {
                             session.is_initialized = true;
                         }
                     }
+                }
+
+                // Forward a synthetic initialize first for stateless first-request sessions.
+                if should_inject_initialize {
+                    let _ = tx.send(IncomingRequest {
+                        message: Self::synthetic_initialize_message(),
+                        client_pubkey: sender_pubkey.clone(),
+                        event_id: event_id.clone(),
+                        is_encrypted,
+                    });
                 }
 
                 // Forward to consumer
@@ -1560,6 +1624,76 @@ mod tests {
             "notifications/initialized",
             None
         ));
+    }
+
+    #[test]
+    fn test_should_inject_synthetic_initialize_for_first_non_initialize_request() {
+        let session = ClientSession::new(false);
+        let message = JsonRpcMessage::Request(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: serde_json::json!(1),
+            method: "tools/list".to_string(),
+            params: Some(serde_json::json!({})),
+        });
+
+        assert!(NostrServerTransport::should_inject_synthetic_initialize(
+            &session, &message,
+        ));
+    }
+
+    #[test]
+    fn test_should_not_inject_synthetic_initialize_for_real_initialize_request() {
+        let session = ClientSession::new(false);
+        let message = JsonRpcMessage::Request(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: serde_json::json!(1),
+            method: "initialize".to_string(),
+            params: Some(serde_json::json!({})),
+        });
+
+        assert!(!NostrServerTransport::should_inject_synthetic_initialize(
+            &session, &message,
+        ));
+    }
+
+    #[test]
+    fn test_should_not_inject_synthetic_initialize_after_session_initialized() {
+        let mut session = ClientSession::new(false);
+        session.is_initialized = true;
+        let message = JsonRpcMessage::Request(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: serde_json::json!(1),
+            method: "tools/list".to_string(),
+            params: Some(serde_json::json!({})),
+        });
+
+        assert!(!NostrServerTransport::should_inject_synthetic_initialize(
+            &session, &message,
+        ));
+    }
+
+    #[test]
+    fn test_synthetic_initialize_message_shape() {
+        let message = NostrServerTransport::synthetic_initialize_message();
+        let JsonRpcMessage::Request(request) = message else {
+            panic!("expected request");
+        };
+
+        assert_eq!(request.method, "initialize");
+        assert_eq!(request.id, serde_json::json!("contextvm-stateless-init"));
+
+        let params = request.params.expect("initialize params");
+        assert_eq!(
+            params.get("protocolVersion").and_then(|v| v.as_str()),
+            Some(crate::core::constants::mcp_protocol_version())
+        );
+        assert_eq!(
+            params
+                .get("clientInfo")
+                .and_then(|v| v.get("name"))
+                .and_then(|v| v.as_str()),
+            Some("contextvm-stateless-client")
+        );
     }
 
     #[test]

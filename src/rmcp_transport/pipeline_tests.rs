@@ -14,18 +14,87 @@
 
 #[cfg(all(test, feature = "rmcp"))]
 mod tests {
+    use std::sync::Arc;
+
     use rmcp::model::{
-        ClientJsonRpcMessage, ClientResult, RequestId, ServerJsonRpcMessage, ServerResult,
+        CallToolRequestParams, CallToolResult, ClientJsonRpcMessage, ClientResult, ErrorData,
+        Implementation, ProtocolVersion, RequestId, ServerCapabilities, ServerInfo,
+        ServerJsonRpcMessage, ServerResult,
+    };
+    use rmcp::{
+        handler::server::{router::tool::ToolRouter, wrapper::Parameters},
+        schemars, tool, tool_handler, tool_router, ClientHandler, ServerHandler, ServiceExt,
     };
 
     use crate::core::serializers;
+    use crate::core::types::{EncryptionMode, GiftWrapMode};
     use crate::core::types::{
         JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
     };
+    use crate::relay::mock::MockRelayPool;
+    use crate::relay::RelayPoolTrait;
     use crate::rmcp_transport::convert::{
         internal_to_rmcp_client_rx, internal_to_rmcp_server_rx, rmcp_client_tx_to_internal,
         rmcp_server_tx_to_internal,
     };
+    use crate::transport::{
+        client::{NostrClientTransport, NostrClientTransportConfig},
+        server::{NostrServerTransport, NostrServerTransportConfig},
+    };
+
+    #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+    struct EchoParams {
+        message: String,
+    }
+
+    #[derive(Clone)]
+    struct StatelessTestServer {
+        tool_router: ToolRouter<Self>,
+    }
+
+    impl StatelessTestServer {
+        fn new() -> Self {
+            Self {
+                tool_router: Self::tool_router(),
+            }
+        }
+    }
+
+    #[tool_router]
+    impl StatelessTestServer {
+        #[tool(description = "Echo a message back unchanged")]
+        async fn echo(
+            &self,
+            Parameters(EchoParams { message }): Parameters<EchoParams>,
+        ) -> Result<CallToolResult, ErrorData> {
+            Ok(CallToolResult::success(vec![rmcp::model::Content::text(
+                format!("Echo: {message}"),
+            )]))
+        }
+    }
+
+    #[tool_handler]
+    impl ServerHandler for StatelessTestServer {
+        fn get_info(&self) -> ServerInfo {
+            ServerInfo {
+                protocol_version: ProtocolVersion::LATEST,
+                capabilities: ServerCapabilities::builder().enable_tools().build(),
+                server_info: Implementation {
+                    name: "stateless-test-server".to_string(),
+                    title: Some("Stateless Test Server".to_string()),
+                    version: "0.1.0".to_string(),
+                    description: Some("Stateless rmcp regression test server".to_string()),
+                    icons: None,
+                    website_url: None,
+                },
+                instructions: Some("Use the echo tool".to_string()),
+            }
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct StatelessTestClient;
+    impl ClientHandler for StatelessTestClient {}
 
     // ── Layer 1: Nostr event content → JsonRpcMessage ──────────────────────
 
@@ -322,6 +391,93 @@ mod tests {
             }
             other => panic!("expected ErrorResponse, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn stateless_rmcp_roundtrip_over_mock_relay_preserves_correlation() {
+        let (server_pool, client_pool) = MockRelayPool::create_pair();
+        let server_pubkey = server_pool
+            .public_key()
+            .await
+            .expect("server mock relay pubkey")
+            .to_hex();
+
+        let server_transport = NostrServerTransport::with_relay_pool(
+            NostrServerTransportConfig::default()
+                .with_relay_urls(vec!["mock://relay".to_string()])
+                .with_encryption_mode(EncryptionMode::Disabled)
+                .with_gift_wrap_mode(GiftWrapMode::Optional),
+            Arc::new(server_pool),
+        )
+        .await
+        .expect("server transport");
+
+        let server_task = tokio::spawn(async move {
+            StatelessTestServer::new()
+                .serve(server_transport)
+                .await
+                .expect("server should start")
+                .waiting()
+                .await
+                .expect("server should keep running until aborted");
+        });
+
+        let client_transport = NostrClientTransport::with_relay_pool(
+            NostrClientTransportConfig::default()
+                .with_relay_urls(vec!["mock://relay".to_string()])
+                .with_server_pubkey(server_pubkey)
+                .with_encryption_mode(EncryptionMode::Disabled)
+                .with_gift_wrap_mode(GiftWrapMode::Optional)
+                .with_stateless(true),
+            Arc::new(client_pool),
+        )
+        .await
+        .expect("client transport");
+
+        let client = StatelessTestClient
+            .serve(client_transport)
+            .await
+            .expect("stateless client should start");
+
+        let peer_info = client
+            .peer_info()
+            .expect("peer info from emulated initialize");
+        assert_eq!(peer_info.server_info.name, "Emulated-Stateless-Server");
+
+        let tools = client
+            .list_all_tools()
+            .await
+            .expect("tools/list should succeed");
+        assert!(
+            tools.iter().any(|tool| tool.name == "echo"),
+            "expected echo tool from server"
+        );
+
+        let result = client
+            .call_tool(CallToolRequestParams {
+                name: "echo".into(),
+                arguments: serde_json::from_value(serde_json::json!({
+                    "message": "hello from stateless test"
+                }))
+                .ok(),
+                meta: None,
+                task: None,
+            })
+            .await
+            .expect("tools/call should succeed");
+
+        let echoed = result
+            .content
+            .iter()
+            .find_map(|content| match &content.raw {
+                rmcp::model::RawContent::Text(text) => Some(text.text.clone()),
+                _ => None,
+            })
+            .expect("echo response text");
+        assert_eq!(echoed, "Echo: hello from stateless test");
+
+        client.cancel().await.expect("client cancel");
+        server_task.abort();
     }
 
     // ── Helper ──────────────────────────────────────────────────────────────
