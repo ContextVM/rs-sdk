@@ -45,7 +45,7 @@ impl ClientCorrelationStore {
     pub fn with_max_pending(max_pending: usize) -> Self {
         Self {
             pending_requests: Arc::new(RwLock::new(LruCache::new(
-                NonZeroUsize::new(max_pending).expect("max_pending must be non-zero"),
+                NonZeroUsize::new(max_pending).unwrap_or(NonZeroUsize::new(1).unwrap()),
             ))),
         }
     }

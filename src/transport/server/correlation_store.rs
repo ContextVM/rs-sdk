@@ -39,7 +39,7 @@ struct Inner {
 impl Inner {
     fn new(max_routes: usize) -> Self {
         let routes =
-            LruCache::new(NonZeroUsize::new(max_routes).expect("max_routes must be non-zero"));
+            LruCache::new(NonZeroUsize::new(max_routes).unwrap_or(NonZeroUsize::new(1).unwrap()));
         Self {
             routes,
             progress_token_to_event: HashMap::new(),

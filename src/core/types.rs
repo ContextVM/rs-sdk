@@ -64,6 +64,7 @@ impl GiftWrapMode {
 /// Published as the content of a replaceable Nostr event so that clients
 /// can discover the server's identity and metadata.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ServerInfo {
     /// Human-readable server name.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -80,6 +81,34 @@ pub struct ServerInfo {
     /// Short description of the server's purpose.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub about: Option<String>,
+}
+
+impl ServerInfo {
+    /// Set the server name.
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+    /// Set the server version.
+    pub fn with_version(mut self, version: impl Into<String>) -> Self {
+        self.version = Some(version.into());
+        self
+    }
+    /// Set the server picture URL.
+    pub fn with_picture(mut self, picture: impl Into<String>) -> Self {
+        self.picture = Some(picture.into());
+        self
+    }
+    /// Set the server website URL.
+    pub fn with_website(mut self, website: impl Into<String>) -> Self {
+        self.website = Some(website.into());
+        self
+    }
+    /// Set the server description.
+    pub fn with_about(mut self, about: impl Into<String>) -> Self {
+        self.about = Some(about.into());
+        self
+    }
 }
 
 // ── Client session ──────────────────────────────────────────────────

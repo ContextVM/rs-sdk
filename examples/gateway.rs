@@ -37,19 +37,17 @@ async fn main() -> contextvm_sdk::Result<()> {
     println!("Server pubkey: {}", keys.public_key().to_hex());
 
     // Configure the gateway
-    let config = GatewayConfig {
-        nostr_config: NostrServerTransportConfig {
-            relay_urls: vec!["wss://relay.damus.io".to_string()],
-            server_info: Some(ServerInfo {
-                name: Some("Echo Server".to_string()),
-                about: Some("A simple echo tool exposed via ContextVM".to_string()),
-                ..Default::default()
-            }),
-            is_announced_server: true,
-            log_file_path,
-            ..Default::default()
-        },
-    };
+    let mut nostr_config = NostrServerTransportConfig::default()
+        .with_server_info(
+            ServerInfo::default()
+                .with_name("Echo Server")
+                .with_about("A simple echo tool exposed via ContextVM"),
+        )
+        .with_announced_server(true);
+    if let Some(path) = log_file_path {
+        nostr_config = nostr_config.with_log_file_path(path);
+    }
+    let config = GatewayConfig::new(nostr_config);
 
     let mut gateway = NostrMCPGateway::new(keys, config).await?;
     let mut rx = gateway.start().await?;

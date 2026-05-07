@@ -53,7 +53,7 @@ impl SessionStore {
     pub fn with_capacity(max_sessions: usize) -> Self {
         Self {
             sessions: Arc::new(RwLock::new(LruCache::new(
-                NonZeroUsize::new(max_sessions).expect("max_sessions must be > 0"),
+                NonZeroUsize::new(max_sessions).unwrap_or(NonZeroUsize::new(1).unwrap()),
             ))),
             on_evicted: None,
         }
