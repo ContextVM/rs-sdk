@@ -26,8 +26,6 @@ use crate::relay::{RelayPool, RelayPoolTrait};
 use crate::transport::base::BaseTransport;
 use crate::transport::discovery_tags::{parse_discovered_peer_capabilities, PeerCapabilities};
 
-use crate::util::tracing_setup;
-
 const LOG_TARGET: &str = "contextvm_sdk::transport::client";
 
 /// Configuration for the client transport.
@@ -49,8 +47,6 @@ pub struct NostrClientTransportConfig {
     /// This prevents leaks -- rmcp owns actual request timeout and cancellation.
     /// Keep this value above your rmcp request timeout to avoid premature cleanup.
     pub timeout: Duration,
-    /// Optional log file path. Logs always go to stdout and are also appended here when set.
-    pub log_file_path: Option<String>,
 }
 
 impl Default for NostrClientTransportConfig {
@@ -62,7 +58,6 @@ impl Default for NostrClientTransportConfig {
             gift_wrap_mode: GiftWrapMode::Optional,
             is_stateless: false,
             timeout: Duration::from_secs(30),
-            log_file_path: None,
         }
     }
 }
@@ -96,11 +91,6 @@ impl NostrClientTransportConfig {
     /// Set the correlation-retention TTL.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
-        self
-    }
-    /// Set the log file path.
-    pub fn with_log_file_path(mut self, path: impl Into<String>) -> Self {
-        self.log_file_path = Some(path.into());
         self
     }
 }
@@ -139,8 +129,6 @@ impl NostrClientTransport {
     where
         T: IntoNostrSigner,
     {
-        tracing_setup::init_tracer(config.log_file_path.as_deref())?;
-
         let server_pubkey = PublicKey::from_hex(&config.server_pubkey).map_err(|error| {
             tracing::error!(
                 target: LOG_TARGET,
@@ -198,8 +186,6 @@ impl NostrClientTransport {
         config: NostrClientTransportConfig,
         relay_pool: Arc<dyn RelayPoolTrait>,
     ) -> Result<Self> {
-        tracing_setup::init_tracer(config.log_file_path.as_deref())?;
-
         let server_pubkey = PublicKey::from_hex(&config.server_pubkey).map_err(|error| {
             tracing::error!(
                 target: LOG_TARGET,
@@ -870,7 +856,6 @@ mod tests {
         assert_eq!(config.gift_wrap_mode, GiftWrapMode::Optional);
         assert!(!config.is_stateless);
         assert_eq!(config.timeout, Duration::from_secs(30));
-        assert!(config.log_file_path.is_none());
     }
 
     #[test]

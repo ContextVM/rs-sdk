@@ -29,8 +29,6 @@ use crate::relay::{RelayPool, RelayPoolTrait};
 use crate::transport::base::BaseTransport;
 use crate::transport::discovery_tags::learn_peer_capabilities;
 
-use crate::util::tracing_setup;
-
 const LOG_TARGET: &str = "contextvm_sdk::transport::server";
 
 /// Configuration for the server transport.
@@ -62,8 +60,6 @@ pub struct NostrServerTransportConfig {
     /// This prevents leaks -- rmcp owns actual request timeout and cancellation.
     /// Keep this value above your rmcp request timeout to avoid premature cleanup.
     pub request_timeout: Duration,
-    /// Optional log file path. Logs always go to stdout and are also appended here when set.
-    pub log_file_path: Option<String>,
 }
 
 impl Default for NostrServerTransportConfig {
@@ -80,7 +76,6 @@ impl Default for NostrServerTransportConfig {
             cleanup_interval: Duration::from_secs(60),
             session_timeout: Duration::from_secs(300),
             request_timeout: Duration::from_secs(60),
-            log_file_path: None,
         }
     }
 }
@@ -170,11 +165,6 @@ impl NostrServerTransportConfig {
         self.request_timeout = timeout;
         self
     }
-    /// Set the log file path.
-    pub fn with_log_file_path(mut self, path: impl Into<String>) -> Self {
-        self.log_file_path = Some(path.into());
-        self
-    }
 }
 
 /// An incoming MCP request with metadata for routing the response.
@@ -197,8 +187,6 @@ impl NostrServerTransport {
     where
         T: IntoNostrSigner,
     {
-        tracing_setup::init_tracer(config.log_file_path.as_deref())?;
-
         let relay_pool: Arc<dyn RelayPoolTrait> =
             Arc::new(RelayPool::new(signer).await.map_err(|error| {
                 tracing::error!(
@@ -246,8 +234,6 @@ impl NostrServerTransport {
         config: NostrServerTransportConfig,
         relay_pool: Arc<dyn RelayPoolTrait>,
     ) -> Result<Self> {
-        tracing_setup::init_tracer(config.log_file_path.as_deref())?;
-
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let seen_gift_wrap_ids = Arc::new(Mutex::new(LruCache::new(
             NonZeroUsize::new(DEFAULT_LRU_SIZE).expect("DEFAULT_LRU_SIZE must be non-zero"),
@@ -1672,7 +1658,6 @@ mod tests {
         assert_eq!(config.session_timeout, Duration::from_secs(300));
         assert_eq!(config.request_timeout, Duration::from_secs(60));
         assert!(config.server_info.is_none());
-        assert!(config.log_file_path.is_none());
     }
 
     // ── CEP-19 helper logic ──────────────────────────────────────
