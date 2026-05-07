@@ -55,6 +55,7 @@ pub use core::types::{
     ServerInfo,
 };
 pub use discovery::ServerAnnouncement;
+#[cfg(any(test, feature = "test-utils"))]
 pub use relay::mock::MockRelayPool;
 pub use relay::{RelayPool, RelayPoolTrait};
 pub use transport::client::{

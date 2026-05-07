@@ -32,6 +32,7 @@ use crate::transport::discovery_tags::learn_peer_capabilities;
 const LOG_TARGET: &str = "contextvm_sdk::transport::server";
 
 /// Configuration for the server transport.
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct NostrServerTransportConfig {
     /// Relay URLs to connect to.

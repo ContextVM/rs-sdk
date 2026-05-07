@@ -2,7 +2,9 @@
 //!
 //! Wraps nostr-sdk's Client for relay connection, event publishing, and subscription.
 
+#[cfg(any(test, feature = "test-utils"))]
 pub mod mock;
+#[cfg(any(test, feature = "test-utils"))]
 pub use mock::MockRelayPool;
 
 use async_trait::async_trait;

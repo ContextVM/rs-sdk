@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.1] - 2026-05-08
+
+### Fixed
+
+- Corrected crates.io metadata (repository URL, keywords, categories, homepage, documentation)
+
 ## [0.1.0] - 2026-05-07
 
 ### Added

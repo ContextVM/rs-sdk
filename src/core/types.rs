@@ -114,7 +114,7 @@ impl ServerInfo {
 // ── Client session ──────────────────────────────────────────────────
 
 /// Client session state tracked by the server transport.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ClientSession {
     /// Whether the client has completed MCP initialization.
     pub is_initialized: bool,
@@ -294,7 +294,7 @@ impl JsonRpcMessage {
 // ── Capability exclusion ────────────────────────────────────────────
 
 /// A capability exclusion pattern that bypasses pubkey whitelisting.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CapabilityExclusion {
     /// The JSON-RPC method to exclude (e.g., "tools/call", "tools/list").
     pub method: String,

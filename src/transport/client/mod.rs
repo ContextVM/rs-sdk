@@ -29,6 +29,7 @@ use crate::transport::discovery_tags::{parse_discovered_peer_capabilities, PeerC
 const LOG_TARGET: &str = "contextvm_sdk::transport::client";
 
 /// Configuration for the client transport.
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct NostrClientTransportConfig {
     /// Relay URLs to connect to.

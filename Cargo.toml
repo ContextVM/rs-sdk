@@ -1,6 +1,6 @@
 [package]
 name = "contextvm-sdk"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.70"
 description = "Rust SDK for the ContextVM protocol — MCP over Nostr"
@@ -43,6 +43,8 @@ tokio-util = { version = "0.7", features = ["rt"] }
 # Enable rmcp by default while keeping legacy APIs available.
 default = ["rmcp"]
 rmcp = ["dep:rmcp"]
+## Exposes `MockRelayPool` for use in downstream integration tests.
+test-utils = []
 
 [[example]]
 name = "rmcp_integration_test"
@@ -55,6 +57,10 @@ required-features = ["rmcp"]
 [[example]]
 name = "native_echo_client"
 required-features = ["rmcp"]
+
+[[test]]
+name = "transport_integration"
+required-features = ["test-utils"]
 
 [dev-dependencies]
 tokio-test = "0.4"

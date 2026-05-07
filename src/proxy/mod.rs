@@ -8,6 +8,7 @@ use crate::core::types::JsonRpcMessage;
 use crate::transport::client::{NostrClientTransport, NostrClientTransportConfig};
 
 /// Configuration for the proxy.
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct ProxyConfig {
     /// Nostr client transport configuration.

@@ -8,6 +8,7 @@ use crate::core::types::JsonRpcMessage;
 use crate::transport::server::{IncomingRequest, NostrServerTransport, NostrServerTransportConfig};
 
 /// Configuration for the gateway.
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct GatewayConfig {
     /// Nostr server transport configuration.

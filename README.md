@@ -53,7 +53,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-contextvm-sdk = { git = "https://github.com/k0sti/rust-contextvm-sdk" }
+contextvm-sdk = { git = "https://github.com/ContextVM/rs-sdk" }
 ```
 
 Or clone and use as a path dependency:
