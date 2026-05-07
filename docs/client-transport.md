@@ -5,16 +5,34 @@ Use this path when you are building a native ContextVM client in Rust.
 The recommended architecture is:
 
 - define an `rmcp` client handler or use a lightweight client info object
-- create a [`NostrClientTransport`](src/transport/client/mod.rs:69)
-- attach the transport with `rmcp`'s [`ServiceExt`](rust-sdk/crates/rmcp/src/lib.rs:20)
+- create a `NostrClientTransport`
+- attach the transport with `rmcp`'s `ServiceExt`
 
-This follows the same pattern as `rmcp` client examples such as [`rust-sdk/examples/clients/src/streamable_http.rs`](rust-sdk/examples/clients/src/streamable_http.rs), except the transport is ContextVM over Nostr instead of HTTP.
+This follows the same pattern as the standard `rmcp` client examples, except the transport is ContextVM over Nostr instead of HTTP.
 
 ## The high-level shape
 
-In `rmcp`, a client is typically started with `client_info.serve(transport)`, as shown in [`rust-sdk/examples/clients/src/streamable_http.rs:24`](rust-sdk/examples/clients/src/streamable_http.rs:24).
+In `rmcp`, a client is typically started with `client_info.serve(transport)`.
 
-For ContextVM, the transport becomes [`NostrClientTransport`](src/transport/client/mod.rs:69), then you convert it into an rmcp-compatible adapter with [`into_rmcp_transport()`](src/rmcp_transport/transport.rs:40).
+For ContextVM, the transport becomes `NostrClientTransport`. In the current SDK API, you pass that transport directly to `ServiceExt`; there is no extra adapter step in the public workflow.
+
+## Loading an existing private key
+
+The signer helper is not limited to ephemeral keys. If you already have a private key, load it with `from_sk()`.
+
+It accepts either:
+
+- a 64-character hex secret key
+- an `nsec` bech32 secret key
+
+```rust
+use contextvm_sdk::signer;
+
+let signer = signer::from_sk("<hex-or-nsec-private-key>")?;
+println!("client pubkey: {}", signer.public_key().to_hex());
+```
+
+Use `generate()` only when you explicitly want a new random identity for a short-lived client or test flow.
 
 ## Example
 
@@ -56,9 +74,7 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
 
-    let client = DemoClient
-        .serve(transport.into_rmcp_transport())
-        .await?;
+    let client = DemoClient.serve(transport).await?;
 
     let server_info = client.peer_info();
     println!("Connected to server: {server_info:#?}");
@@ -79,22 +95,22 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-This is the ContextVM equivalent of the workflow in [`rust-sdk/examples/clients/src/streamable_http.rs:19`](rust-sdk/examples/clients/src/streamable_http.rs:19) through [`rust-sdk/examples/clients/src/streamable_http.rs:43`](rust-sdk/examples/clients/src/streamable_http.rs:43), using the direct adapter [`NostrClientTransport::into_rmcp_transport()`](src/rmcp_transport/transport.rs:40).
+This is the ContextVM equivalent of the usual `rmcp` client workflow, but using `NostrClientTransport` directly.
 
 ## What the transport adds
 
-[`NostrClientTransport`](src/transport/client/mod.rs:69) adds ContextVM-specific client behavior on top of `rmcp` client semantics:
+`NostrClientTransport` adds ContextVM-specific client behavior on top of `rmcp` client semantics:
 
-- relay connection management via [`NostrClientTransport::new()`](src/transport/client/mod.rs:94)
-- target server selection through `server_pubkey` in [`NostrClientTransportConfig`](src/transport/client/mod.rs:33)
-- request/response correlation via [`send()`](src/transport/client/mod.rs:283)
-- server capability learning via [`learn_server_discovery()`](src/transport/client/mod.rs:477)
-- optional stateless behavior via `is_stateless` in [`NostrClientTransportConfig`](src/transport/client/mod.rs:33)
-- encrypted message reception and gift-wrap deduplication in [`handle_notification()`](src/transport/client/mod.rs:530)
+- relay connection management via `NostrClientTransport::new()`
+- target server selection through `server_pubkey` in `NostrClientTransportConfig`
+- request and response correlation via `send()`
+- server capability learning from discovery tags
+- optional stateless behavior via `is_stateless` in `NostrClientTransportConfig`
+- encrypted message reception and gift-wrap deduplication during notification handling
 
 ## Configuration fields that matter first
 
-Start with these fields in [`NostrClientTransportConfig`](src/transport/client/mod.rs:33):
+Start with these fields in `NostrClientTransportConfig`:
 
 - `relay_urls`: relays the client uses to reach the server
 - `server_pubkey`: the target server public key
@@ -107,11 +123,11 @@ Start with these fields in [`NostrClientTransportConfig`](src/transport/client/m
 
 Use this page's approach when you are writing a new Rust MCP client that should speak ContextVM natively.
 
-Use [`proxy.md`](docs/proxy.md) when you want a simpler message-oriented bridge and do not want the full `rmcp` running client model.
+Use the proxy guide when you want a simpler message-oriented bridge and do not want the full `rmcp` running client model.
 
 ## Behavioral notes
 
-- The client-side `rmcp` handshake is driven by [`serve_client()`](rust-sdk/crates/rmcp/src/service/client.rs:177).
-- The initialize request is sent automatically in [`rust-sdk/crates/rmcp/src/service/client.rs:219`](rust-sdk/crates/rmcp/src/service/client.rs:219).
-- Stateless initialization behavior in the ContextVM client transport is covered by [`tests/conformance_stateless_mode.rs`](tests/conformance_stateless_mode.rs).
-- Capability learning and gift-wrap handling are implemented in [`src/transport/client/mod.rs:477`](src/transport/client/mod.rs:477) and [`src/transport/client/mod.rs:530`](src/transport/client/mod.rs:530).
+- The client-side `rmcp` handshake is driven by the normal `serve_client()` flow.
+- The initialize request is sent automatically as part of the running client startup sequence.
+- Stateless initialization behavior is covered by the conformance tests.
+- Capability learning and gift-wrap handling happen inside the client transport implementation.

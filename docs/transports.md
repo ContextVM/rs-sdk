@@ -2,10 +2,10 @@
 
 Use this page when you want to understand the transport layer itself.
 
-If you are building a normal native server or client, start with [`server-transport.md`](docs/server-transport.md) or [`client-transport.md`](docs/client-transport.md) first.
+If you are building a normal native server or client, start with the dedicated native server or native client guide first.
 
-- [`NostrClientTransport`](src/transport/client/mod.rs:69): client-side direct transport
-- [`NostrServerTransport`](src/transport/server/mod.rs:87): server-side direct transport
+- `NostrClientTransport`: client-side direct transport
+- `NostrServerTransport`: server-side direct transport
 
 ## Why use the transport layer directly
 
@@ -15,6 +15,19 @@ Use transports directly when you need to:
 - control announcement timing yourself
 - tune authorization and session behavior
 - embed the transport in higher-level abstractions
+
+## Signer choice
+
+All transport constructors accept an existing signer, not just a newly generated one.
+
+- Use `generate()` for temporary identities in examples, tests, and short-lived sessions.
+- Use `from_sk()` when you need a stable identity backed by a pre-existing hex or `nsec` private key.
+
+```rust
+use contextvm_sdk::signer;
+
+let signer = signer::from_sk("<hex-or-nsec-private-key>")?;
+```
 
 ## Low-level client transport example
 
@@ -111,17 +124,17 @@ It manages:
 - multi-client session state
 - request route storage
 - authorization via `allowed_public_keys`
-- allowlist bypasses via [`CapabilityExclusion`](src/core/types.rs:269)
+- allowlist bypasses via `CapabilityExclusion`
 - announcement publication
 - encryption negotiation and response mirroring
 
-Those behaviors are visible in the fields of [`NostrServerTransport`](src/transport/server/mod.rs:87) and are exercised heavily in [`tests/transport_integration.rs`](tests/transport_integration.rs).
+Those behaviors are part of the server transport implementation and are exercised heavily by the integration tests.
 
 ## What the server receives
 
-Incoming traffic is delivered as [`IncomingRequest`](src/transport/server/mod.rs:113), which includes:
+Incoming traffic is delivered as `IncomingRequest`, which includes:
 
-- the parsed [`JsonRpcMessage`](src/core/types.rs:146)
+- the parsed `JsonRpcMessage`
 - the client pubkey
 - the original Nostr request event id
 - whether the incoming message was encrypted

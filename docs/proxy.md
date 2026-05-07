@@ -1,10 +1,10 @@
 # Proxy Guide
 
-[`NostrMCPProxy`](src/proxy/mod.rs:17) is the simplest way to talk to a remote ContextVM server from Rust.
+`NostrMCPProxy` is the simplest way to talk to a remote ContextVM server from Rust.
 
-It wraps [`NostrClientTransport`](src/transport/client/mod.rs:69), gives you a receiver for responses and notifications, and handles transport startup and shutdown.
+It wraps `NostrClientTransport`, gives you a receiver for responses and notifications, and handles transport startup and shutdown.
 
-For native Rust applications, this is usually not the primary path. Most users should build an `rmcp` client and attach [`NostrClientTransport`](src/transport/client/mod.rs:69) directly, as described in [`client-transport.md`](docs/client-transport.md).
+For native Rust applications, this is usually not the primary path. Most users should build an `rmcp` client and attach `NostrClientTransport` directly, as described in the native client guide.
 
 ## When to use it
 
@@ -16,9 +16,21 @@ Use the proxy when:
 
 Do not start here if you are writing a new native Rust MCP client from scratch.
 
+## Loading an existing private key
+
+Like the native client transport, the proxy can reuse an existing Nostr identity instead of generating a new one. Load the signer with `from_sk()`:
+
+```rust
+use contextvm_sdk::signer;
+
+let signer = signer::from_sk("<hex-or-nsec-private-key>")?;
+```
+
+Pass that signer to `NostrMCPProxy::new()` exactly as you would pass a freshly generated keypair.
+
 ## Minimal example
 
-This follows [`examples/proxy.rs`](examples/proxy.rs).
+This follows the repository proxy example.
 
 ```rust
 use contextvm_sdk::core::types::{JsonRpcMessage, JsonRpcRequest};
@@ -28,7 +40,7 @@ use contextvm_sdk::transport::client::NostrClientTransportConfig;
 
 #[tokio::main]
 async fn main() -> contextvm_sdk::Result<()> {
-    let keys = signer::generate();
+    let keys = signer::from_sk("<hex-or-nsec-private-key>")?;
 
     let config = ProxyConfig {
         nostr_config: NostrClientTransportConfig {
@@ -61,7 +73,7 @@ async fn main() -> contextvm_sdk::Result<()> {
 
 ## Client config
 
-The main options live on [`NostrClientTransportConfig`](src/transport/client/mod.rs:33):
+The main options live on `NostrClientTransportConfig`:
 
 - `relay_urls`: relays used for direct transport
 - `server_pubkey`: target server identity in hex form
@@ -72,9 +84,9 @@ The main options live on [`NostrClientTransportConfig`](src/transport/client/mod
 
 ## Stateless mode
 
-[`is_stateless`](src/transport/client/mod.rs:43) is a major behavior switch.
+`is_stateless` is a major behavior switch.
 
-When enabled, the client can emulate initialize handling locally instead of waiting for a network roundtrip. This behavior is tested in [`tests/conformance_stateless_mode.rs`](tests/conformance_stateless_mode.rs).
+When enabled, the client can emulate initialize handling locally instead of waiting for a network roundtrip. This behavior is covered by the conformance tests.
 
 Use it when:
 
@@ -87,18 +99,18 @@ Avoid assuming that every server workflow depends only on stateless behavior.
 
 - responses are correlated at the transport level, not just by raw receive order
 - the client learns peer capabilities from discovery tags on inbound messages
-- encrypted traffic is deduplicated by outer gift-wrap event id before delivery, as covered by [`tests/conformance_dedup.rs`](tests/conformance_dedup.rs)
+- encrypted traffic is deduplicated by outer gift-wrap event id before delivery
 
 ## When not to use it
 
-Prefer [`client-transport.md`](docs/client-transport.md) when:
+Prefer the native client transport path when:
 
-- your application is already modeled as an `rmcp` [`ClientHandler`](rust-sdk/crates/rmcp/src/lib.rs:14)
-- you want the normal running-client workflow from [`ServiceExt`](rust-sdk/crates/rmcp/src/lib.rs:20)
+- your application is already modeled as an `rmcp` `ClientHandler`
+- you want the normal running-client workflow from `ServiceExt`
 - you want examples that match the rest of the `rmcp` client ecosystem
 
 ## rmcp path
 
-If you are building on `rmcp`, use [`serve_client_handler()`](src/proxy/mod.rs:77) instead of manually sending and receiving raw [`JsonRpcMessage`](src/core/types.rs:146) values.
+If you are building on `rmcp`, use `serve_client_handler()` instead of manually sending and receiving raw `JsonRpcMessage` values.
 
-That said, the preferred native documentation path is still [`client-transport.md`](docs/client-transport.md), because it reflects the main architecture: `rmcp` client first, ContextVM transport second.
+That said, the preferred native architecture is still `rmcp` client first and ContextVM transport second.

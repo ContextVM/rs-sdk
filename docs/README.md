@@ -10,32 +10,32 @@ The main mental model is:
 2. attach a ContextVM transport
 3. run MCP over Nostr
 
-For most native Rust applications, the primary entry points are [`NostrServerTransport`](src/transport/server/mod.rs:87) and [`NostrClientTransport`](src/transport/client/mod.rs:69), used together with `rmcp` services via [`ServiceExt`](rust-sdk/crates/rmcp/src/lib.rs:20).
+For most native Rust applications, the primary entry points are `NostrServerTransport` and `NostrClientTransport`, used together with `rmcp` services via `ServiceExt`.
 
 ## Guides
 
 ### Native ContextVM applications
 
-- [`overview.md`](docs/overview.md)
-- [`server-transport.md`](docs/server-transport.md)
-- [`client-transport.md`](docs/client-transport.md)
-- [`encryption.md`](docs/encryption.md)
-- [`discovery.md`](docs/discovery.md)
+- Overview: architecture, API selection, and protocol model
+- Native server guide: server setup over Nostr
+- Native client guide: client setup over Nostr
+- Encryption guide: plaintext, encrypted, and gift-wrap behavior
+- Discovery guide: public discovery helpers and event kinds
 
 ### Bridging existing MCP applications
 
-- [`gateway.md`](docs/gateway.md)
-- [`proxy.md`](docs/proxy.md)
+- Gateway guide: expose an existing server-side MCP flow over ContextVM
+- Proxy guide: connect to a remote ContextVM server with a lighter client bridge
 
 ### Integration notes
 
-- [`rmcp.md`](docs/rmcp.md)
-- [`transports.md`](docs/transports.md)
+- RMCP integration guide: how the optional `rmcp` integration layer fits in
+- Transport guide: lower-level transport behavior and direct usage
 
 ## Documentation goals
 
 The docs here are concise and implementation-driven.
 
-They are derived from public APIs in [`src/lib.rs`](src/lib.rs:1), `rmcp` service APIs in [`rust-sdk/crates/rmcp/src/lib.rs`](rust-sdk/crates/rmcp/src/lib.rs), example programs such as [`examples/rmcp_integration_test.rs`](examples/rmcp_integration_test.rs), and transport/conformance tests such as [`tests/transport_integration.rs`](tests/transport_integration.rs).
+They are derived from the public crate APIs, the `rmcp` service APIs, the repository examples, and the transport and conformance tests in this repository.
 
-They are meant to be migrated later into [`contextvm-docs/src/content/docs`](contextvm-docs/src/content/docs).
+They are intended to remain usable on their own, without depending on external documentation pages.

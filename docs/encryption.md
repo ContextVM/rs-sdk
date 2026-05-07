@@ -1,28 +1,28 @@
 # Encryption Guide
 
-ContextVM encryption in this SDK is controlled by [`EncryptionMode`](src/core/types.rs:17) and [`GiftWrapMode`](src/core/types.rs:34).
+ContextVM encryption in this SDK is controlled by `EncryptionMode` and `GiftWrapMode`.
 
-The direct transport behavior is aligned with the protocol references in [`contextvm-docs/src/content/docs/spec/ceps/cep-4.md`](contextvm-docs/src/content/docs/spec/ceps/cep-4.md:2) and [`contextvm-docs/src/content/docs/spec/ceps/cep-19.md`](contextvm-docs/src/content/docs/spec/ceps/cep-19.md:2).
+At a high level, direct traffic can be sent as plaintext ContextVM events or as encrypted NIP-44 payloads wrapped in gift-wrap events, depending on the configured policy on both peers.
 
 ## Encryption modes
 
-[`EncryptionMode`](src/core/types.rs:17) has three modes:
+`EncryptionMode` has three modes:
 
 - `Optional`: accept both plaintext and encrypted traffic
 - `Required`: require encrypted traffic
 - `Disabled`: reject encrypted traffic and use plaintext only
 
-These semantics are not only conceptual; they are exercised in [`tests/transport_integration.rs`](tests/transport_integration.rs).
+These semantics are not only conceptual; they are also exercised by the transport integration tests.
 
 ## Gift-wrap modes
 
-[`GiftWrapMode`](src/core/types.rs:34) controls which outer encrypted event kind is used:
+`GiftWrapMode` controls which outer encrypted event kind is used:
 
 - `Optional`: accept and prefer either supported mode
 - `Ephemeral`: use kind `21059`
 - `Persistent`: use kind `1059`
 
-The helper methods [`allows_kind()`](src/core/types.rs:46) and [`supports_ephemeral()`](src/core/types.rs:55) show the expected policy behavior.
+The helper methods `allows_kind()` and `supports_ephemeral()` show the expected policy behavior.
 
 ## Practical rules
 
@@ -38,19 +38,19 @@ Encrypted ContextVM messages:
 2. encrypt it with NIP-44
 3. wrap it as a gift-wrap event using kind `1059` or `21059`
 
-The implementation details live in [`src/encryption/mod.rs`](src/encryption/mod.rs).
+The implementation details live in the SDK encryption module.
 
 ## Response mirroring
 
 One important implementation detail is that server responses mirror the client’s inbound encryption format when policy allows it.
 
-This behavior is verified in [`tests/transport_integration.rs`](tests/transport_integration.rs) and is important for interoperable mixed-mode deployments.
+This behavior is verified by the transport integration tests and is important for interoperable mixed-mode deployments.
 
 ## Deduplication
 
 Both client and server transports deduplicate encrypted outer gift-wrap event ids before delivering them.
 
-This is covered by [`tests/conformance_dedup.rs`](tests/conformance_dedup.rs) and by encrypted transport integration tests in [`tests/transport_integration.rs`](tests/transport_integration.rs).
+This is covered by the deduplication and encrypted transport integration tests.
 
 ## Example configuration
 
@@ -69,7 +69,7 @@ let config = NostrClientTransportConfig {
 
 ## Discovery tags
 
-Encryption support is also surfaced through discovery tags and first-message capability learning, consistent with [`contextvm-docs/src/content/docs/spec/ceps/informational/cep-35.md`](contextvm-docs/src/content/docs/spec/ceps/informational/cep-35.md:60).
+Encryption support is also surfaced through discovery tags and first-message capability learning.
 
 In practice, this matters for:
 

@@ -1,10 +1,10 @@
 # Gateway Guide
 
-[`NostrMCPGateway`](src/gateway/mod.rs:20) is the simplest way to expose an MCP server through ContextVM.
+`NostrMCPGateway` is the simplest way to expose an MCP server through ContextVM.
 
-It wraps [`NostrServerTransport`](src/transport/server/mod.rs:87), receives incoming ContextVM requests from Nostr, and lets your application send responses back using the inbound event id.
+It wraps `NostrServerTransport`, receives incoming ContextVM requests from Nostr, and lets your application send responses back using the inbound event id.
 
-For native Rust applications, this is usually not the primary path. Most users should build an `rmcp` server and attach [`NostrServerTransport`](src/transport/server/mod.rs:87) directly, as described in [`server-transport.md`](docs/server-transport.md).
+For native Rust applications, this is usually not the primary path. Most users should build an `rmcp` server and attach `NostrServerTransport` directly, as described in the native server guide.
 
 ## When to use it
 
@@ -18,7 +18,7 @@ Do not start here if you are writing a new native Rust MCP server from scratch.
 
 ## Minimal example
 
-This follows the shape of [`examples/gateway.rs`](examples/gateway.rs).
+This follows the shape of the repository gateway example.
 
 ```rust
 use contextvm_sdk::core::types::{
@@ -91,21 +91,21 @@ async fn main() -> contextvm_sdk::Result<()> {
 
 ## What the gateway gives you
 
-- a message channel of [`IncomingRequest`](src/transport/server/mod.rs:113)
-- automatic routing of responses by original Nostr event id through [`send_response()`](src/gateway/mod.rs:57)
-- optional public announcements through [`announce()`](src/gateway/mod.rs:62)
+- a message channel of `IncomingRequest`
+- automatic routing of responses by original Nostr event id through `send_response()`
+- optional public announcements through `announce()`
 
 ## When not to use it
 
-Prefer [`server-transport.md`](docs/server-transport.md) when:
+Prefer the native server transport path when:
 
-- your application is already modeled as an `rmcp` [`ServerHandler`](rust-sdk/crates/rmcp/src/lib.rs:16)
-- you want the normal `rmcp` running service lifecycle through [`ServiceExt`](rust-sdk/crates/rmcp/src/lib.rs:20)
+- your application is already modeled as an `rmcp` `ServerHandler`
+- you want the normal `rmcp` running service lifecycle through `ServiceExt`
 - you want docs and examples that match the broader `rmcp` ecosystem
 
 ## Important server config
 
-The main operational knobs live on [`NostrServerTransportConfig`](src/transport/server/mod.rs:36):
+The main operational knobs live on `NostrServerTransportConfig`:
 
 - `relay_urls`: relays to connect to
 - `encryption_mode`: plaintext vs encrypted session policy
@@ -119,11 +119,11 @@ The main operational knobs live on [`NostrServerTransportConfig`](src/transport/
 ## Behavioral notes
 
 - responses are routed using the inbound request event id, not just the JSON-RPC id
-- for announced servers, public metadata publication is part of the supported flow, verified in [`tests/transport_integration.rs`](tests/transport_integration.rs)
-- authorization and allowlist bypass behavior are also exercised in [`tests/transport_integration.rs`](tests/transport_integration.rs)
+- for announced servers, public metadata publication is part of the supported flow
+- authorization and allowlist bypass behavior are also exercised by the integration tests
 
 ## rmcp path
 
-If your server already uses `rmcp`, the gateway also exposes [`serve_handler()`](src/gateway/mod.rs:88) so you can attach a handler directly without manually running the request loop.
+If your server already uses `rmcp`, the gateway also exposes `serve_handler()` so you can attach a handler directly without manually running the request loop.
 
-That said, the preferred native documentation path is still [`server-transport.md`](docs/server-transport.md), because it reflects the main architecture: `rmcp` service first, ContextVM transport second.
+That said, the preferred native architecture is still `rmcp` service first and ContextVM transport second.
