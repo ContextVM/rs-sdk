@@ -2,9 +2,21 @@
 
 ## [0.1.1] - 2026-05-08
 
+### Added
+
+- End-to-end happy-path integration coverage for the full in-memory SDK stack, exercising RMCP handlers through `NostrServerWorker`, `NostrServerTransport`, `MockRelayPool`, `NostrClientTransport`, and the RMCP client without requiring a live network
+- New `test-utils` feature for downstream integration tests that need access to `MockRelayPool`
+- Public re-export of the relay module so downstream crates can use `MockRelayPool` through the crate root when `test-utils` is enabled
+
 ### Fixed
 
+- RMCP stateless CEP-35 requests are now bridged into the RMCP lifecycle correctly by injecting synthetic initialization for first contact, allowing stateless clients to call tools and resources without an explicit `initialize` round-trip
 - Corrected crates.io metadata (repository URL, keywords, categories, homepage, documentation)
+
+### Changed
+
+- Enabled the `rmcp` feature by default to make the native RMCP transport integration available out of the box
+- Improved public API exports for transport, relay, gateway, and proxy types to simplify downstream usage
 
 ## [0.1.0] - 2026-05-07
 
