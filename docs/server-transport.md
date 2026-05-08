@@ -82,9 +82,14 @@ impl ServerHandler for DemoServer {
         rmcp::model::ServerInfo {
             protocol_version: ProtocolVersion::LATEST,
             capabilities: ServerCapabilities::builder().enable_tools().build(),
-            server_info: Implementation::new("contextvm-native-echo", "0.1.0")
-                .with_title("ContextVM Native Echo Server")
-                .with_description("Native rmcp echo server over ContextVM/Nostr"),
+            server_info: Implementation {
+                name: "contextvm-native-echo".to_string(),
+                title: Some("ContextVM Native Echo Server".to_string()),
+                version: "0.1.0".to_string(),
+                description: Some("Native rmcp echo server over ContextVM/Nostr".to_string()),
+                icons: None,
+                website_url: None,
+            },
             instructions: Some("Call the echo tool with a message string".to_string()),
         }
     }
@@ -129,7 +134,7 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-This follows the same flow as [`examples/native_echo_server.rs`](examples/native_echo_server.rs:1), while keeping the snippet compatible for external crate users by avoiding struct literals on `#[non_exhaustive]` types.
+This follows the same flow as the repository's native echo server example.
 
 ## What the transport adds
 

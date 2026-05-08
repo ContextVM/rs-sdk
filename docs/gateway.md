@@ -32,16 +32,16 @@ use contextvm_sdk::transport::server::NostrServerTransportConfig;
 async fn main() -> contextvm_sdk::Result<()> {
     let keys = signer::generate();
 
-    let config = GatewayConfig {
-        nostr_config: NostrServerTransportConfig::default()
-            .with_relay_urls(vec!["wss://relay.damus.io".to_string()])
-            .with_server_info(
-                ServerInfo::default()
-                    .with_name("Echo Server".to_string())
-                    .with_about("A simple ContextVM server".to_string()),
-            )
-            .with_announced_server(true),
-    };
+    let nostr_config = NostrServerTransportConfig::default()
+        .with_relay_urls(vec!["wss://relay.damus.io".to_string()])
+        .with_server_info(
+            ServerInfo::default()
+                .with_name("Echo Server".to_string())
+                .with_about("A simple ContextVM server".to_string()),
+        )
+        .with_announced_server(true);
+
+    let config = GatewayConfig::new(nostr_config);
 
     let mut gateway = NostrMCPGateway::new(keys, config).await?;
     let mut rx = gateway.start().await?;
