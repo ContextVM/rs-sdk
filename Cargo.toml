@@ -2,7 +2,7 @@
 name = "contextvm-sdk"
 version = "0.1.1"
 edition = "2021"
-rust-version = "1.70"
+rust-version = "1.88"
 description = "Rust SDK for the ContextVM protocol — MCP over Nostr"
 license = "MIT"
 readme = "README.md"
@@ -57,6 +57,10 @@ required-features = ["rmcp"]
 [[example]]
 name = "native_echo_client"
 required-features = ["rmcp"]
+
+[[test]]
+name = "e2e_happy_path"
+required-features = ["rmcp", "test-utils"]
 
 [[test]]
 name = "transport_integration"

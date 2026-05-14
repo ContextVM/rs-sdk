@@ -40,3 +40,38 @@ jobs:
 
       - name: Build
         run: cargo build --verbose
+
+      - name: Check (no-default-features)
+        run: cargo check --no-default-features
+
+      - name: Test (no-default-features)
+        run: cargo test --no-default-features
+
+      - name: Check (default features)
+        run: cargo check
+
+      - name: Test (default features)
+        run: cargo test
+
+  msrv:
+    name: MSRV (Rust 1.88)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.88
+        uses: dtolnay/rust-toolchain@1.88
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Remove incompatible lockfile
+        run: rm -f Cargo.lock
+
+      - name: Check
+        run: cargo check --all-features
+
+      - name: Test
+        run: cargo test --all-features
