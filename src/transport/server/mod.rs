@@ -4,6 +4,7 @@
 //! sessions, handles request/response correlation, and optionally publishes
 //! server announcements.
 
+pub(crate) mod announcement_manager;
 pub mod correlation_store;
 pub mod session_store;
 
@@ -87,10 +88,8 @@ pub struct NostrServerTransport {
     base: BaseTransport,
     /// Configuration for this server transport.
     config: NostrServerTransportConfig,
-    /// Extra common discovery tags to include in server announcements and first responses.
-    extra_common_tags: Vec<Tag>,
-    /// Pricing tags to include in announcements and capability list responses.
-    pricing_tags: Vec<Tag>,
+    /// Manages tag composition and publishing for CEP-6 announcements and CEP-35 discovery.
+    announcement_manager: announcement_manager::AnnouncementManager,
     /// Client sessions.
     sessions: SessionStore,
     /// Reverse lookup: event_id → client route.
@@ -211,6 +210,12 @@ impl NostrServerTransport {
             "Created server transport"
         );
         Ok(Self {
+            announcement_manager: announcement_manager::AnnouncementManager::new(
+                Arc::clone(&relay_pool),
+                config.server_info.clone(),
+                config.encryption_mode,
+                config.gift_wrap_mode,
+            ),
             base: BaseTransport {
                 relay_pool,
                 encryption_mode: config.encryption_mode,
@@ -218,8 +223,6 @@ impl NostrServerTransport {
             },
             sessions: SessionStore::with_capacity(config.max_sessions),
             config,
-            extra_common_tags: Vec::new(),
-            pricing_tags: Vec::new(),
             event_routes: ServerEventRouteStore::new(),
             request_wrap_kinds: Arc::new(RwLock::new(HashMap::new())),
             seen_gift_wrap_ids,
@@ -248,6 +251,12 @@ impl NostrServerTransport {
             "Created server transport (with_relay_pool)"
         );
         Ok(Self {
+            announcement_manager: announcement_manager::AnnouncementManager::new(
+                Arc::clone(&relay_pool),
+                config.server_info.clone(),
+                config.encryption_mode,
+                config.gift_wrap_mode,
+            ),
             base: BaseTransport {
                 relay_pool,
                 encryption_mode: config.encryption_mode,
@@ -255,8 +264,6 @@ impl NostrServerTransport {
             },
             sessions: SessionStore::with_capacity(config.max_sessions),
             config,
-            extra_common_tags: Vec::new(),
-            pricing_tags: Vec::new(),
             request_wrap_kinds: Arc::new(RwLock::new(HashMap::new())),
             event_routes: ServerEventRouteStore::new(),
             seen_gift_wrap_ids,
@@ -323,8 +330,7 @@ impl NostrServerTransport {
         let encryption_mode = self.config.encryption_mode;
         let gift_wrap_mode = self.config.gift_wrap_mode;
         let is_announced_server = self.config.is_announced_server;
-        let server_info = self.config.server_info.clone();
-        let extra_common_tags = self.extra_common_tags.clone();
+        let common_tags_snapshot = self.announcement_manager.common_tags_snapshot();
         let seen_gift_wrap_ids = self.seen_gift_wrap_ids.clone();
         let event_loop_token = self.cancellation_token.child_token();
 
@@ -340,8 +346,7 @@ impl NostrServerTransport {
                 encryption_mode,
                 gift_wrap_mode,
                 is_announced_server,
-                server_info,
-                extra_common_tags,
+                common_tags_snapshot,
                 seen_gift_wrap_ids,
                 event_loop_token,
             )
@@ -657,100 +662,32 @@ impl NostrServerTransport {
 
     /// Sets extra discovery tags to include in announcements and first-response discovery replay.
     pub fn set_announcement_extra_tags(&mut self, tags: Vec<Tag>) {
-        self.extra_common_tags = tags;
+        self.announcement_manager.set_extra_common_tags(tags);
     }
 
     /// Sets pricing tags to include in announcement/list events and capability list responses.
     pub fn set_announcement_pricing_tags(&mut self, tags: Vec<Tag>) {
-        self.pricing_tags = tags;
+        self.announcement_manager.set_pricing_tags(tags);
     }
 
     /// Publish server announcement (kind 11316).
     pub async fn announce(&self) -> Result<EventId> {
-        let info = self
-            .config
-            .server_info
-            .as_ref()
-            .ok_or_else(|| Error::Other("No server info configured".to_string()))?;
-
-        let content = serde_json::to_string(info)?;
-
-        let mut tags = Vec::new();
-        if let Some(ref name) = info.name {
-            tags.push(Tag::custom(
-                TagKind::Custom(tags::NAME.into()),
-                vec![name.clone()],
-            ));
-        }
-        if let Some(ref about) = info.about {
-            tags.push(Tag::custom(
-                TagKind::Custom(tags::ABOUT.into()),
-                vec![about.clone()],
-            ));
-        }
-        if let Some(ref website) = info.website {
-            tags.push(Tag::custom(
-                TagKind::Custom(tags::WEBSITE.into()),
-                vec![website.clone()],
-            ));
-        }
-        if let Some(ref picture) = info.picture {
-            tags.push(Tag::custom(
-                TagKind::Custom(tags::PICTURE.into()),
-                vec![picture.clone()],
-            ));
-        }
-        if self.config.encryption_mode != EncryptionMode::Disabled {
-            tags.push(Tag::custom(
-                TagKind::Custom(tags::SUPPORT_ENCRYPTION.into()),
-                Vec::<String>::new(),
-            ));
-            if self.config.gift_wrap_mode.supports_ephemeral() {
-                tags.push(Tag::custom(
-                    TagKind::Custom(tags::SUPPORT_ENCRYPTION_EPHEMERAL.into()),
-                    Vec::<String>::new(),
-                ));
-            }
-        }
-        tags.extend(self.extra_common_tags.iter().cloned());
-        tags.extend(self.pricing_tags.iter().cloned());
-
-        let builder = EventBuilder::new(Kind::Custom(SERVER_ANNOUNCEMENT_KIND), content).tags(tags);
-
-        self.base.relay_pool.publish(builder).await
+        self.announcement_manager.announce().await
     }
 
     /// Publish tools list (kind 11317).
     pub async fn publish_tools(&self, tools: Vec<serde_json::Value>) -> Result<EventId> {
-        let content = serde_json::json!({ "tools": tools });
-        let builder = EventBuilder::new(
-            Kind::Custom(TOOLS_LIST_KIND),
-            serde_json::to_string(&content)?,
-        )
-        .tags(self.pricing_tags.iter().cloned());
-        self.base.relay_pool.publish(builder).await
+        self.announcement_manager.publish_tools(tools).await
     }
 
     /// Publish resources list (kind 11318).
     pub async fn publish_resources(&self, resources: Vec<serde_json::Value>) -> Result<EventId> {
-        let content = serde_json::json!({ "resources": resources });
-        let builder = EventBuilder::new(
-            Kind::Custom(RESOURCES_LIST_KIND),
-            serde_json::to_string(&content)?,
-        )
-        .tags(self.pricing_tags.iter().cloned());
-        self.base.relay_pool.publish(builder).await
+        self.announcement_manager.publish_resources(resources).await
     }
 
     /// Publish prompts list (kind 11320).
     pub async fn publish_prompts(&self, prompts: Vec<serde_json::Value>) -> Result<EventId> {
-        let content = serde_json::json!({ "prompts": prompts });
-        let builder = EventBuilder::new(
-            Kind::Custom(PROMPTS_LIST_KIND),
-            serde_json::to_string(&content)?,
-        )
-        .tags(self.pricing_tags.iter().cloned());
-        self.base.relay_pool.publish(builder).await
+        self.announcement_manager.publish_prompts(prompts).await
     }
 
     /// Publish resource templates list (kind 11319).
@@ -758,39 +695,20 @@ impl NostrServerTransport {
         &self,
         templates: Vec<serde_json::Value>,
     ) -> Result<EventId> {
-        let content = serde_json::json!({ "resourceTemplates": templates });
-        let builder = EventBuilder::new(
-            Kind::Custom(RESOURCETEMPLATES_LIST_KIND),
-            serde_json::to_string(&content)?,
-        )
-        .tags(self.pricing_tags.iter().cloned());
-        self.base.relay_pool.publish(builder).await
+        self.announcement_manager
+            .publish_resource_templates(templates)
+            .await
     }
 
     /// Delete server announcements (NIP-09 kind 5).
     pub async fn delete_announcements(&self, reason: &str) -> Result<()> {
-        // We publish kind 5 events for each announcement kind
-        let pubkey = self.base.get_public_key().await?;
-        let _pubkey_hex = pubkey.to_hex();
-
-        for kind in UNENCRYPTED_KINDS {
-            let builder = EventBuilder::new(Kind::Custom(5), reason).tag(Tag::custom(
-                TagKind::Custom("k".into()),
-                vec![kind.to_string()],
-            ));
-            self.base.relay_pool.publish(builder).await?;
-        }
-        Ok(())
+        self.announcement_manager.delete_announcements(reason).await
     }
 
     /// Publish tools list from rmcp typed tool descriptors.
     #[cfg(feature = "rmcp")]
     pub async fn publish_tools_typed(&self, tools: Vec<rmcp::model::Tool>) -> Result<EventId> {
-        let tools = tools
-            .into_iter()
-            .map(serde_json::to_value)
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        self.publish_tools(tools).await
+        self.announcement_manager.publish_tools_typed(tools).await
     }
 
     /// Publish resources list from rmcp typed resource descriptors.
@@ -799,11 +717,9 @@ impl NostrServerTransport {
         &self,
         resources: Vec<rmcp::model::Resource>,
     ) -> Result<EventId> {
-        let resources = resources
-            .into_iter()
-            .map(serde_json::to_value)
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        self.publish_resources(resources).await
+        self.announcement_manager
+            .publish_resources_typed(resources)
+            .await
     }
 
     /// Publish prompts list from rmcp typed prompt descriptors.
@@ -812,11 +728,9 @@ impl NostrServerTransport {
         &self,
         prompts: Vec<rmcp::model::Prompt>,
     ) -> Result<EventId> {
-        let prompts = prompts
-            .into_iter()
-            .map(serde_json::to_value)
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        self.publish_prompts(prompts).await
+        self.announcement_manager
+            .publish_prompts_typed(prompts)
+            .await
     }
 
     /// Publish resource templates list from rmcp typed template descriptors.
@@ -825,67 +739,12 @@ impl NostrServerTransport {
         &self,
         templates: Vec<rmcp::model::ResourceTemplate>,
     ) -> Result<EventId> {
-        let templates = templates
-            .into_iter()
-            .map(serde_json::to_value)
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        self.publish_resource_templates(templates).await
+        self.announcement_manager
+            .publish_resource_templates_typed(templates)
+            .await
     }
 
     // ── CEP-35 discovery tag helpers ──────────────────────────────
-
-    /// Build common discovery tags from server config.
-    ///
-    /// Includes server info tags (name, about, website, picture) and capability
-    /// tags (support_encryption, support_encryption_ephemeral) based on the
-    /// transport's encryption and gift-wrap mode.
-    fn get_common_tags(&self) -> Vec<Tag> {
-        let mut tags = Vec::new();
-
-        // Server info tags
-        if let Some(ref info) = self.config.server_info {
-            if let Some(ref name) = info.name {
-                tags.push(Tag::custom(
-                    TagKind::Custom(tags::NAME.into()),
-                    vec![name.clone()],
-                ));
-            }
-            if let Some(ref about) = info.about {
-                tags.push(Tag::custom(
-                    TagKind::Custom(tags::ABOUT.into()),
-                    vec![about.clone()],
-                ));
-            }
-            if let Some(ref website) = info.website {
-                tags.push(Tag::custom(
-                    TagKind::Custom(tags::WEBSITE.into()),
-                    vec![website.clone()],
-                ));
-            }
-            if let Some(ref picture) = info.picture {
-                tags.push(Tag::custom(
-                    TagKind::Custom(tags::PICTURE.into()),
-                    vec![picture.clone()],
-                ));
-            }
-        }
-
-        // Capability tags
-        if self.config.encryption_mode != EncryptionMode::Disabled {
-            tags.push(Tag::custom(
-                TagKind::Custom(tags::SUPPORT_ENCRYPTION.into()),
-                Vec::<String>::new(),
-            ));
-            if self.config.gift_wrap_mode.supports_ephemeral() {
-                tags.push(Tag::custom(
-                    TagKind::Custom(tags::SUPPORT_ENCRYPTION_EPHEMERAL.into()),
-                    Vec::<String>::new(),
-                ));
-            }
-        }
-
-        tags
-    }
 
     /// One-shot: returns common tags if not yet sent to this client, empty otherwise.
     fn take_pending_server_discovery_tags(&self, session: &mut ClientSession) -> Vec<Tag> {
@@ -893,7 +752,7 @@ impl NostrServerTransport {
             return vec![];
         }
         session.has_sent_common_tags = true;
-        self.get_common_tags()
+        self.announcement_manager.get_common_tags()
     }
 
     // ── Internal ────────────────────────────────────────────────
@@ -932,8 +791,7 @@ impl NostrServerTransport {
         encryption_mode: EncryptionMode,
         gift_wrap_mode: GiftWrapMode,
         is_announced_server: bool,
-        server_info: Option<ServerInfo>,
-        extra_common_tags: Vec<Tag>,
+        common_tags_snapshot: announcement_manager::CommonTagsSnapshot,
         seen_gift_wrap_ids: Arc<Mutex<LruCache<EventId, ()>>>,
         cancel: CancellationToken,
     ) {
@@ -1136,13 +994,7 @@ impl NostrServerTransport {
                                         .await
                                         .is_some_and(|s| s.has_sent_common_tags);
                                     if !has_sent {
-                                        Self::append_common_response_tags(
-                                            &mut tags,
-                                            server_info.as_ref(),
-                                            &extra_common_tags,
-                                            encryption_mode,
-                                            gift_wrap_mode,
-                                        );
+                                        common_tags_snapshot.append_common_response_tags(&mut tags);
                                         sessions.mark_common_tags_sent(&sender_pubkey).await;
                                     }
 
@@ -1389,37 +1241,6 @@ impl NostrServerTransport {
             GiftWrapMode::Ephemeral => Some(EPHEMERAL_GIFT_WRAP_KIND),
             GiftWrapMode::Optional => Some(GIFT_WRAP_KIND),
         }
-    }
-
-    /// CEP-19: Append server capability discovery tags to the given tag vec.
-    fn append_common_response_tags(
-        tags: &mut Vec<Tag>,
-        server_info: Option<&ServerInfo>,
-        extra_common_tags: &[Tag],
-        encryption_mode: EncryptionMode,
-        gift_wrap_mode: GiftWrapMode,
-    ) {
-        if encryption_mode != EncryptionMode::Disabled {
-            tags.push(Tag::custom(
-                TagKind::Custom(tags::SUPPORT_ENCRYPTION.into()),
-                Vec::<String>::new(),
-            ));
-            if gift_wrap_mode.supports_ephemeral() {
-                tags.push(Tag::custom(
-                    TagKind::Custom(tags::SUPPORT_ENCRYPTION_EPHEMERAL.into()),
-                    Vec::<String>::new(),
-                ));
-            }
-        }
-        if let Some(info) = server_info {
-            if let Some(ref name) = info.name {
-                tags.push(Tag::custom(
-                    TagKind::Custom(tags::NAME.into()),
-                    vec![name.clone()],
-                ));
-            }
-        }
-        tags.extend(extra_common_tags.iter().cloned());
     }
 }
 
@@ -1701,14 +1522,14 @@ mod tests {
 
     #[test]
     fn test_append_common_response_tags_includes_encryption_when_optional() {
+        let snapshot = announcement_manager::CommonTagsSnapshot {
+            server_info: None,
+            extra_common_tags: vec![],
+            encryption_mode: EncryptionMode::Optional,
+            gift_wrap_mode: GiftWrapMode::Optional,
+        };
         let mut tags = Vec::new();
-        NostrServerTransport::append_common_response_tags(
-            &mut tags,
-            None,
-            &[],
-            EncryptionMode::Optional,
-            GiftWrapMode::Optional,
-        );
+        snapshot.append_common_response_tags(&mut tags);
         let kinds: Vec<String> = tags.iter().map(|t| format!("{:?}", t.kind())).collect();
         assert!(
             kinds.iter().any(|k| k.contains("support_encryption")),
@@ -1718,14 +1539,14 @@ mod tests {
 
     #[test]
     fn test_append_common_response_tags_no_encryption_when_disabled() {
+        let snapshot = announcement_manager::CommonTagsSnapshot {
+            server_info: None,
+            extra_common_tags: vec![],
+            encryption_mode: EncryptionMode::Disabled,
+            gift_wrap_mode: GiftWrapMode::Optional,
+        };
         let mut tags = Vec::new();
-        NostrServerTransport::append_common_response_tags(
-            &mut tags,
-            None,
-            &[],
-            EncryptionMode::Disabled,
-            GiftWrapMode::Optional,
-        );
+        snapshot.append_common_response_tags(&mut tags);
         assert!(
             tags.is_empty(),
             "should not include encryption tags when encryption disabled"
@@ -1815,14 +1636,14 @@ mod tests {
 
     #[test]
     fn test_append_common_response_tags_includes_ephemeral_tag() {
+        let snapshot = announcement_manager::CommonTagsSnapshot {
+            server_info: None,
+            extra_common_tags: vec![],
+            encryption_mode: EncryptionMode::Optional,
+            gift_wrap_mode: GiftWrapMode::Optional,
+        };
         let mut tags = Vec::new();
-        NostrServerTransport::append_common_response_tags(
-            &mut tags,
-            None,
-            &[],
-            EncryptionMode::Optional,
-            GiftWrapMode::Optional,
-        );
+        snapshot.append_common_response_tags(&mut tags);
         let kinds: Vec<String> = tags.iter().map(|t| format!("{:?}", t.kind())).collect();
         assert!(
             kinds
@@ -1834,18 +1655,18 @@ mod tests {
 
     #[test]
     fn test_append_common_response_tags_includes_server_info() {
-        let mut tags = Vec::new();
         let server_info = ServerInfo {
             name: Some("TestServer".to_string()),
             ..Default::default()
         };
-        NostrServerTransport::append_common_response_tags(
-            &mut tags,
-            Some(&server_info),
-            &[],
-            EncryptionMode::Disabled,
-            GiftWrapMode::Optional,
-        );
+        let snapshot = announcement_manager::CommonTagsSnapshot {
+            server_info: Some(server_info),
+            extra_common_tags: vec![],
+            encryption_mode: EncryptionMode::Disabled,
+            gift_wrap_mode: GiftWrapMode::Optional,
+        };
+        let mut tags = Vec::new();
+        snapshot.append_common_response_tags(&mut tags);
         let tag_value = tags
             .iter()
             .find(|t| (*t).clone().to_vec().first().map(|s| s.as_str()) == Some("name"))
@@ -1855,18 +1676,18 @@ mod tests {
 
     #[test]
     fn test_append_common_response_tags_extra_tags() {
-        let mut tags = Vec::new();
         let extra_tags = vec![Tag::custom(
             TagKind::Custom("custom_tag".into()),
             vec!["value".to_string()],
         )];
-        NostrServerTransport::append_common_response_tags(
-            &mut tags,
-            None,
-            &extra_tags,
-            EncryptionMode::Disabled,
-            GiftWrapMode::Optional,
-        );
+        let snapshot = announcement_manager::CommonTagsSnapshot {
+            server_info: None,
+            extra_common_tags: extra_tags,
+            encryption_mode: EncryptionMode::Disabled,
+            gift_wrap_mode: GiftWrapMode::Optional,
+        };
+        let mut tags = Vec::new();
+        snapshot.append_common_response_tags(&mut tags);
         let tag_value = tags
             .iter()
             .find(|t| (*t).clone().to_vec().first().map(|s| s.as_str()) == Some("custom_tag"))
