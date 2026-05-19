@@ -3,6 +3,7 @@
 //! Encapsulates tag composition, caching, and publishing for CEP-6 server
 //! announcements (kinds 11316–11320) and CEP-35 first-response discovery.
 
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -55,6 +56,39 @@ pub(crate) struct AnnouncementManager {
     /// rmcp worker — unused when the `rmcp` feature is disabled.
     #[cfg_attr(not(feature = "rmcp"), allow(dead_code))]
     initialized: Mutex<bool>,
+    /// Transport's connected relay URLs (fallback for `relay_list_urls`).
+    relay_urls: Vec<String>,
+    /// Explicit relay URLs to advertise in the kind 10002 relay list event.
+    relay_list_urls: Option<Vec<String>>,
+    /// Additional bootstrap relay URLs for discoverability publication.
+    #[allow(dead_code)] // Used by get_discoverability_publish_relay_urls; reserved for relay-specific publish
+    bootstrap_relay_urls: Option<Vec<String>>,
+    /// Whether to publish a relay list event (kind 10002).
+    should_publish_relay_list: bool,
+    /// NIP-01 profile metadata (kind 0) to publish at startup.
+    profile_metadata: Option<ProfileMetadata>,
+}
+
+/// Check whether a relay URL points to a local address.
+///
+/// Used for smart bootstrap relay detection: default bootstrap relays are
+/// skipped when all advertised relays are local and no explicit bootstrap
+/// URLs were provided.
+#[allow(dead_code)] // Used by get_discoverability_publish_relay_urls
+fn is_local_relay_url(url: &str) -> bool {
+    let without_proto = url
+        .strip_prefix("wss://")
+        .or_else(|| url.strip_prefix("ws://"))
+        .unwrap_or(url);
+    let lower = without_proto.to_lowercase();
+    for prefix in &["localhost", "127.0.0.1", "0.0.0.0", "[::1]"] {
+        if let Some(rest) = lower.strip_prefix(prefix) {
+            if rest.is_empty() || rest.starts_with(':') || rest.starts_with('/') {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 impl AnnouncementManager {
@@ -63,12 +97,18 @@ impl AnnouncementManager {
     /// `dispatch_fn` is a clone of the transport's `message_tx` channel, used to
     /// inject synthetic MCP messages (initialize, notifications/initialized,
     /// capability list requests) during the auto-publish flow.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         relay_pool: Arc<dyn RelayPoolTrait>,
         server_info: Option<ServerInfo>,
         encryption_mode: EncryptionMode,
         gift_wrap_mode: GiftWrapMode,
         dispatch_fn: tokio::sync::mpsc::UnboundedSender<IncomingRequest>,
+        relay_urls: Vec<String>,
+        relay_list_urls: Option<Vec<String>>,
+        bootstrap_relay_urls: Option<Vec<String>>,
+        should_publish_relay_list: bool,
+        profile_metadata: Option<ProfileMetadata>,
     ) -> Self {
         Self {
             relay_pool,
@@ -82,6 +122,11 @@ impl AnnouncementManager {
             dispatch_fn: Some(dispatch_fn),
             init_notify: Arc::new(Notify::new()),
             initialized: Mutex::new(false),
+            relay_urls,
+            relay_list_urls,
+            bootstrap_relay_urls,
+            should_publish_relay_list,
+            profile_metadata,
         }
     }
 
@@ -330,6 +375,189 @@ impl AnnouncementManager {
             .map(serde_json::to_value)
             .collect::<std::result::Result<Vec<_>, _>>()?;
         self.publish_resource_templates(templates).await
+    }
+
+    // ── Relay list + profile metadata (CEP-6) ─────────────────────────
+
+    /// Returns the relay URLs to advertise in the kind 10002 relay list event.
+    ///
+    /// Uses `relay_list_urls` if explicitly configured, otherwise falls back
+    /// to the transport's connected `relay_urls`.
+    pub(crate) fn get_advertised_relay_urls(&self) -> &[String] {
+        self.relay_list_urls.as_deref().unwrap_or(&self.relay_urls)
+    }
+
+    /// Compute relay URLs for discoverability event publication.
+    ///
+    /// Merges advertised relay URLs with bootstrap relay URLs, deduplicated.
+    /// Skips default bootstrap relays when all advertised URLs are local and
+    /// no explicit `bootstrap_relay_urls` were provided.
+    #[allow(dead_code)] // Reserved for relay-specific publish when RelayPoolTrait supports it
+    pub(crate) fn get_discoverability_publish_relay_urls(&self) -> Vec<String> {
+        let advertised = self.get_advertised_relay_urls();
+        let has_explicit_bootstrap = self.bootstrap_relay_urls.is_some();
+
+        let should_skip_bootstrap = !has_explicit_bootstrap
+            && !advertised.is_empty()
+            && advertised.iter().all(|url| is_local_relay_url(url));
+
+        let mut seen = HashSet::new();
+        let mut result = Vec::new();
+
+        for url in advertised {
+            if seen.insert(url.clone()) {
+                result.push(url.clone());
+            }
+        }
+
+        if !should_skip_bootstrap {
+            let default_bootstrap: Vec<String> = DEFAULT_BOOTSTRAP_RELAY_URLS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect();
+            let bootstrap = self
+                .bootstrap_relay_urls
+                .as_deref()
+                .unwrap_or(&default_bootstrap);
+            for url in bootstrap {
+                if seen.insert(url.clone()) {
+                    result.push(url.clone());
+                }
+            }
+        }
+
+        result
+    }
+
+    /// Publish relay list (kind 10002).
+    ///
+    /// No-op if `should_publish_relay_list` is false or no relay URLs are available.
+    #[allow(dead_code)] // API for direct use; spawn_publish_discoverability inlines the logic
+    pub(crate) async fn publish_relay_list(&self) -> Result<()> {
+        if !self.should_publish_relay_list {
+            return Ok(());
+        }
+        let urls = self.get_advertised_relay_urls();
+        if urls.is_empty() {
+            tracing::warn!(target: LOG_TARGET, "No relay URLs to publish relay list");
+            return Ok(());
+        }
+        let tags: Vec<Tag> = urls
+            .iter()
+            .map(|url| Tag::custom(TagKind::Custom(tags::RELAY.into()), vec![url.clone()]))
+            .collect();
+        let builder =
+            EventBuilder::new(Kind::Custom(RELAY_LIST_METADATA_KIND), "").tags(tags);
+        match self.relay_pool.publish(builder).await {
+            Ok(id) => tracing::info!(
+                target: LOG_TARGET,
+                event_id = %id,
+                "Published relay list (kind 10002)"
+            ),
+            Err(e) => tracing::warn!(
+                target: LOG_TARGET,
+                error = %e,
+                "Failed to publish relay list"
+            ),
+        }
+        Ok(())
+    }
+
+    /// Publish profile metadata (kind 0).
+    ///
+    /// No-op if `profile_metadata` is not configured.
+    #[allow(dead_code)] // API for direct use; spawn_publish_discoverability inlines the logic
+    pub(crate) async fn publish_profile_metadata(&self) -> Result<()> {
+        let metadata = match &self.profile_metadata {
+            Some(m) => m,
+            None => return Ok(()),
+        };
+        let content = serde_json::to_string(metadata)?;
+        let builder = EventBuilder::new(Kind::Custom(0), content);
+        match self.relay_pool.publish(builder).await {
+            Ok(id) => tracing::info!(
+                target: LOG_TARGET,
+                event_id = %id,
+                "Published profile metadata (kind 0)"
+            ),
+            Err(e) => tracing::warn!(
+                target: LOG_TARGET,
+                error = %e,
+                "Failed to publish profile metadata"
+            ),
+        }
+        Ok(())
+    }
+
+    /// Spawn a task to publish profile metadata and relay list.
+    ///
+    /// Unconditional — guards live inside the individual publish methods.
+    /// Event-building logic mirrors `publish_relay_list()` and `publish_profile_metadata()`.
+    /// Duplication is intentional — `&self` can't be moved into a spawned task in Rust.
+    #[cfg_attr(not(feature = "rmcp"), allow(dead_code))]
+    pub(crate) fn spawn_publish_discoverability(&self) -> tokio::task::JoinHandle<()> {
+        let relay_pool = Arc::clone(&self.relay_pool);
+
+        // Build events before spawning (borrows self) to avoid sending &self
+        let profile_event = self.profile_metadata.as_ref().and_then(|metadata| {
+            serde_json::to_string(metadata)
+                .ok()
+                .map(|content| EventBuilder::new(Kind::Custom(0), content))
+        });
+
+        let relay_list_event = if self.should_publish_relay_list {
+            let urls = self.get_advertised_relay_urls();
+            if urls.is_empty() {
+                None
+            } else {
+                let tags: Vec<Tag> = urls
+                    .iter()
+                    .map(|url| {
+                        Tag::custom(TagKind::Custom(tags::RELAY.into()), vec![url.clone()])
+                    })
+                    .collect();
+                Some(
+                    EventBuilder::new(Kind::Custom(RELAY_LIST_METADATA_KIND), "").tags(tags),
+                )
+            }
+        } else {
+            None
+        };
+
+        tokio::spawn(async move {
+            if let Some(builder) = profile_event {
+                match relay_pool.publish(builder).await {
+                    Ok(id) => tracing::info!(
+                        target: LOG_TARGET,
+                        event_id = %id,
+                        "Published profile metadata (kind 0)"
+                    ),
+                    Err(e) => tracing::warn!(
+                        target: LOG_TARGET,
+                        error = %e,
+                        "Failed to publish profile metadata"
+                    ),
+                }
+            }
+            if let Some(builder) = relay_list_event {
+                match relay_pool.publish(builder).await {
+                    Ok(id) => tracing::info!(
+                        target: LOG_TARGET,
+                        event_id = %id,
+                        "Published relay list (kind 10002)"
+                    ),
+                    Err(e) => tracing::warn!(
+                        target: LOG_TARGET,
+                        error = %e,
+                        "Failed to publish relay list"
+                    ),
+                }
+            }
+            tracing::info!(
+                target: LOG_TARGET,
+                "Discoverability event publishing complete"
+            );
+        })
     }
 
     // ── Event loop support ─────────────────────────────────────────
@@ -636,7 +864,18 @@ mod tests {
         use crate::relay::mock::MockRelayPool;
         let pool: Arc<dyn RelayPoolTrait> = Arc::new(MockRelayPool::new());
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        AnnouncementManager::new(pool, server_info, encryption_mode, gift_wrap_mode, tx)
+        AnnouncementManager::new(
+            pool,
+            server_info,
+            encryption_mode,
+            gift_wrap_mode,
+            tx,
+            Vec::new(),
+            None,
+            None,
+            true,
+            None,
+        )
     }
 
     // ── 1. Server info tags ────────────────────────────────────────
@@ -839,6 +1078,11 @@ mod tests {
             EncryptionMode::Disabled,
             GiftWrapMode::Optional,
             tx,
+            Vec::new(),
+            None,
+            None,
+            true,
+            None,
         );
         (mgr, pool, rx)
     }
@@ -1060,6 +1304,253 @@ mod tests {
         assert_eq!(
             notif.message.method(),
             Some(NOTIFICATIONS_INITIALIZED_METHOD)
+        );
+    }
+
+    // ── 13. Relay list + profile metadata (CEP-6) ──────────────────
+
+    fn make_manager_with_discoverability(
+        relay_urls: Vec<String>,
+        relay_list_urls: Option<Vec<String>>,
+        bootstrap_relay_urls: Option<Vec<String>>,
+        publish_relay_list: bool,
+        profile_metadata: Option<ProfileMetadata>,
+    ) -> (AnnouncementManager, Arc<crate::relay::mock::MockRelayPool>) {
+        use crate::relay::mock::MockRelayPool;
+        let pool = Arc::new(MockRelayPool::new());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mgr = AnnouncementManager::new(
+            Arc::clone(&pool) as Arc<dyn RelayPoolTrait>,
+            None,
+            EncryptionMode::Disabled,
+            GiftWrapMode::Optional,
+            tx,
+            relay_urls,
+            relay_list_urls,
+            bootstrap_relay_urls,
+            publish_relay_list,
+            profile_metadata,
+        );
+        (mgr, pool)
+    }
+
+    #[test]
+    fn is_local_relay_url_detects_localhost() {
+        assert!(is_local_relay_url("ws://localhost:7777"));
+        assert!(is_local_relay_url("wss://localhost"));
+        assert!(is_local_relay_url("ws://127.0.0.1:8080"));
+        assert!(is_local_relay_url("ws://0.0.0.0:9999"));
+        assert!(is_local_relay_url("ws://[::1]:7777"));
+    }
+
+    #[test]
+    fn is_local_relay_url_rejects_remote() {
+        assert!(!is_local_relay_url("wss://relay.damus.io"));
+        assert!(!is_local_relay_url("wss://relay.example.com"));
+        assert!(!is_local_relay_url("ws://10.0.0.1:7777"));
+    }
+
+    #[test]
+    fn get_advertised_relay_urls_uses_relay_list_when_set() {
+        let (mgr, _pool) = make_manager_with_discoverability(
+            vec!["wss://connected.relay".into()],
+            Some(vec!["wss://advertised.relay".into()]),
+            None,
+            true,
+            None,
+        );
+        assert_eq!(mgr.get_advertised_relay_urls(), &["wss://advertised.relay"]);
+    }
+
+    #[test]
+    fn get_advertised_relay_urls_falls_back_to_relay_urls() {
+        let (mgr, _pool) = make_manager_with_discoverability(
+            vec!["wss://connected.relay".into()],
+            None,
+            None,
+            true,
+            None,
+        );
+        assert_eq!(mgr.get_advertised_relay_urls(), &["wss://connected.relay"]);
+    }
+
+    #[test]
+    fn get_discoverability_urls_merges_bootstrap() {
+        let (mgr, _pool) = make_manager_with_discoverability(
+            vec!["wss://my.relay".into()],
+            None,
+            None,
+            true,
+            None,
+        );
+        let urls = mgr.get_discoverability_publish_relay_urls();
+        assert!(urls.contains(&"wss://my.relay".to_string()));
+        // Should include default bootstrap relays
+        assert!(urls.len() > 1);
+        assert!(urls.contains(&DEFAULT_BOOTSTRAP_RELAY_URLS[0].to_string()));
+    }
+
+    #[test]
+    fn get_discoverability_urls_skips_bootstrap_for_local_only() {
+        let (mgr, _pool) = make_manager_with_discoverability(
+            vec!["ws://127.0.0.1:7777".into()],
+            None,
+            None,
+            true,
+            None,
+        );
+        let urls = mgr.get_discoverability_publish_relay_urls();
+        assert_eq!(urls, vec!["ws://127.0.0.1:7777"]);
+    }
+
+    #[test]
+    fn get_discoverability_urls_keeps_explicit_bootstrap_even_for_local() {
+        let (mgr, _pool) = make_manager_with_discoverability(
+            vec!["ws://127.0.0.1:7777".into()],
+            None,
+            Some(vec!["wss://explicit-bootstrap.relay".into()]),
+            true,
+            None,
+        );
+        let urls = mgr.get_discoverability_publish_relay_urls();
+        assert!(urls.contains(&"ws://127.0.0.1:7777".to_string()));
+        assert!(urls.contains(&"wss://explicit-bootstrap.relay".to_string()));
+    }
+
+    #[test]
+    fn get_discoverability_urls_deduplicates() {
+        let (mgr, _pool) = make_manager_with_discoverability(
+            vec!["wss://relay.damus.io".into()],
+            None,
+            None,
+            true,
+            None,
+        );
+        let urls = mgr.get_discoverability_publish_relay_urls();
+        let damus_count = urls
+            .iter()
+            .filter(|u| *u == "wss://relay.damus.io")
+            .count();
+        assert_eq!(damus_count, 1, "should be deduplicated");
+    }
+
+    #[tokio::test]
+    async fn publish_relay_list_event_shape() {
+        let (mgr, pool) = make_manager_with_discoverability(
+            vec![
+                "wss://relay1.example.com".into(),
+                "wss://relay2.example.com".into(),
+            ],
+            None,
+            None,
+            true,
+            None,
+        );
+        mgr.publish_relay_list().await.unwrap();
+        let events = pool.stored_events().await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, Kind::Custom(RELAY_LIST_METADATA_KIND));
+        assert_eq!(events[0].content, "");
+        let tag_values: Vec<String> = events[0]
+            .tags
+            .iter()
+            .filter(|t| (*t).clone().to_vec().first().map(|s| s.as_str()) == Some("r"))
+            .filter_map(|t| (*t).clone().to_vec().get(1).cloned())
+            .collect();
+        assert_eq!(
+            tag_values,
+            vec!["wss://relay1.example.com", "wss://relay2.example.com"]
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_relay_list_uses_relay_list_urls_override() {
+        let (mgr, pool) = make_manager_with_discoverability(
+            vec!["wss://connected.relay".into()],
+            Some(vec!["wss://override.relay".into()]),
+            None,
+            true,
+            None,
+        );
+        mgr.publish_relay_list().await.unwrap();
+        let events = pool.stored_events().await;
+        assert_eq!(events.len(), 1);
+        let tag_values: Vec<String> = events[0]
+            .tags
+            .iter()
+            .filter(|t| (*t).clone().to_vec().first().map(|s| s.as_str()) == Some("r"))
+            .filter_map(|t| (*t).clone().to_vec().get(1).cloned())
+            .collect();
+        assert_eq!(tag_values, vec!["wss://override.relay"]);
+    }
+
+    #[tokio::test]
+    async fn publish_relay_list_opt_out() {
+        let (mgr, pool) = make_manager_with_discoverability(
+            vec!["wss://relay.example.com".into()],
+            None,
+            None,
+            false,
+            None,
+        );
+        mgr.publish_relay_list().await.unwrap();
+        assert!(
+            pool.stored_events().await.is_empty(),
+            "should not publish when disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_relay_list_empty_urls_no_publish() {
+        let (mgr, pool) = make_manager_with_discoverability(
+            Vec::new(),
+            None,
+            None,
+            true,
+            None,
+        );
+        mgr.publish_relay_list().await.unwrap();
+        assert!(
+            pool.stored_events().await.is_empty(),
+            "should not publish with no URLs"
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_profile_metadata_event_shape() {
+        let metadata = ProfileMetadata::default()
+            .with_name("Test Server")
+            .with_about("A test MCP server");
+        let (mgr, pool) = make_manager_with_discoverability(
+            Vec::new(),
+            None,
+            None,
+            true,
+            Some(metadata),
+        );
+        mgr.publish_profile_metadata().await.unwrap();
+        let events = pool.stored_events().await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, Kind::Custom(0));
+        assert!(events[0].tags.is_empty());
+        let parsed: ProfileMetadata = serde_json::from_str(&events[0].content).unwrap();
+        assert_eq!(parsed.name.as_deref(), Some("Test Server"));
+        assert_eq!(parsed.about.as_deref(), Some("A test MCP server"));
+    }
+
+    #[tokio::test]
+    async fn publish_profile_metadata_noop_when_unconfigured() {
+        let (mgr, pool) = make_manager_with_discoverability(
+            Vec::new(),
+            None,
+            None,
+            true,
+            None,
+        );
+        mgr.publish_profile_metadata().await.unwrap();
+        assert!(
+            pool.stored_events().await.is_empty(),
+            "should not publish without profile metadata"
         );
     }
 }

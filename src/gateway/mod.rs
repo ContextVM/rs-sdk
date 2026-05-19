@@ -139,6 +139,10 @@ mod tests {
             cleanup_interval: Duration::from_secs(120),
             session_timeout: Duration::from_secs(600),
             request_timeout: Duration::from_secs(60),
+            relay_list_urls: None,
+            bootstrap_relay_urls: None,
+            publish_relay_list: true,
+            profile_metadata: None,
         };
 
         let config = GatewayConfig { nostr_config };
