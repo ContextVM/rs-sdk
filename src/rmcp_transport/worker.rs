@@ -3,6 +3,7 @@
 //! This file defines wrapper types that bind existing ContextVM Nostr
 //! transports to rmcp's worker abstraction.
 
+use crate::core::constants::ANNOUNCEMENT_REQUEST_ID;
 use crate::core::error::Result;
 use crate::core::types::{JsonRpcMessage, JsonRpcNotification, JsonRpcRequest};
 use crate::transport::client::{NostrClientTransport, NostrClientTransportConfig};
@@ -117,6 +118,10 @@ impl Worker for NostrServerWorker {
             .start()
             .await
             .map_err(WorkerQuitReason::fatal_context("starting server transport"))?;
+
+        // CEP-6: Spawn auto-publish after start() so the worker's select loop
+        // is running when synthetic messages arrive through message_tx.
+        self.transport.spawn_announcements();
 
         let mut rx = self.transport.take_message_receiver().ok_or_else(|| {
             WorkerQuitReason::fatal(
@@ -366,6 +371,17 @@ impl NostrServerWorker {
                     )
                 })?;
 
+                if event_id == ANNOUNCEMENT_REQUEST_ID {
+                    tracing::debug!(
+                        target: LOG_TARGET,
+                        "Routing announcement response to handler"
+                    );
+                    return self
+                        .transport
+                        .handle_announcement_response(JsonRpcMessage::Response(resp))
+                        .await;
+                }
+
                 if event_id == STATELESS_SYNTHETIC_EVENT_ID {
                     tracing::debug!(
                         target: LOG_TARGET,
@@ -385,6 +401,17 @@ impl NostrServerWorker {
                         "rmcp server error response id is not a string event_id".to_string(),
                     )
                 })?;
+
+                if event_id == ANNOUNCEMENT_REQUEST_ID {
+                    tracing::debug!(
+                        target: LOG_TARGET,
+                        "Routing announcement error to handler"
+                    );
+                    return self
+                        .transport
+                        .handle_announcement_response(JsonRpcMessage::ErrorResponse(resp))
+                        .await;
+                }
 
                 if event_id == STATELESS_SYNTHETIC_EVENT_ID {
                     tracing::debug!(
@@ -516,5 +543,30 @@ mod tests {
         assert!(is_synthetic_initialize_message(
             &synthetic_initialize_message()
         ));
+    }
+
+    #[test]
+    fn test_announcement_sentinel_differs_from_stateless_sentinel() {
+        assert_ne!(ANNOUNCEMENT_REQUEST_ID, STATELESS_SYNTHETIC_EVENT_ID);
+    }
+
+    #[test]
+    fn test_announcement_response_id_detected() {
+        let response = JsonRpcMessage::Response(JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: serde_json::json!(ANNOUNCEMENT_REQUEST_ID),
+            result: serde_json::json!({
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "serverInfo": { "name": "test" }
+            }),
+        });
+
+        if let JsonRpcMessage::Response(ref resp) = response {
+            let event_id = resp.id.as_str().unwrap();
+            assert_eq!(event_id, ANNOUNCEMENT_REQUEST_ID);
+            // Must not be confused with the stateless synthetic sentinel
+            assert!(!is_synthetic_initialize_message(&response));
+        }
     }
 }

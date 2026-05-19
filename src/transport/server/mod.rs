@@ -215,6 +215,7 @@ impl NostrServerTransport {
                 config.server_info.clone(),
                 config.encryption_mode,
                 config.gift_wrap_mode,
+                tx.clone(),
             ),
             base: BaseTransport {
                 relay_pool,
@@ -256,6 +257,7 @@ impl NostrServerTransport {
                 config.server_info.clone(),
                 config.encryption_mode,
                 config.gift_wrap_mode,
+                tx.clone(),
             ),
             base: BaseTransport {
                 relay_pool,
@@ -430,6 +432,7 @@ impl NostrServerTransport {
         for handle in self.task_handles.drain(..) {
             let _ = handle.await;
         }
+        self.announcement_manager.shutdown();
         self.message_tx.take();
         self.base.disconnect().await?;
         self.sessions.clear().await;
@@ -703,6 +706,34 @@ impl NostrServerTransport {
     /// Delete server announcements (NIP-09 kind 5).
     pub async fn delete_announcements(&self, reason: &str) -> Result<()> {
         self.announcement_manager.delete_announcements(reason).await
+    }
+
+    /// Spawn the CEP-6 auto-publish task if `is_announced_server` is set.
+    ///
+    /// Called by the rmcp worker after `start()` — not in `start()` itself —
+    /// because the auto-publish flow injects synthetic MCP requests that
+    /// require an rmcp handler to produce responses.
+    #[cfg_attr(not(feature = "rmcp"), allow(dead_code))]
+    pub(crate) fn spawn_announcements(&mut self) {
+        if self.config.is_announced_server {
+            let handle = self
+                .announcement_manager
+                .spawn_publish_public_announcements(self.cancellation_token.child_token());
+            self.task_handles.push(handle);
+        }
+    }
+
+    /// Forward an announcement response to the announcement manager for publishing.
+    ///
+    /// Called by the worker when a response with the announcement sentinel ID arrives.
+    #[cfg_attr(not(feature = "rmcp"), allow(dead_code))]
+    pub(crate) async fn handle_announcement_response(
+        &self,
+        response: JsonRpcMessage,
+    ) -> Result<()> {
+        self.announcement_manager
+            .handle_announcement_response(response)
+            .await
     }
 
     /// Publish tools list from rmcp typed tool descriptors.

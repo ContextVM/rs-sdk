@@ -97,6 +97,13 @@ pub const INITIALIZE_METHOD: &str = "initialize";
 /// MCP protocol method for the initialized notification
 pub const NOTIFICATIONS_INITIALIZED_METHOD: &str = "notifications/initialized";
 
+/// Sentinel request ID for the announcement auto-publish flow.
+///
+/// Synthetic initialize and capability-list requests use this ID so the
+/// worker routes responses to the announcement handler rather than the
+/// normal client response path.
+pub const ANNOUNCEMENT_REQUEST_ID: &str = "announcement";
+
 /// Kinds that should never be encrypted (public announcements)
 pub const UNENCRYPTED_KINDS: &[u16] = &[
     SERVER_ANNOUNCEMENT_KIND,
@@ -209,6 +216,13 @@ mod tests {
             NOTIFICATIONS_INITIALIZED_METHOD,
             "notifications/initialized"
         );
+    }
+
+    #[test]
+    fn test_announcement_request_id() {
+        assert_eq!(ANNOUNCEMENT_REQUEST_ID, "announcement");
+        // Must differ from the stateless synthetic sentinel used by the worker
+        assert_ne!(ANNOUNCEMENT_REQUEST_ID, "contextvm-stateless-init");
     }
 
     #[test]
