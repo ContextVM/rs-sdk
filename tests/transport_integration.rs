@@ -120,6 +120,14 @@ impl RelayPoolTrait for TestRelayPool {
     async fn subscribe(&self, filters: Vec<Filter>) -> contextvm_sdk::Result<()> {
         self.inner.subscribe(filters).await
     }
+
+    async fn publish_to(
+        &self,
+        urls: &[String],
+        builder: EventBuilder,
+    ) -> contextvm_sdk::Result<EventId> {
+        self.inner.publish_to(urls, builder).await
+    }
 }
 
 /// Let spawned event loops call `notifications()` before we publish anything.

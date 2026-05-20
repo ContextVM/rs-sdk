@@ -34,6 +34,8 @@ pub trait RelayPoolTrait: Send + Sync {
     async fn public_key(&self) -> Result<PublicKey>;
     /// Subscribe to events matching filters.
     async fn subscribe(&self, filters: Vec<Filter>) -> Result<()>;
+    /// Sign and publish an event to specific relay URLs.
+    async fn publish_to(&self, urls: &[String], builder: EventBuilder) -> Result<EventId>;
 }
 
 /// Relay pool wrapper for managing Nostr relay connections.
@@ -135,6 +137,16 @@ impl RelayPool {
         }
         Ok(())
     }
+
+    /// Sign and publish an event to specific relay URLs.
+    pub async fn publish_to(&self, urls: &[String], builder: EventBuilder) -> Result<EventId> {
+        let output = self
+            .client
+            .send_event_builder_to(urls, builder)
+            .await
+            .map_err(|e| Error::Transport(e.to_string()))?;
+        Ok(output.val)
+    }
 }
 
 #[async_trait]
@@ -176,5 +188,9 @@ impl RelayPoolTrait for RelayPool {
 
     async fn subscribe(&self, filters: Vec<Filter>) -> Result<()> {
         RelayPool::subscribe(self, filters).await
+    }
+
+    async fn publish_to(&self, urls: &[String], builder: EventBuilder) -> Result<EventId> {
+        RelayPool::publish_to(self, urls, builder).await
     }
 }

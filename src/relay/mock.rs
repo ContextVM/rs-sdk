@@ -229,6 +229,11 @@ impl RelayPoolTrait for MockRelayPool {
 
         Ok(())
     }
+
+    /// Mock ignores target URLs — delegates to `publish()`.
+    async fn publish_to(&self, _urls: &[String], builder: EventBuilder) -> Result<EventId> {
+        self.publish(builder).await
+    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

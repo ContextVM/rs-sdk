@@ -62,6 +62,19 @@ pub struct NostrServerTransportConfig {
     /// This prevents leaks -- rmcp owns actual request timeout and cancellation.
     /// Keep this value above your rmcp request timeout to avoid premature cleanup.
     pub request_timeout: Duration,
+    /// Explicit relay URLs to advertise in kind 10002 (NIP-65 relay list).
+    ///
+    /// Falls back to the transport's `relay_urls` when omitted.
+    pub relay_list_urls: Option<Vec<String>>,
+    /// Additional publication targets for discoverability events.
+    ///
+    /// Merged with `relay_list_urls` when computing where to send events.
+    /// Defaults to [`DEFAULT_BOOTSTRAP_RELAY_URLS`] when omitted.
+    pub bootstrap_relay_urls: Option<Vec<String>>,
+    /// Whether to publish a relay list event (kind 10002). Default: `true`.
+    pub publish_relay_list: bool,
+    /// Optional NIP-01 profile metadata (kind 0) to publish at startup.
+    pub profile_metadata: Option<ProfileMetadata>,
 }
 
 impl Default for NostrServerTransportConfig {
@@ -78,6 +91,10 @@ impl Default for NostrServerTransportConfig {
             cleanup_interval: Duration::from_secs(60),
             session_timeout: Duration::from_secs(300),
             request_timeout: Duration::from_secs(60),
+            relay_list_urls: None,
+            bootstrap_relay_urls: None,
+            publish_relay_list: true,
+            profile_metadata: None,
         }
     }
 }
@@ -165,6 +182,26 @@ impl NostrServerTransportConfig {
         self.request_timeout = timeout;
         self
     }
+    /// Set explicit relay URLs to advertise in the relay list event (kind 10002).
+    pub fn with_relay_list_urls(mut self, urls: Vec<String>) -> Self {
+        self.relay_list_urls = Some(urls);
+        self
+    }
+    /// Set additional bootstrap relay URLs for discoverability event publication.
+    pub fn with_bootstrap_relay_urls(mut self, urls: Vec<String>) -> Self {
+        self.bootstrap_relay_urls = Some(urls);
+        self
+    }
+    /// Enable or disable relay list publication (kind 10002).
+    pub fn with_publish_relay_list(mut self, publish: bool) -> Self {
+        self.publish_relay_list = publish;
+        self
+    }
+    /// Set NIP-01 profile metadata (kind 0) for publication at startup.
+    pub fn with_profile_metadata(mut self, metadata: ProfileMetadata) -> Self {
+        self.profile_metadata = Some(metadata);
+        self
+    }
 }
 
 /// An incoming MCP request with metadata for routing the response.
@@ -216,6 +253,11 @@ impl NostrServerTransport {
                 config.encryption_mode,
                 config.gift_wrap_mode,
                 tx.clone(),
+                config.relay_urls.clone(),
+                config.relay_list_urls.clone(),
+                config.bootstrap_relay_urls.clone(),
+                config.publish_relay_list,
+                config.profile_metadata.clone(),
             ),
             base: BaseTransport {
                 relay_pool,
@@ -258,6 +300,11 @@ impl NostrServerTransport {
                 config.encryption_mode,
                 config.gift_wrap_mode,
                 tx.clone(),
+                config.relay_urls.clone(),
+                config.relay_list_urls.clone(),
+                config.bootstrap_relay_urls.clone(),
+                config.publish_relay_list,
+                config.profile_metadata.clone(),
             ),
             base: BaseTransport {
                 relay_pool,
@@ -721,6 +768,9 @@ impl NostrServerTransport {
                 .spawn_publish_public_announcements(self.cancellation_token.child_token());
             self.task_handles.push(handle);
         }
+        // Unconditional: publish profile metadata and relay list (guards inside methods)
+        let handle = self.announcement_manager.spawn_publish_discoverability();
+        self.task_handles.push(handle);
     }
 
     /// Forward an announcement response to the announcement manager for publishing.
@@ -1511,6 +1561,10 @@ mod tests {
         assert_eq!(config.session_timeout, Duration::from_secs(300));
         assert_eq!(config.request_timeout, Duration::from_secs(60));
         assert!(config.server_info.is_none());
+        assert!(config.relay_list_urls.is_none());
+        assert!(config.bootstrap_relay_urls.is_none());
+        assert!(config.publish_relay_list);
+        assert!(config.profile_metadata.is_none());
     }
 
     // ── CEP-19 helper logic ──────────────────────────────────────
