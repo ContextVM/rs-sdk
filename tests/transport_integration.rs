@@ -1518,7 +1518,7 @@ async fn publish_tools_empty_list() {
 // ── 23. Delete announcements uses e tags referencing published events ─────────
 
 #[tokio::test]
-async fn delete_announcements_k_tags_match_kinds() {
+async fn delete_announcements_uses_e_tags_for_published_events() {
     let pool = Arc::new(MockRelayPool::new());
 
     let mut server = NostrServerTransport::with_relay_pool(

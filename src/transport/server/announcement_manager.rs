@@ -357,8 +357,8 @@ impl AnnouncementManager {
 
     /// Delete server announcements (NIP-09 kind 5).
     ///
-    /// Queries existing announcement events per kind and publishes kind 5
-    /// deletion events with `["e", event_id]` tags, matching TS SDK behavior.
+    /// Queries existing announcement events per kind and publishes deletion
+    /// events with `["e", event_id]` tags via `EventBuilder::delete()`.
     pub async fn delete_announcements(&self, reason: &str) -> Result<()> {
         let pubkey = self.relay_pool.public_key().await?;
         for &kind in UNENCRYPTED_KINDS {
@@ -370,9 +370,12 @@ impl AnnouncementManager {
             if events.is_empty() {
                 continue;
             }
-            let tags: Vec<Tag> = events.iter().map(|e| Tag::event(e.id)).collect();
-            let builder = EventBuilder::new(Kind::Custom(5), reason).tags(tags);
-            self.relay_pool.publish(builder).await?;
+            let request = EventDeletionRequest::new()
+                .ids(events.iter().map(|e| e.id))
+                .reason(reason);
+            self.relay_pool
+                .publish(EventBuilder::delete(request))
+                .await?;
         }
         Ok(())
     }
@@ -1753,18 +1756,82 @@ mod tests {
 
     #[tokio::test]
     async fn publish_profile_metadata_publish_error_does_not_panic() {
-        // Configure profile metadata but give the manager an empty relay URL set.
-        // publish_to_discoverability_relays falls back to pool.publish() which
-        // succeeds on MockRelayPool — so instead we verify the method's own
-        // error-swallowing: it logs and returns Ok(()) rather than propagating.
+        use crate::relay::mock::MockRelayPool;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        /// A relay pool that fails on publish when the flag is set.
+        struct FailingPool {
+            inner: MockRelayPool,
+            should_fail: AtomicBool,
+        }
+
+        #[async_trait::async_trait]
+        impl RelayPoolTrait for FailingPool {
+            async fn connect(&self, urls: &[String]) -> Result<()> {
+                self.inner.connect(urls).await
+            }
+            async fn disconnect(&self) -> Result<()> {
+                self.inner.disconnect().await
+            }
+            async fn publish_event(&self, event: &Event) -> Result<EventId> {
+                self.inner.publish_event(event).await
+            }
+            async fn publish(&self, builder: EventBuilder) -> Result<EventId> {
+                if self.should_fail.load(Ordering::SeqCst) {
+                    return Err(Error::Transport("injected publish failure".into()));
+                }
+                self.inner.publish(builder).await
+            }
+            async fn sign(&self, builder: EventBuilder) -> Result<Event> {
+                self.inner.sign(builder).await
+            }
+            async fn signer(&self) -> Result<Arc<dyn NostrSigner>> {
+                self.inner.signer().await
+            }
+            fn notifications(&self) -> tokio::sync::broadcast::Receiver<RelayPoolNotification> {
+                self.inner.notifications()
+            }
+            async fn public_key(&self) -> Result<PublicKey> {
+                self.inner.public_key().await
+            }
+            async fn subscribe(&self, filters: Vec<Filter>) -> Result<()> {
+                self.inner.subscribe(filters).await
+            }
+            async fn publish_to(&self, urls: &[String], builder: EventBuilder) -> Result<EventId> {
+                if self.should_fail.load(Ordering::SeqCst) {
+                    return Err(Error::Transport("injected publish failure".into()));
+                }
+                self.inner.publish_to(urls, builder).await
+            }
+            async fn fetch_events(&self, filter: Filter, timeout: Duration) -> Result<Vec<Event>> {
+                self.inner.fetch_events(filter, timeout).await
+            }
+        }
+
+        let pool: Arc<dyn RelayPoolTrait> = Arc::new(FailingPool {
+            inner: MockRelayPool::new(),
+            should_fail: AtomicBool::new(true),
+        });
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let metadata = ProfileMetadata::default().with_name("Err Server");
-        let (mgr, _pool) =
-            make_manager_with_discoverability(Vec::new(), None, None, true, Some(metadata));
-        // Even with no relay URLs configured, the method should not panic.
+        let mgr = AnnouncementManager::new(
+            pool,
+            None,
+            EncryptionMode::Disabled,
+            GiftWrapMode::Optional,
+            tx,
+            Vec::new(),
+            None,
+            None,
+            true,
+            Some(metadata),
+        );
+
+        // publish_profile_metadata swallows the error and returns Ok(())
         let result = mgr.publish_profile_metadata().await;
         assert!(
             result.is_ok(),
-            "publish_profile_metadata should not panic or error"
+            "publish_profile_metadata should swallow publish errors"
         );
     }
 
