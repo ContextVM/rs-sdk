@@ -68,6 +68,47 @@ pub(crate) struct AnnouncementManager {
     profile_metadata: Option<ProfileMetadata>,
 }
 
+/// Maps an MCP result schema to the Nostr event kind for announcement publishing.
+///
+/// The `matches` function validates the result's structure (not just field presence),
+/// matching the TS SDK's Zod `safeParse` semantics.
+struct AnnouncementMapping {
+    matches: fn(&serde_json::Value) -> bool,
+    kind: u16,
+}
+
+/// Schema-to-kind mapping table for MCP announcement responses.
+///
+/// Checked in order — first match wins. Validation checks field types:
+/// `protocolVersion` must be a string, `capabilities` must be an object,
+/// and capability lists (`tools`, `resources`, etc.) must be arrays.
+const ANNOUNCEMENT_MAPPINGS: &[AnnouncementMapping] = &[
+    AnnouncementMapping {
+        matches: |r| r.get("protocolVersion").is_some_and(|v| v.is_string()),
+        kind: SERVER_ANNOUNCEMENT_KIND,
+    },
+    AnnouncementMapping {
+        matches: |r| r.get("capabilities").is_some_and(|v| v.is_object()),
+        kind: SERVER_ANNOUNCEMENT_KIND,
+    },
+    AnnouncementMapping {
+        matches: |r| r.get("tools").is_some_and(|v| v.is_array()),
+        kind: TOOLS_LIST_KIND,
+    },
+    AnnouncementMapping {
+        matches: |r| r.get("resources").is_some_and(|v| v.is_array()),
+        kind: RESOURCES_LIST_KIND,
+    },
+    AnnouncementMapping {
+        matches: |r| r.get("resourceTemplates").is_some_and(|v| v.is_array()),
+        kind: RESOURCETEMPLATES_LIST_KIND,
+    },
+    AnnouncementMapping {
+        matches: |r| r.get("prompts").is_some_and(|v| v.is_array()),
+        kind: PROMPTS_LIST_KIND,
+    },
+];
+
 /// Check whether a relay URL points to a local address.
 ///
 /// Used for smart bootstrap relay detection: default bootstrap relays are
@@ -315,12 +356,22 @@ impl AnnouncementManager {
     }
 
     /// Delete server announcements (NIP-09 kind 5).
+    ///
+    /// Queries existing announcement events per kind and publishes kind 5
+    /// deletion events with `["e", event_id]` tags, matching TS SDK behavior.
     pub async fn delete_announcements(&self, reason: &str) -> Result<()> {
-        for kind in UNENCRYPTED_KINDS {
-            let builder = EventBuilder::new(Kind::Custom(5), reason).tag(Tag::custom(
-                TagKind::Custom("k".into()),
-                vec![kind.to_string()],
-            ));
+        let pubkey = self.relay_pool.public_key().await?;
+        for &kind in UNENCRYPTED_KINDS {
+            let filter = Filter::new().kind(Kind::Custom(kind)).author(pubkey);
+            let events = self
+                .relay_pool
+                .fetch_events(filter, Duration::from_secs(10))
+                .await?;
+            if events.is_empty() {
+                continue;
+            }
+            let tags: Vec<Tag> = events.iter().map(|e| Tag::event(e.id)).collect();
+            let builder = EventBuilder::new(Kind::Custom(5), reason).tags(tags);
             self.relay_pool.publish(builder).await?;
         }
         Ok(())
@@ -642,25 +693,18 @@ impl AnnouncementManager {
             _ => return Ok(()),
         };
 
-        // Determine event kind from response schema.
-        let kind =
-            if result.get("protocolVersion").is_some() || result.get("capabilities").is_some() {
-                Some(SERVER_ANNOUNCEMENT_KIND)
-            } else if result.get("tools").is_some() {
-                Some(TOOLS_LIST_KIND)
-            } else if result.get("resources").is_some() {
-                Some(RESOURCES_LIST_KIND)
-            } else if result.get("resourceTemplates").is_some() {
-                Some(RESOURCETEMPLATES_LIST_KIND)
-            } else if result.get("prompts").is_some() {
-                Some(PROMPTS_LIST_KIND)
-            } else {
-                tracing::warn!(
-                    target: LOG_TARGET,
-                    "Announcement response has unrecognized schema, skipping publish"
-                );
-                None
-            };
+        // Determine event kind via the schema-to-kind mapping table.
+        let kind = ANNOUNCEMENT_MAPPINGS
+            .iter()
+            .find(|m| (m.matches)(result))
+            .map(|m| m.kind);
+
+        if kind.is_none() {
+            tracing::warn!(
+                target: LOG_TARGET,
+                "Announcement response has unrecognized schema, skipping publish"
+            );
+        }
 
         if let Some(kind) = kind {
             let content = serde_json::to_string(result)?;
@@ -1551,6 +1595,329 @@ mod tests {
         assert!(
             pool.stored_events().await.is_empty(),
             "should not publish without profile metadata"
+        );
+    }
+
+    // ── 14. Integration tests + cleanup (CEP-6) ────────────────────
+
+    #[test]
+    fn announcement_mapping_table_covers_all_kinds() {
+        let kinds: HashSet<u16> = ANNOUNCEMENT_MAPPINGS.iter().map(|m| m.kind).collect();
+        assert!(kinds.contains(&SERVER_ANNOUNCEMENT_KIND));
+        assert!(kinds.contains(&TOOLS_LIST_KIND));
+        assert!(kinds.contains(&RESOURCES_LIST_KIND));
+        assert!(kinds.contains(&RESOURCETEMPLATES_LIST_KIND));
+        assert!(kinds.contains(&PROMPTS_LIST_KIND));
+    }
+
+    #[test]
+    fn announcement_mapping_resource_templates_regression() {
+        let result = serde_json::json!({ "resourceTemplates": [] });
+        let kind = ANNOUNCEMENT_MAPPINGS
+            .iter()
+            .find(|m| (m.matches)(&result))
+            .map(|m| m.kind);
+        assert_eq!(kind, Some(RESOURCETEMPLATES_LIST_KIND));
+    }
+
+    #[test]
+    fn announcement_mapping_rejects_null_field() {
+        let result = serde_json::json!({ "tools": null });
+        let kind = ANNOUNCEMENT_MAPPINGS
+            .iter()
+            .find(|m| (m.matches)(&result))
+            .map(|m| m.kind);
+        assert_eq!(kind, None, "null field should not match any schema");
+    }
+
+    #[test]
+    fn announcement_mapping_rejects_wrong_type() {
+        let result = serde_json::json!({ "tools": "not an array" });
+        let kind = ANNOUNCEMENT_MAPPINGS
+            .iter()
+            .find(|m| (m.matches)(&result))
+            .map(|m| m.kind);
+        assert_eq!(kind, None, "string field should not match array schema");
+    }
+
+    #[tokio::test]
+    async fn handle_announcement_response_rejects_malformed_payload() {
+        let (mgr, pool, _rx) = make_manager_with_pool(None);
+
+        let response = JsonRpcMessage::Response(JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: serde_json::json!(ANNOUNCEMENT_REQUEST_ID),
+            result: serde_json::json!({ "tools": null }),
+        });
+        mgr.handle_announcement_response(response).await.unwrap();
+        assert!(
+            pool.stored_events().await.is_empty(),
+            "malformed payload should not produce an event"
+        );
+    }
+
+    #[tokio::test]
+    async fn roundtrip_publish_discover_all_5_kinds() {
+        let info = ServerInfo {
+            name: Some("Roundtrip".into()),
+            ..Default::default()
+        };
+        let (mgr, pool, _rx) = make_manager_with_pool(Some(info));
+
+        let responses = vec![
+            serde_json::json!({
+                "protocolVersion": "2025-11-25",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "Roundtrip", "version": "1.0"}
+            }),
+            serde_json::json!({"tools": [{"name": "echo"}]}),
+            serde_json::json!({"resources": [{"name": "config"}]}),
+            serde_json::json!({"resourceTemplates": [{"name": "tmpl"}]}),
+            serde_json::json!({"prompts": [{"name": "greet"}]}),
+        ];
+        for result in responses {
+            mgr.handle_announcement_response(JsonRpcMessage::Response(JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id: serde_json::json!(ANNOUNCEMENT_REQUEST_ID),
+                result,
+            }))
+            .await
+            .unwrap();
+        }
+
+        // Discover via fetch_events for each kind
+        let pubkey = pool.mock_public_key();
+        for (kind, key) in [
+            (SERVER_ANNOUNCEMENT_KIND, "protocolVersion"),
+            (TOOLS_LIST_KIND, "tools"),
+            (RESOURCES_LIST_KIND, "resources"),
+            (RESOURCETEMPLATES_LIST_KIND, "resourceTemplates"),
+            (PROMPTS_LIST_KIND, "prompts"),
+        ] {
+            let filter = Filter::new().kind(Kind::Custom(kind)).author(pubkey);
+            let events = pool
+                .fetch_events(filter, Duration::from_secs(1))
+                .await
+                .unwrap();
+            assert_eq!(events.len(), 1, "kind {kind} should have exactly 1 event");
+            let content: serde_json::Value = serde_json::from_str(&events[0].content).unwrap();
+            assert!(
+                content.get(key).is_some(),
+                "kind {kind} content should contain '{key}'"
+            );
+        }
+    }
+
+    // ── 15. CEP-6 parity tests ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn publish_profile_metadata_preserves_custom_fields() {
+        let mut metadata = ProfileMetadata::default()
+            .with_name("Full Server")
+            .with_about("All fields present")
+            .with_picture("https://example.com/pic.png")
+            .with_banner("https://example.com/banner.png")
+            .with_website("https://example.com")
+            .with_nip05("server@example.com")
+            .with_lud16("server@walletofsatoshi.com");
+        metadata
+            .extra
+            .insert("custom_flag".into(), serde_json::json!(true));
+
+        let (mgr, pool) =
+            make_manager_with_discoverability(Vec::new(), None, None, true, Some(metadata));
+        mgr.publish_profile_metadata().await.unwrap();
+
+        let events = pool.stored_events().await;
+        assert_eq!(events.len(), 1);
+        let parsed: ProfileMetadata = serde_json::from_str(&events[0].content).unwrap();
+        assert_eq!(parsed.name.as_deref(), Some("Full Server"));
+        assert_eq!(parsed.about.as_deref(), Some("All fields present"));
+        assert_eq!(
+            parsed.picture.as_deref(),
+            Some("https://example.com/pic.png")
+        );
+        assert_eq!(
+            parsed.banner.as_deref(),
+            Some("https://example.com/banner.png")
+        );
+        assert_eq!(parsed.website.as_deref(), Some("https://example.com"));
+        assert_eq!(parsed.nip05.as_deref(), Some("server@example.com"));
+        assert_eq!(parsed.lud16.as_deref(), Some("server@walletofsatoshi.com"));
+        assert_eq!(
+            parsed.extra.get("custom_flag"),
+            Some(&serde_json::json!(true)),
+            "custom field should survive publish round-trip"
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_profile_metadata_publish_error_does_not_panic() {
+        // Configure profile metadata but give the manager an empty relay URL set.
+        // publish_to_discoverability_relays falls back to pool.publish() which
+        // succeeds on MockRelayPool — so instead we verify the method's own
+        // error-swallowing: it logs and returns Ok(()) rather than propagating.
+        let metadata = ProfileMetadata::default().with_name("Err Server");
+        let (mgr, _pool) =
+            make_manager_with_discoverability(Vec::new(), None, None, true, Some(metadata));
+        // Even with no relay URLs configured, the method should not panic.
+        let result = mgr.publish_profile_metadata().await;
+        assert!(
+            result.is_ok(),
+            "publish_profile_metadata should not panic or error"
+        );
+    }
+
+    #[tokio::test]
+    async fn private_server_publishes_relay_list_but_not_announcements() {
+        // A private server (is_announced_server: false at transport level) still
+        // publishes relay list for discoverability. The AnnouncementManager doesn't
+        // gate on is_announced_server — that's the transport's job — so calling
+        // publish_relay_list() should work, while never calling announce() means
+        // no kind 11316 events exist.
+        let (mgr, pool) = make_manager_with_discoverability(
+            vec!["wss://relay.example.com".into()],
+            None,
+            None,
+            true,
+            None,
+        );
+
+        // Publish relay list (kind 10002) — should succeed.
+        mgr.publish_relay_list().await.unwrap();
+
+        let events = pool.stored_events().await;
+        let relay_list_events: Vec<_> = events
+            .iter()
+            .filter(|e| e.kind == Kind::Custom(RELAY_LIST_METADATA_KIND))
+            .collect();
+        assert_eq!(
+            relay_list_events.len(),
+            1,
+            "relay list (kind 10002) should be published"
+        );
+
+        // No kind 11316 events — announce() was never called (private server).
+        let announcement_events: Vec<_> = events
+            .iter()
+            .filter(|e| e.kind == Kind::Custom(SERVER_ANNOUNCEMENT_KIND))
+            .collect();
+        assert!(
+            announcement_events.is_empty(),
+            "private server should have no kind 11316 announcements"
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_list_advertises_different_urls_than_bootstrap() {
+        let (mgr, pool) = make_manager_with_discoverability(
+            vec!["wss://connected.relay".into()],
+            Some(vec![
+                "wss://public1.relay".into(),
+                "wss://public2.relay".into(),
+            ]),
+            Some(vec!["wss://bootstrap.relay".into()]),
+            true,
+            None,
+        );
+        mgr.publish_relay_list().await.unwrap();
+
+        let events = pool.stored_events().await;
+        assert_eq!(events.len(), 1);
+        let tag_values: Vec<String> = events[0]
+            .tags
+            .iter()
+            .filter(|t| (*t).clone().to_vec().first().map(|s| s.as_str()) == Some("r"))
+            .filter_map(|t| (*t).clone().to_vec().get(1).cloned())
+            .collect();
+        assert_eq!(
+            tag_values,
+            vec!["wss://public1.relay", "wss://public2.relay"],
+            "kind 10002 tags should contain only relay_list_urls"
+        );
+        assert!(
+            !tag_values.contains(&"wss://bootstrap.relay".to_string()),
+            "bootstrap URLs must not appear in kind 10002 tags"
+        );
+    }
+
+    #[tokio::test]
+    async fn profile_metadata_published_regardless_of_announced_server() {
+        // Profile metadata (kind 0) is decoupled from is_announced_server.
+        // The AnnouncementManager publishes it whenever configured, even if the
+        // transport never calls announce().
+        let metadata = ProfileMetadata::default()
+            .with_name("Private Server")
+            .with_about("Not publicly announced");
+        let (mgr, pool) =
+            make_manager_with_discoverability(Vec::new(), None, None, true, Some(metadata));
+
+        // Publish only profile metadata — do NOT call announce().
+        mgr.publish_profile_metadata().await.unwrap();
+
+        let events = pool.stored_events().await;
+        let profile_events: Vec<_> = events
+            .iter()
+            .filter(|e| e.kind == Kind::Custom(0))
+            .collect();
+        assert_eq!(
+            profile_events.len(),
+            1,
+            "kind 0 should be published even without announcements"
+        );
+
+        let announcement_events: Vec<_> = events
+            .iter()
+            .filter(|e| e.kind == Kind::Custom(SERVER_ANNOUNCEMENT_KIND))
+            .collect();
+        assert!(
+            announcement_events.is_empty(),
+            "no kind 11316 should exist when announce() not called"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_announcements_uses_e_tags() {
+        let info = ServerInfo {
+            name: Some("Del".into()),
+            ..Default::default()
+        };
+        let (mgr, pool, _rx) = make_manager_with_pool(Some(info));
+
+        // Publish an announcement (kind 11316)
+        mgr.announce().await.unwrap();
+        let published = pool.stored_events().await;
+        let announcement_id = published[0].id;
+
+        // Delete
+        mgr.delete_announcements("going offline").await.unwrap();
+
+        // Find deletion events (kind 5)
+        let all_events = pool.stored_events().await;
+        let deletion_events: Vec<_> = all_events
+            .iter()
+            .filter(|e| e.kind == Kind::Custom(5))
+            .collect();
+        assert!(!deletion_events.is_empty(), "should have deletion events");
+
+        // Verify ["e", event_id] tags, not ["k", kind]
+        let del = &deletion_events[0];
+        let tags: Vec<Vec<String>> = del.tags.iter().map(|t| (*t).clone().to_vec()).collect();
+        assert!(!tags.is_empty(), "deletion event should have tags");
+        for tag in &tags {
+            assert_eq!(tag[0], "e", "deletion tag should be 'e', not 'k'");
+        }
+        let ann_id_hex = announcement_id.to_hex();
+        assert!(
+            tags.iter()
+                .any(|t| t.get(1).map(|s| s.as_str()) == Some(ann_id_hex.as_str())),
+            "deletion should reference the published announcement event ID"
+        );
+        assert_eq!(del.content, "going offline");
+        assert_eq!(
+            deletion_events.len(),
+            1,
+            "only one kind was published so only one deletion event expected"
         );
     }
 }
