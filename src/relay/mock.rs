@@ -234,6 +234,21 @@ impl RelayPoolTrait for MockRelayPool {
     async fn publish_to(&self, _urls: &[String], builder: EventBuilder) -> Result<EventId> {
         self.publish(builder).await
     }
+
+    /// Return stored events matching the filter.
+    async fn fetch_events(
+        &self,
+        filter: Filter,
+        _timeout: std::time::Duration,
+    ) -> Result<Vec<Event>> {
+        let inner = self.inner.lock().await;
+        Ok(inner
+            .events
+            .iter()
+            .filter(|e| filter.match_event(e, MatchEventOptions::default()))
+            .cloned()
+            .collect())
+    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

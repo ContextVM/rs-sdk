@@ -128,6 +128,14 @@ impl RelayPoolTrait for TestRelayPool {
     ) -> contextvm_sdk::Result<EventId> {
         self.inner.publish_to(urls, builder).await
     }
+
+    async fn fetch_events(
+        &self,
+        filter: Filter,
+        timeout: Duration,
+    ) -> contextvm_sdk::Result<Vec<Event>> {
+        self.inner.fetch_events(filter, timeout).await
+    }
 }
 
 /// Let spawned event loops call `notifications()` before we publish anything.
@@ -1507,7 +1515,7 @@ async fn publish_tools_empty_list() {
     assert!(arr.is_empty(), "empty tools list must produce tools: []");
 }
 
-// ── 23. Delete announcements k tags match kinds ─────────────────────────────
+// ── 23. Delete announcements uses e tags referencing published events ─────────
 
 #[tokio::test]
 async fn delete_announcements_k_tags_match_kinds() {
@@ -1531,36 +1539,44 @@ async fn delete_announcements_k_tags_match_kinds() {
         .expect("delete announcements");
 
     let events = pool.stored_events().await;
+
+    // Find the kind 11316 announcement that was published by announce()
+    let announcement = events
+        .iter()
+        .find(|e| e.kind == Kind::Custom(SERVER_ANNOUNCEMENT_KIND))
+        .expect("should have a kind 11316 announcement event");
+    let announcement_id = announcement.id;
+
+    // Only 1 deletion event expected: only kind 11316 was announced
     let kind5_events: Vec<_> = events
         .iter()
         .filter(|e| e.kind == Kind::Custom(5))
         .collect();
-
-    assert_eq!(kind5_events.len(), 5);
-
-    // Collect k tag values from all kind-5 events.
-    let mut k_values: Vec<u16> = kind5_events
-        .iter()
-        .filter_map(|e| {
-            contextvm_sdk::core::serializers::get_tag_value(&e.tags, "k")
-                .and_then(|v| v.parse::<u16>().ok())
-        })
-        .collect();
-    k_values.sort();
-
-    let mut expected = vec![
-        SERVER_ANNOUNCEMENT_KIND,
-        TOOLS_LIST_KIND,
-        RESOURCES_LIST_KIND,
-        RESOURCETEMPLATES_LIST_KIND,
-        PROMPTS_LIST_KIND,
-    ];
-    expected.sort();
-
     assert_eq!(
-        k_values, expected,
-        "each kind-5 event must have a k tag matching one announcement kind"
+        kind5_events.len(),
+        1,
+        "only one kind was announced so only one deletion event expected"
     );
+
+    let del = &kind5_events[0];
+
+    // Deletion uses ["e", event_id] tags (not ["k", kind])
+    let tags: Vec<Vec<String>> = del.tags.iter().map(|t| (*t).clone().to_vec()).collect();
+    assert!(!tags.is_empty(), "deletion event should have tags");
+    for tag in &tags {
+        assert_eq!(tag[0], "e", "deletion tag should be 'e', not 'k'");
+    }
+
+    // The e tag must reference the announced event's ID
+    let ann_id_hex = announcement_id.to_hex();
+    assert!(
+        tags.iter()
+            .any(|t| t.get(1).map(|s| s.as_str()) == Some(ann_id_hex.as_str())),
+        "deletion should reference the published announcement event ID"
+    );
+
+    // Content is the reason string
+    assert_eq!(del.content, "shutting down");
 }
 
 // ── 24. Encryption Disabled server rejects gift-wrap ────────────────────────

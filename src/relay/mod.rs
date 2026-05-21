@@ -12,6 +12,7 @@ use async_trait::async_trait;
 use crate::core::error::{Error, Result};
 use nostr_sdk::prelude::*;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Trait abstracting relay pool operations, enabling dependency injection and testing.
 #[async_trait]
@@ -36,6 +37,8 @@ pub trait RelayPoolTrait: Send + Sync {
     async fn subscribe(&self, filters: Vec<Filter>) -> Result<()>;
     /// Sign and publish an event to specific relay URLs.
     async fn publish_to(&self, urls: &[String], builder: EventBuilder) -> Result<EventId>;
+    /// Fetch events matching a filter from connected relays.
+    async fn fetch_events(&self, filter: Filter, timeout: Duration) -> Result<Vec<Event>>;
 }
 
 /// Relay pool wrapper for managing Nostr relay connections.
@@ -147,6 +150,16 @@ impl RelayPool {
             .map_err(|e| Error::Transport(e.to_string()))?;
         Ok(output.val)
     }
+
+    /// Fetch events matching a filter from connected relays.
+    pub async fn fetch_events(&self, filter: Filter, timeout: Duration) -> Result<Vec<Event>> {
+        let events = self
+            .client
+            .fetch_events(filter, timeout)
+            .await
+            .map_err(|e| Error::Transport(e.to_string()))?;
+        Ok(events.into_iter().collect())
+    }
 }
 
 #[async_trait]
@@ -192,5 +205,9 @@ impl RelayPoolTrait for RelayPool {
 
     async fn publish_to(&self, urls: &[String], builder: EventBuilder) -> Result<EventId> {
         RelayPool::publish_to(self, urls, builder).await
+    }
+
+    async fn fetch_events(&self, filter: Filter, timeout: Duration) -> Result<Vec<Event>> {
+        RelayPool::fetch_events(self, filter, timeout).await
     }
 }
