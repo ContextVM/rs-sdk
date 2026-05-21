@@ -365,7 +365,7 @@ impl AnnouncementManager {
             let filter = Filter::new().kind(Kind::Custom(kind)).author(pubkey);
             let events = self
                 .relay_pool
-                .fetch_events(filter, Duration::from_secs(10))
+                .fetch_events(vec![filter], Duration::from_secs(10))
                 .await?;
             if events.is_empty() {
                 continue;
@@ -1699,7 +1699,7 @@ mod tests {
         ] {
             let filter = Filter::new().kind(Kind::Custom(kind)).author(pubkey);
             let events = pool
-                .fetch_events(filter, Duration::from_secs(1))
+                .fetch_events(vec![filter], Duration::from_secs(1))
                 .await
                 .unwrap();
             assert_eq!(events.len(), 1, "kind {kind} should have exactly 1 event");
@@ -1803,8 +1803,12 @@ mod tests {
                 }
                 self.inner.publish_to(urls, builder).await
             }
-            async fn fetch_events(&self, filter: Filter, timeout: Duration) -> Result<Vec<Event>> {
-                self.inner.fetch_events(filter, timeout).await
+            async fn fetch_events(
+                &self,
+                filters: Vec<Filter>,
+                timeout: Duration,
+            ) -> Result<Vec<Event>> {
+                self.inner.fetch_events(filters, timeout).await
             }
         }
 

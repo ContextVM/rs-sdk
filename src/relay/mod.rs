@@ -37,8 +37,8 @@ pub trait RelayPoolTrait: Send + Sync {
     async fn subscribe(&self, filters: Vec<Filter>) -> Result<()>;
     /// Sign and publish an event to specific relay URLs.
     async fn publish_to(&self, urls: &[String], builder: EventBuilder) -> Result<EventId>;
-    /// Fetch events matching a filter from connected relays.
-    async fn fetch_events(&self, filter: Filter, timeout: Duration) -> Result<Vec<Event>>;
+    /// Fetch events matching filters from connected relays.
+    async fn fetch_events(&self, filters: Vec<Filter>, timeout: Duration) -> Result<Vec<Event>>;
 }
 
 /// Relay pool wrapper for managing Nostr relay connections.
@@ -151,14 +151,22 @@ impl RelayPool {
         Ok(output.val)
     }
 
-    /// Fetch events matching a filter from connected relays.
-    pub async fn fetch_events(&self, filter: Filter, timeout: Duration) -> Result<Vec<Event>> {
-        let events = self
-            .client
-            .fetch_events(filter, timeout)
-            .await
-            .map_err(|e| Error::Transport(e.to_string()))?;
-        Ok(events.into_iter().collect())
+    /// Fetch events matching filters from connected relays.
+    pub async fn fetch_events(
+        &self,
+        filters: Vec<Filter>,
+        timeout: Duration,
+    ) -> Result<Vec<Event>> {
+        let mut all_events = Vec::new();
+        for filter in filters {
+            let events = self
+                .client
+                .fetch_events(filter, timeout)
+                .await
+                .map_err(|e| Error::Transport(e.to_string()))?;
+            all_events.extend(events);
+        }
+        Ok(all_events)
     }
 }
 
@@ -207,7 +215,7 @@ impl RelayPoolTrait for RelayPool {
         RelayPool::publish_to(self, urls, builder).await
     }
 
-    async fn fetch_events(&self, filter: Filter, timeout: Duration) -> Result<Vec<Event>> {
-        RelayPool::fetch_events(self, filter, timeout).await
+    async fn fetch_events(&self, filters: Vec<Filter>, timeout: Duration) -> Result<Vec<Event>> {
+        RelayPool::fetch_events(self, filters, timeout).await
     }
 }

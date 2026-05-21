@@ -131,10 +131,10 @@ impl RelayPoolTrait for TestRelayPool {
 
     async fn fetch_events(
         &self,
-        filter: Filter,
+        filters: Vec<Filter>,
         timeout: Duration,
     ) -> contextvm_sdk::Result<Vec<Event>> {
-        self.inner.fetch_events(filter, timeout).await
+        self.inner.fetch_events(filters, timeout).await
     }
 }
 

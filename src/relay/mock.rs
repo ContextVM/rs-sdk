@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::sync::Mutex;
@@ -127,6 +128,13 @@ impl MockRelayPool {
     pub async fn stored_events(&self) -> Vec<Event> {
         self.inner.lock().await.events.clone()
     }
+
+    /// Inject an externally-built event into the store without broadcasting.
+    ///
+    /// Useful for seeding kind 10002 relay-list events for `fetch_events()` tests.
+    pub async fn inject_event(&self, event: Event) {
+        self.inner.lock().await.events.push(event);
+    }
 }
 
 impl Default for MockRelayPool {
@@ -235,19 +243,20 @@ impl RelayPoolTrait for MockRelayPool {
         self.publish(builder).await
     }
 
-    /// Return stored events matching the filter.
-    async fn fetch_events(
-        &self,
-        filter: Filter,
-        _timeout: std::time::Duration,
-    ) -> Result<Vec<Event>> {
+    /// Return stored events that match the given filters' kind and author constraints.
+    async fn fetch_events(&self, filters: Vec<Filter>, _timeout: Duration) -> Result<Vec<Event>> {
         let inner = self.inner.lock().await;
-        Ok(inner
+        let matched: Vec<Event> = inner
             .events
             .iter()
-            .filter(|e| filter.match_event(e, MatchEventOptions::default()))
+            .filter(|e| {
+                filters
+                    .iter()
+                    .any(|f| f.match_event(e, MatchEventOptions::default()))
+            })
             .cloned()
-            .collect())
+            .collect();
+        Ok(matched)
     }
 }
 
