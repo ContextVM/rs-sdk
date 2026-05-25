@@ -4,6 +4,8 @@
 //! kind 25910 events, correlates responses via `e` tag.
 
 pub mod correlation_store;
+pub mod server_identity;
+pub mod server_relay_discovery;
 
 pub use correlation_store::ClientCorrelationStore;
 
@@ -17,7 +19,7 @@ use nostr_sdk::prelude::*;
 use tokio_util::sync::CancellationToken;
 
 use crate::core::constants::*;
-use crate::core::error::{Error, Result};
+use crate::core::error::Result;
 use crate::core::serializers;
 use crate::core::types::*;
 use crate::core::validation;
@@ -34,7 +36,10 @@ const LOG_TARGET: &str = "contextvm_sdk::transport::client";
 pub struct NostrClientTransportConfig {
     /// Relay URLs to connect to.
     pub relay_urls: Vec<String>,
-    /// The server's public key (hex).
+    /// The server's public key (hex, npub, or nprofile).
+    ///
+    /// When an nprofile is provided, embedded relay hints are extracted and used
+    /// during CEP-17 relay resolution.
     pub server_pubkey: String,
     /// Encryption mode.
     pub encryption_mode: EncryptionMode,
@@ -64,7 +69,7 @@ impl Default for NostrClientTransportConfig {
 }
 
 impl NostrClientTransportConfig {
-    /// Set the server's public key (hex).
+    /// Set the server's public key (hex, npub, or nprofile).
     pub fn with_server_pubkey(mut self, pubkey: impl Into<String>) -> Self {
         self.server_pubkey = pubkey.into();
         self
@@ -101,6 +106,9 @@ pub struct NostrClientTransport {
     base: BaseTransport,
     config: NostrClientTransportConfig,
     server_pubkey: PublicKey,
+    /// Populated from nprofile relay hints; used by relay resolution in `start()` (CEP-17).
+    #[allow(dead_code)]
+    hinted_relay_urls: Vec<String>,
     /// Pending request event IDs awaiting responses.
     pending_requests: ClientCorrelationStore,
     /// CEP-35: one-shot flag for client discovery tag emission.
@@ -130,15 +138,16 @@ impl NostrClientTransport {
     where
         T: IntoNostrSigner,
     {
-        let server_pubkey = PublicKey::from_hex(&config.server_pubkey).map_err(|error| {
-            tracing::error!(
-                target: LOG_TARGET,
-                error = %error,
-                server_pubkey = %config.server_pubkey,
-                "Invalid server pubkey"
-            );
-            Error::Other(format!("Invalid server pubkey: {error}"))
-        })?;
+        let (server_pubkey, hinted_relay_urls) =
+            server_identity::parse_server_identity(&config.server_pubkey).map_err(|error| {
+                tracing::error!(
+                    target: LOG_TARGET,
+                    error = %error,
+                    server_pubkey = %config.server_pubkey,
+                    "Invalid server pubkey"
+                );
+                error
+            })?;
 
         let relay_pool: Arc<dyn RelayPoolTrait> =
             Arc::new(RelayPool::new(signer).await.map_err(|error| {
@@ -169,6 +178,7 @@ impl NostrClientTransport {
             },
             config,
             server_pubkey,
+            hinted_relay_urls,
             pending_requests: ClientCorrelationStore::new(),
             has_sent_discovery_tags: AtomicBool::new(false),
             discovered_server_capabilities: Arc::new(Mutex::new(PeerCapabilities::default())),
@@ -187,15 +197,16 @@ impl NostrClientTransport {
         config: NostrClientTransportConfig,
         relay_pool: Arc<dyn RelayPoolTrait>,
     ) -> Result<Self> {
-        let server_pubkey = PublicKey::from_hex(&config.server_pubkey).map_err(|error| {
-            tracing::error!(
-                target: LOG_TARGET,
-                error = %error,
-                server_pubkey = %config.server_pubkey,
-                "Invalid server pubkey"
-            );
-            Error::Other(format!("Invalid server pubkey: {error}"))
-        })?;
+        let (server_pubkey, hinted_relay_urls) =
+            server_identity::parse_server_identity(&config.server_pubkey).map_err(|error| {
+                tracing::error!(
+                    target: LOG_TARGET,
+                    error = %error,
+                    server_pubkey = %config.server_pubkey,
+                    "Invalid server pubkey"
+                );
+                error
+            })?;
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let seen_gift_wrap_ids = Arc::new(Mutex::new(LruCache::new(
@@ -217,6 +228,7 @@ impl NostrClientTransport {
             },
             config,
             server_pubkey,
+            hinted_relay_urls,
             pending_requests: ClientCorrelationStore::new(),
             has_sent_discovery_tags: AtomicBool::new(false),
             discovered_server_capabilities: Arc::new(Mutex::new(PeerCapabilities::default())),
@@ -1092,6 +1104,7 @@ mod tests {
                 ..Default::default()
             },
             server_pubkey: keys.public_key(),
+            hinted_relay_urls: vec![],
             pending_requests: ClientCorrelationStore::new(),
             has_sent_discovery_tags: AtomicBool::new(false),
             discovered_server_capabilities: Arc::new(Mutex::new(PeerCapabilities::default())),
