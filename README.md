@@ -39,6 +39,8 @@ ContextVM maps MCP's JSON-RPC 2.0 messages onto Nostr events:
 |---------|------------------------|-------------|--------------------------------------|
 | `25910` | ContextVM Messages     | Ephemeral   | MCP request/response/notification    |
 | `1059`  | Gift Wrap (NIP-59)     | Regular     | Encrypted MCP messages               |
+| `21059` | Ephemeral Gift Wrap    | Ephemeral   | Encrypted MCP messages (CEP-19)      |
+| `10002` | Relay List Metadata    | Replaceable | Server's advertised relays (CEP-17)  |
 | `11316` | Server Announcement    | Addressable | Server identity & metadata           |
 | `11317` | Tools List             | Addressable | Published tool capabilities          |
 | `11318` | Resources List         | Addressable | Published resource capabilities      |
@@ -211,20 +213,28 @@ metadata-private delivery. Server announcements (kinds 11316–11320) are always
 | `relay_urls`             | `["wss://relay.damus.io"]` | Nostr relays to connect to          |
 | `encryption_mode`        | `Optional`            | Encryption policy                        |
 | `server_info`            | `None`                | Server metadata for announcements        |
-| `is_announced_server`    | `false`               | Whether to publish announcements (CEP-6) |
+| `is_announced_server`    | `false`               | Auto-publish announcements on start (CEP-6) |
 | `allowed_public_keys`    | `[]` (allow all)      | Client pubkey allowlist (hex)            |
 | `excluded_capabilities`  | `[]`                  | Methods exempt from allowlist            |
 | `session_timeout`        | `300s`                | Inactive session expiry                  |
+| `relay_list_urls`        | `None`                | Relay URLs for kind 10002 (CEP-17); defaults to `relay_urls` |
+| `bootstrap_relay_urls`   | `None`                | Additional relays for publishing announcements (CEP-6/17) |
+| `publish_relay_list`     | `true`                | Whether to publish kind 10002 relay list metadata |
+| `profile_metadata`       | `None`                | Profile metadata for kind 0 publication (CEP-23) |
 
 ### Client Transport Config
 
-| Field             | Default                    | Description                          |
-|-------------------|----------------------------|--------------------------------------|
-| `relay_urls`      | `["wss://relay.damus.io"]` | Nostr relays to connect to           |
-| `server_pubkey`   | (required)                 | Target server's public key (hex)     |
-| `encryption_mode` | `Optional`                 | Encryption policy                    |
-| `is_stateless`    | `false`                    | Emulate initialize locally           |
-| `timeout`         | `30s`                      | Response timeout                     |
+| Field                              | Default                    | Description                          |
+|------------------------------------|----------------------------|--------------------------------------|
+| `relay_urls`                       | `[]`                       | Nostr relays to connect to (empty = use relay resolution) |
+| `server_pubkey`                    | (required)                 | Target server's public key (hex, npub, or nprofile) |
+| `encryption_mode`                  | `Optional`                 | Encryption policy                    |
+| `is_stateless`                     | `false`                    | Emulate initialize locally           |
+| `timeout`                          | `30s`                      | Response timeout                     |
+| `discovery_relay_urls`             | `None` (bootstrap relays)  | Relays for CEP-17 kind 10002 discovery |
+| `fallback_operational_relay_urls`  | `None`                     | Relays probed in parallel with CEP-17 discovery |
+
+When `relay_urls` is empty, `start()` runs automatic relay resolution: configured relays > nprofile hints > CEP-17 kind 10002 discovery > fallback probing > bootstrap defaults.
 
 ## References
 

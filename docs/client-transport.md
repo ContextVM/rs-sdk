@@ -147,12 +147,14 @@ This is the ContextVM equivalent of the usual `rmcp` client workflow, but using 
 
 Start with these fields in `NostrClientTransportConfig`:
 
-- `relay_urls`: relays the client uses to reach the server
-- `server_pubkey`: the target server public key
+- `relay_urls`: relays the client uses to reach the server (empty = use relay resolution)
+- `server_pubkey`: the target server's public key (hex, npub, or nprofile with relay hints)
 - `encryption_mode`: whether plaintext is allowed
 - `gift_wrap_mode`: whether to use persistent or ephemeral wrapping
 - `is_stateless`: whether initialize is emulated locally for stateless workflows
 - `timeout`: how long request correlation waits for a response
+- `discovery_relay_urls`: bootstrap relays for CEP-17 kind 10002 relay-list discovery (defaults to `DEFAULT_BOOTSTRAP_RELAY_URLS`)
+- `fallback_operational_relay_urls`: non-authoritative relays probed in parallel with CEP-17 discovery
 
 ## When to use this instead of the proxy
 
@@ -166,3 +168,4 @@ Use the proxy guide when you want a simpler message-oriented bridge and do not w
 - The initialize request is sent automatically as part of the running client startup sequence.
 - Stateless initialization behavior is covered by the conformance tests.
 - Capability learning and gift-wrap handling happen inside the client transport implementation.
+- When `relay_urls` is empty, `start()` runs 6-stage relay resolution before connecting: configured relays > nprofile hints > CEP-17 kind 10002 discovery > fallback probing > bootstrap defaults. Callers can set `server_pubkey` to an nprofile and omit `relay_urls` entirely.

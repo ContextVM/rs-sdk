@@ -109,10 +109,14 @@ The main operational knobs live on `NostrServerTransportConfig`:
 - `encryption_mode`: plaintext vs encrypted session policy
 - `gift_wrap_mode`: choose between persistent and ephemeral gift wraps
 - `server_info`: metadata used in public announcements
-- `is_announced_server`: publish public discovery events
+- `is_announced_server`: auto-publish announcements on start (CEP-6)
 - `allowed_public_keys`: static client allowlist
 - `excluded_capabilities`: allow public access to specific methods or capability names
 - `max_sessions`, `cleanup_interval`, `session_timeout`: server-side session lifecycle
+- `relay_list_urls`: relay URLs advertised in kind 10002 (CEP-17); defaults to `relay_urls`
+- `bootstrap_relay_urls`: additional relays for publishing announcements (CEP-6/17)
+- `publish_relay_list`: whether to publish kind 10002 relay list metadata; default `true`
+- `profile_metadata`: optional profile metadata for kind 0 publication (CEP-23)
 
 ## Behavioral notes
 

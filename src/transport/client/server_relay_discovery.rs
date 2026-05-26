@@ -94,8 +94,7 @@ pub(crate) async fn fetch_relay_list_from_pool(
 ) -> Result<Vec<RelayListEntry>> {
     let filter = Filter::new()
         .kind(Kind::Custom(RELAY_LIST_METADATA_KIND))
-        .author(*server_pubkey)
-        .limit(1);
+        .author(*server_pubkey);
 
     let mut events = relay_pool.fetch_events(vec![filter], timeout).await?;
 

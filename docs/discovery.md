@@ -59,6 +59,26 @@ The event kinds follow the public announcement model summarized in the repositor
 
 These event kinds are the SDK's public discovery model for server metadata and advertised MCP capabilities.
 
+## CEP-17 automatic relay resolution
+
+Clients can discover which relays a server uses without hardcoding relay URLs. Set `server_pubkey` to an nprofile (which embeds relay hints) and leave `relay_urls` empty:
+
+```rust
+NostrClientTransportConfig::default()
+    .with_server_pubkey("nprofile1...") // contains pubkey + relay hints
+```
+
+When `start()` is called with empty `relay_urls`, the transport runs a 6-stage resolution pipeline:
+
+1. **Configured relays** -- if `relay_urls` is non-empty, use them directly
+2. **nprofile hints** -- relay URLs embedded in the nprofile identity
+3. **CEP-17 discovery** -- fetch kind 10002 relay-list events from bootstrap relays
+4. **Fallback probing** -- probe `fallback_operational_relay_urls` in parallel with discovery
+5. **Sequential fallback** -- if the race winner returned empty, await the other
+6. **Bootstrap default** -- fall back to `DEFAULT_BOOTSTRAP_RELAY_URLS` as last resort
+
+The `discovery_relay_urls` and `fallback_operational_relay_urls` config fields customize stages 3-4.
+
 ## Important limitations
 
 - discovery is public metadata, not a replacement for direct transport negotiation

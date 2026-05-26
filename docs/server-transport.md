@@ -158,6 +158,10 @@ Start with these fields in `NostrServerTransportConfig`:
 - `gift_wrap_mode`: persistent vs ephemeral wrapping policy
 - `allowed_public_keys`: allowlist for private or restricted servers
 - `excluded_capabilities`: allow specific methods without fully opening the server
+- `relay_list_urls`: relay URLs advertised in kind 10002 (CEP-17); defaults to `relay_urls`
+- `bootstrap_relay_urls`: additional relays for publishing announcements (CEP-6/17); merged with `relay_list_urls`
+- `publish_relay_list`: whether to publish kind 10002 relay list metadata; default `true`
+- `profile_metadata`: optional profile metadata for kind 0 publication (CEP-23)
 
 ## When to use this instead of the gateway
 
@@ -171,3 +175,4 @@ Use the gateway guide when you already have a request loop or existing local MCP
 - `rmcp` accepts pre-init ping and enters the main loop immediately after initialization completes.
 - ContextVM response routing depends on request event ids.
 - Encryption mirroring and announcement behavior are covered by the integration tests.
+- When `is_announced_server` is `true`, the transport auto-publishes all announcement events on `start()` via synthetic MCP requests: kind 11316 (server announcement), kinds 11317-11320 (tools, resources, templates, prompts), kind 10002 (relay list), and kind 0 (profile metadata if configured).
