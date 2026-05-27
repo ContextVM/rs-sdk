@@ -1,0 +1,252 @@
+/*
+ * contextvm.h — C FFI header for the ContextVM SDK
+ *
+ * Usage:
+ *   #include "contextvm.h"
+ *   Link against libcontextvm_ffi.a (static) or libcontextvm_ffi.so (shared)
+ *
+ * All functions that return handles use the pattern:
+ *   - On success: returns a valid handle (id > 0)
+ *   - On error: returns handle { id: 0 } and sets *error
+ *
+ * Strings returned by this library must be freed with cvm_string_free().
+ * Structs with owned strings must be freed with their respective _free functions.
+ *
+ * Error pointers should be freed with cvm_error_free().
+ */
+
+#ifndef CONTEXTVM_FFI_H
+#define CONTEXTVM_FFI_H
+
+#include <stdint.h>
+#include <stdbool.h>
+#include <stddef.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* ─── Opaque Handle ────────────────────────────────────────────────── */
+
+typedef struct {
+    uint64_t id;
+} CvmHandle;
+
+/* ─── Error ────────────────────────────────────────────────────────── */
+
+typedef enum {
+    CVM_OK = 0,
+    CVM_TRANSPORT = 1,
+    CVM_ENCRYPTION = 2,
+    CVM_DECRYPTION = 3,
+    CVM_TIMEOUT = 4,
+    CVM_VALIDATION = 5,
+    CVM_UNAUTHORIZED = 6,
+    CVM_SERIALIZATION = 7,
+    CVM_OTHER = 99,
+} CvmErrorCode;
+
+typedef struct CvmError CvmError;
+
+/* ─── Enums ─────────────────────────────────────────────────────────── */
+
+typedef enum {
+    CVM_ENCRYPTION_OPTIONAL = 0,
+    CVM_ENCRYPTION_REQUIRED = 1,
+    CVM_ENCRYPTION_DISABLED = 2,
+} CvmEncryptionMode;
+
+typedef enum {
+    CVM_GIFTWRAP_OPTIONAL = 0,
+    CVM_GIFTWRAP_EPHEMERAL = 1,
+    CVM_GIFTWRAP_PERSISTENT = 2,
+} CvmGiftWrapMode;
+
+typedef enum {
+    CVM_MSG_REQUEST = 0,
+    CVM_MSG_RESPONSE = 1,
+    CVM_MSG_ERROR_RESPONSE = 2,
+    CVM_MSG_NOTIFICATION = 3,
+} CvmJsonRpcType;
+
+/* ─── Structs ──────────────────────────────────────────────────────── */
+
+typedef struct {
+    CvmJsonRpcType msg_type;
+    char *payload_json; /* owned JSON string */
+    char *method;       /* owned, may be NULL */
+    char *id;           /* owned, may be NULL */
+} CvmJsonRpcMessage;
+
+typedef struct {
+    CvmJsonRpcMessage message;
+    char *client_pubkey; /* owned hex string */
+    char *event_id;      /* owned hex string */
+    bool is_encrypted;
+} CvmIncomingRequest;
+
+typedef struct {
+    char *pubkey;   /* owned hex string */
+    char *name;     /* owned, may be NULL */
+    char *version;  /* owned, may be NULL */
+    char *picture;  /* owned, may be NULL */
+    char *about;    /* owned, may be NULL */
+    char *website;  /* owned, may be NULL */
+    char *event_id; /* owned hex string */
+} CvmServerAnnouncement;
+
+typedef struct {
+    char *provider_pubkey;       /* owned hex string */
+    char *provider_display_name; /* owned, may be NULL */
+    char *provider_name;         /* owned, may be NULL */
+    char *provider_about;        /* owned, may be NULL */
+    char *provider_picture;      /* owned, may be NULL */
+    char *provider_nip05;        /* owned, may be NULL */
+    char *tool_name;             /* owned */
+    char *description;           /* owned */
+    char *schema_json;           /* owned JSON string */
+} CvmDiscoveredTool;
+
+typedef struct {
+    char *pubkey;  /* owned hex string */
+    char *name;    /* owned, may be NULL */
+    char *about;   /* owned, may be NULL */
+    char *picture; /* owned, may be NULL */
+    char *nip05;   /* owned, may be NULL */
+} CvmProviderProfile;
+
+typedef struct {
+    char **relay_urls;
+    size_t relay_url_count;
+    CvmEncryptionMode encryption_mode;
+    CvmGiftWrapMode gift_wrap_mode;
+    bool is_announced_server;
+    char *server_name;    /* may be NULL */
+    char *server_version; /* may be NULL */
+    char *server_picture; /* may be NULL */
+    char *server_about;   /* may be NULL */
+    char *server_website; /* may be NULL */
+    char **allowed_pubkeys;
+    size_t allowed_pubkey_count;
+    uint64_t session_timeout_secs;
+    uint64_t cleanup_interval_secs;
+} CvmServerConfig;
+
+typedef struct {
+    char **relay_urls;
+    size_t relay_url_count;
+    char *server_pubkey; /* required */
+    CvmEncryptionMode encryption_mode;
+    CvmGiftWrapMode gift_wrap_mode;
+    bool is_stateless;
+    uint64_t timeout_secs;
+} CvmClientConfig;
+
+/* ─── Free Functions ───────────────────────────────────────────────── */
+
+void cvm_string_free(char *s);
+void cvm_message_free(CvmJsonRpcMessage msg);
+void cvm_incoming_request_free(CvmIncomingRequest req);
+void cvm_announcements_free(CvmServerAnnouncement *announcements, size_t count);
+void cvm_discovered_tools_free(CvmDiscoveredTool *tools, size_t count);
+void cvm_provider_profiles_free(CvmProviderProfile *profiles, size_t count);
+void cvm_error_free(CvmError *e);
+char *cvm_error_message(const CvmError *e);
+CvmErrorCode cvm_error_code(const CvmError *e);
+
+/* ─── Version ──────────────────────────────────────────────────────── */
+
+char *cvm_version(void);
+
+/* ─── Keys / Signer ────────────────────────────────────────────────── */
+
+CvmHandle cvm_keys_generate(CvmError **error);
+CvmHandle cvm_keys_from_secret_key(const char *sk, CvmError **error);
+char *cvm_keys_public_key(CvmHandle handle, CvmError **error);
+char *cvm_keys_secret_key(CvmHandle handle, CvmError **error);
+void cvm_keys_free(CvmHandle handle);
+
+/* ─── Relay Pool ───────────────────────────────────────────────────── */
+
+CvmHandle cvm_relay_pool_new(CvmHandle keys_handle, CvmError **error);
+bool cvm_relay_pool_connect(CvmHandle pool_handle, char **urls, size_t count, CvmError **error);
+bool cvm_relay_pool_disconnect(CvmHandle pool_handle, CvmError **error);
+void cvm_relay_pool_free(CvmHandle handle);
+
+/* ─── Server (channel-based) ──────────────────────────────────────── */
+
+CvmHandle cvm_server_ch_new(CvmHandle keys_handle, CvmServerConfig config, CvmError **error);
+bool cvm_server_ch_recv(CvmHandle handle, CvmIncomingRequest *out_req, CvmError **error);
+bool cvm_server_ch_send_response(CvmHandle handle, const char *event_id, const char *payload_json, CvmError **error);
+bool cvm_server_ch_announce(CvmHandle handle, CvmError **error);
+bool cvm_server_ch_close(CvmHandle handle, CvmError **error);
+
+/* ─── Client (channel-based) ──────────────────────────────────────── */
+
+CvmHandle cvm_client_ch_new(CvmHandle keys_handle, CvmClientConfig config, CvmError **error);
+bool cvm_client_ch_send(CvmHandle handle, const char *payload_json, CvmError **error);
+bool cvm_client_ch_recv(CvmHandle handle, CvmJsonRpcMessage *out_msg, CvmError **error);
+bool cvm_client_ch_close(CvmHandle handle, CvmError **error);
+
+/* ─── Gateway (channel-based) ─────────────────────────────────────── */
+
+CvmHandle cvm_gateway_ch_new(CvmHandle keys_handle, CvmServerConfig config, CvmError **error);
+bool cvm_gateway_ch_recv(CvmHandle handle, CvmIncomingRequest *out_req, CvmError **error);
+bool cvm_gateway_ch_send_response(CvmHandle handle, const char *event_id, const char *payload_json, CvmError **error);
+bool cvm_gateway_ch_announce(CvmHandle handle, CvmError **error);
+bool cvm_gateway_ch_stop(CvmHandle handle, CvmError **error);
+
+/* ─── Proxy (channel-based) ───────────────────────────────────────── */
+
+CvmHandle cvm_proxy_ch_new(CvmHandle keys_handle, CvmClientConfig config, CvmError **error);
+bool cvm_proxy_ch_send(CvmHandle handle, const char *payload_json, CvmError **error);
+bool cvm_proxy_ch_recv(CvmHandle handle, CvmJsonRpcMessage *out_msg, CvmError **error);
+bool cvm_proxy_ch_recv_timeout(CvmHandle handle, uint64_t timeout_secs, CvmJsonRpcMessage *out_msg, CvmError **error);
+bool cvm_proxy_ch_stop(CvmHandle handle, CvmError **error);
+
+/* ─── Discovery ────────────────────────────────────────────────────── */
+
+CvmServerAnnouncement *cvm_discover_servers(
+    CvmHandle pool_handle,
+    char **relay_urls,
+    size_t url_count,
+    size_t *out_count,
+    CvmError **error
+);
+CvmDiscoveredTool *cvm_discover_tools(
+    CvmHandle pool_handle,
+    const char *provider_pubkey_hex,
+    const char *provider_display_name,
+    char **relay_urls,
+    size_t url_count,
+    size_t *out_count,
+    CvmError **error
+);
+CvmDiscoveredTool *cvm_discover_all_tools(
+    CvmHandle pool_handle,
+    char **relay_urls,
+    size_t url_count,
+    size_t *out_count,
+    CvmError **error
+);
+CvmProviderProfile *cvm_fetch_provider_profiles(
+    CvmHandle pool_handle,
+    char **provider_pubkeys,
+    size_t provider_pubkey_count,
+    char **relay_urls,
+    size_t url_count,
+    size_t *out_count,
+    CvmError **error
+);
+
+/* ─── Encryption ───────────────────────────────────────────────────── */
+
+char *cvm_encrypt_nip44(CvmHandle keys_handle, const char *recipient_hex, const char *plaintext, CvmError **error);
+char *cvm_decrypt_nip44(CvmHandle keys_handle, const char *sender_hex, const char *ciphertext, CvmError **error);
+char *cvm_pubkey_hex_to_npub(const char *pubkey_hex, CvmError **error);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* CONTEXTVM_FFI_H */

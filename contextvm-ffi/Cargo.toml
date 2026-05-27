@@ -1,0 +1,20 @@
+[package]
+name = "contextvm-ffi"
+version = "0.1.0"
+edition = "2021"
+description = "FFI bindings for the ContextVM SDK — C header + Python/Swift/Kotlin support"
+license = "MIT"
+
+[lib]
+name = "contextvm_ffi"
+crate-type = ["cdylib", "staticlib", "lib"]
+
+[dependencies]
+contextvm-sdk = { path = ".." }
+nostr-sdk = { version = "0.43", features = ["nip59"] }
+tokio = { version = "1", features = ["full"] }
+serde_json = "1"
+uniffi = "0.29"
+
+[features]
+default = []
