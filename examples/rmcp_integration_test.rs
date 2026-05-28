@@ -139,22 +139,18 @@ impl DemoServer {
 #[tool_handler]
 impl ServerHandler for DemoServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            protocol_version: ProtocolVersion::LATEST,
-            capabilities: ServerCapabilities::builder()
+        ServerInfo::new(
+            ServerCapabilities::builder()
                 .enable_tools()
                 .enable_resources()
                 .build(),
-            server_info: Implementation {
-                name: "contextvm-demo".to_string(),
-                title: Some("ContextVM Demo Server".to_string()),
-                version: "0.1.0".to_string(),
-                description: Some("Demonstrates rmcp integration over ContextVM".to_string()),
-                icons: None,
-                website_url: None,
-            },
-            instructions: Some("Try: echo, add, get_echo_count".to_string()),
-        }
+        )
+        .with_server_info(
+            Implementation::new("contextvm-demo", "0.1.0")
+                .with_title("ContextVM Demo Server")
+                .with_description("Demonstrates rmcp integration over ContextVM"),
+        )
+        .with_instructions("Try: echo, add, get_echo_count")
     }
 
     async fn list_resources(
@@ -177,12 +173,10 @@ impl ServerHandler for DemoServer {
         _ctx: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResult, ErrorData> {
         match req.uri.as_str() {
-            "demo://readme" => Ok(ReadResourceResult {
-                contents: vec![ResourceContents::text(
-                    "This server demonstrates the ContextVM rmcp integration.",
-                    req.uri,
-                )],
-            }),
+            "demo://readme" => Ok(ReadResourceResult::new(vec![ResourceContents::text(
+                "This server demonstrates the ContextVM rmcp integration.",
+                req.uri,
+            )])),
             other => Err(ErrorData::resource_not_found(
                 "not_found",
                 Some(serde_json::json!({ "uri": other })),
@@ -696,12 +690,11 @@ fn assert_error_response(response: &JsonRpcMessage) -> Result<()> {
 }
 
 fn call_params(name: &'static str, args: Option<serde_json::Value>) -> CallToolRequestParams {
-    CallToolRequestParams {
-        name: name.into(),
-        arguments: args.and_then(|v| serde_json::from_value(v).ok()),
-        meta: None,
-        task: None,
+    let mut params = CallToolRequestParams::new(name);
+    if let Some(v) = args.and_then(|v| serde_json::from_value(v).ok()) {
+        params = params.with_arguments(v);
     }
+    params
 }
 
 fn first_text(result: &CallToolResult) -> String {

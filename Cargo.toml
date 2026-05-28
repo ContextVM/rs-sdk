@@ -31,7 +31,7 @@ nostr-sdk = { version = "0.43", features = ["nip59"] }
 tracing = "0.1"
 
 # Optional MCP integration (Rust equivalent to TS @modelcontextprotocol/sdk)
-rmcp = { version = "0.16.0", features = ["server", "client", "macros", "transport-worker"], optional = true }
+rmcp = { git = "https://github.com/ContextVM-org/rust-sdk", branch = "progress-aware-request-timeouts", features = ["server", "client", "macros", "transport-worker"], optional = true }
 
 # LRU cache for gift-wrap (outer event id) deduplication
 lru = "0.12"

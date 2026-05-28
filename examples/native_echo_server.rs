@@ -48,19 +48,13 @@ impl EchoServer {
 #[tool_handler]
 impl ServerHandler for EchoServer {
     fn get_info(&self) -> rmcp::model::ServerInfo {
-        rmcp::model::ServerInfo {
-            protocol_version: ProtocolVersion::LATEST,
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            server_info: Implementation {
-                name: "contextvm-native-echo".to_string(),
-                title: Some("ContextVM Native Echo Server".to_string()),
-                version: "0.1.0".to_string(),
-                description: Some("Native rmcp echo server over ContextVM/Nostr".to_string()),
-                icons: None,
-                website_url: None,
-            },
-            instructions: Some("Call the echo tool with a message string".to_string()),
-        }
+        rmcp::model::ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(
+                Implementation::new("contextvm-native-echo", "0.1.0")
+                    .with_title("ContextVM Native Echo Server")
+                    .with_description("Native rmcp echo server over ContextVM/Nostr"),
+            )
+            .with_instructions("Call the echo tool with a message string")
     }
 }
 
