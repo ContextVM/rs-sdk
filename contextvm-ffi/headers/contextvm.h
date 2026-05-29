@@ -72,7 +72,7 @@ typedef enum {
 /* ─── Structs ──────────────────────────────────────────────────────── */
 
 typedef struct {
-    CvmJsonRpcType msg_type;
+    int32_t msg_type;   /* one of CvmJsonRpcType */
     char *payload_json; /* owned JSON string */
     char *method;       /* owned, may be NULL */
     char *id;           /* owned, may be NULL */
@@ -116,30 +116,55 @@ typedef struct {
 } CvmProviderProfile;
 
 typedef struct {
+    char *method; /* required */
+    char *name;   /* optional */
+} CvmCapabilityExclusion;
+
+typedef struct {
+    bool supports_encryption;
+    bool supports_ephemeral_encryption;
+    bool supports_oversized_transfer;
+} CvmPeerCapabilities;
+
+typedef struct {
     char **relay_urls;
     size_t relay_url_count;
-    CvmEncryptionMode encryption_mode;
-    CvmGiftWrapMode gift_wrap_mode;
+    int32_t encryption_mode; /* one of CvmEncryptionMode */
+    int32_t gift_wrap_mode;  /* one of CvmGiftWrapMode */
     bool is_announced_server;
     char *server_name;    /* may be NULL */
     char *server_version; /* may be NULL */
     char *server_picture; /* may be NULL */
     char *server_about;   /* may be NULL */
     char *server_website; /* may be NULL */
-    char **allowed_pubkeys;
+    char **allowed_pubkeys; /* if count > 0, pointer and entries must be non-NULL UTF-8 */
     size_t allowed_pubkey_count;
     uint64_t session_timeout_secs;
     uint64_t cleanup_interval_secs;
+    CvmCapabilityExclusion *excluded_capabilities;
+    size_t excluded_capability_count;
+    size_t max_sessions; /* 0 keeps SDK default */
+    uint64_t request_timeout_secs; /* 0 keeps SDK default */
+    char **relay_list_urls;
+    size_t relay_list_url_count;
+    char **bootstrap_relay_urls;
+    size_t bootstrap_relay_url_count;
+    bool publish_relay_list;
+    char *profile_metadata_json; /* optional ProfileMetadata JSON object */
 } CvmServerConfig;
 
 typedef struct {
     char **relay_urls;
     size_t relay_url_count;
     char *server_pubkey; /* required */
-    CvmEncryptionMode encryption_mode;
-    CvmGiftWrapMode gift_wrap_mode;
+    int32_t encryption_mode; /* one of CvmEncryptionMode */
+    int32_t gift_wrap_mode;  /* one of CvmGiftWrapMode */
     bool is_stateless;
     uint64_t timeout_secs;
+    char **discovery_relay_urls;
+    size_t discovery_relay_url_count;
+    char **fallback_operational_relay_urls;
+    size_t fallback_operational_relay_url_count;
 } CvmClientConfig;
 
 /* ─── Free Functions ───────────────────────────────────────────────── */
@@ -178,7 +203,17 @@ void cvm_relay_pool_free(CvmHandle handle);
 CvmHandle cvm_server_ch_new(CvmHandle keys_handle, CvmServerConfig config, CvmError **error);
 bool cvm_server_ch_recv(CvmHandle handle, CvmIncomingRequest *out_req, CvmError **error);
 bool cvm_server_ch_send_response(CvmHandle handle, const char *event_id, const char *payload_json, CvmError **error);
+bool cvm_server_ch_send_notification(CvmHandle handle, const char *client_pubkey, const char *payload_json, const char *correlated_event_id, CvmError **error);
+bool cvm_server_ch_broadcast_notification(CvmHandle handle, const char *payload_json, CvmError **error);
+bool cvm_server_ch_set_announcement_extra_tags(CvmHandle handle, const char *tags_json, CvmError **error);
+bool cvm_server_ch_set_announcement_pricing_tags(CvmHandle handle, const char *tags_json, CvmError **error);
 bool cvm_server_ch_announce(CvmHandle handle, CvmError **error);
+char *cvm_server_ch_announce_event_id(CvmHandle handle, CvmError **error);
+char *cvm_server_ch_publish_tools(CvmHandle handle, const char *tools_json, CvmError **error);
+char *cvm_server_ch_publish_resources(CvmHandle handle, const char *resources_json, CvmError **error);
+char *cvm_server_ch_publish_prompts(CvmHandle handle, const char *prompts_json, CvmError **error);
+char *cvm_server_ch_publish_resource_templates(CvmHandle handle, const char *templates_json, CvmError **error);
+bool cvm_server_ch_delete_announcements(CvmHandle handle, const char *reason, CvmError **error);
 bool cvm_server_ch_close(CvmHandle handle, CvmError **error);
 
 /* ─── Client (channel-based) ──────────────────────────────────────── */
@@ -186,6 +221,9 @@ bool cvm_server_ch_close(CvmHandle handle, CvmError **error);
 CvmHandle cvm_client_ch_new(CvmHandle keys_handle, CvmClientConfig config, CvmError **error);
 bool cvm_client_ch_send(CvmHandle handle, const char *payload_json, CvmError **error);
 bool cvm_client_ch_recv(CvmHandle handle, CvmJsonRpcMessage *out_msg, CvmError **error);
+bool cvm_client_ch_discovered_server_capabilities(CvmHandle handle, CvmPeerCapabilities *out_caps, CvmError **error);
+bool cvm_client_ch_server_supports_ephemeral_encryption(CvmHandle handle, CvmError **error);
+char *cvm_client_ch_server_initialize_event_json(CvmHandle handle, CvmError **error);
 bool cvm_client_ch_close(CvmHandle handle, CvmError **error);
 
 /* ─── Gateway (channel-based) ─────────────────────────────────────── */
@@ -194,6 +232,8 @@ CvmHandle cvm_gateway_ch_new(CvmHandle keys_handle, CvmServerConfig config, CvmE
 bool cvm_gateway_ch_recv(CvmHandle handle, CvmIncomingRequest *out_req, CvmError **error);
 bool cvm_gateway_ch_send_response(CvmHandle handle, const char *event_id, const char *payload_json, CvmError **error);
 bool cvm_gateway_ch_announce(CvmHandle handle, CvmError **error);
+char *cvm_gateway_ch_announce_event_id(CvmHandle handle, CvmError **error);
+bool cvm_gateway_ch_is_active(CvmHandle handle, CvmError **error);
 bool cvm_gateway_ch_stop(CvmHandle handle, CvmError **error);
 
 /* ─── Proxy (channel-based) ───────────────────────────────────────── */
@@ -202,6 +242,7 @@ CvmHandle cvm_proxy_ch_new(CvmHandle keys_handle, CvmClientConfig config, CvmErr
 bool cvm_proxy_ch_send(CvmHandle handle, const char *payload_json, CvmError **error);
 bool cvm_proxy_ch_recv(CvmHandle handle, CvmJsonRpcMessage *out_msg, CvmError **error);
 bool cvm_proxy_ch_recv_timeout(CvmHandle handle, uint64_t timeout_secs, CvmJsonRpcMessage *out_msg, CvmError **error);
+bool cvm_proxy_ch_is_active(CvmHandle handle, CvmError **error);
 bool cvm_proxy_ch_stop(CvmHandle handle, CvmError **error);
 
 /* ─── Discovery ────────────────────────────────────────────────────── */

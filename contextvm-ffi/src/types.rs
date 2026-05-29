@@ -15,53 +15,24 @@ use std::ptr;
 
 // ─── FFI-safe struct mirrors ───────────────────────────────────────────
 
-/// Encryption mode.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EncryptionMode {
-    Optional = 0,
-    Required = 1,
-    Disabled = 2,
-}
+/// Raw integer mode value supplied by C callers.
+pub type FfiMode = i32;
 
-impl From<EncryptionMode> for contextvm_sdk::EncryptionMode {
-    fn from(m: EncryptionMode) -> Self {
-        match m {
-            EncryptionMode::Optional => contextvm_sdk::EncryptionMode::Optional,
-            EncryptionMode::Required => contextvm_sdk::EncryptionMode::Required,
-            EncryptionMode::Disabled => contextvm_sdk::EncryptionMode::Disabled,
-        }
-    }
-}
+pub const ENCRYPTION_MODE_OPTIONAL: FfiMode = 0;
+pub const ENCRYPTION_MODE_REQUIRED: FfiMode = 1;
+pub const ENCRYPTION_MODE_DISABLED: FfiMode = 2;
 
-/// Gift-wrap mode (CEP-19).
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GiftWrapMode {
-    Optional = 0,
-    Ephemeral = 1,
-    Persistent = 2,
-}
-
-impl From<GiftWrapMode> for contextvm_sdk::GiftWrapMode {
-    fn from(m: GiftWrapMode) -> Self {
-        match m {
-            GiftWrapMode::Optional => contextvm_sdk::GiftWrapMode::Optional,
-            GiftWrapMode::Ephemeral => contextvm_sdk::GiftWrapMode::Ephemeral,
-            GiftWrapMode::Persistent => contextvm_sdk::GiftWrapMode::Persistent,
-        }
-    }
-}
+pub const GIFT_WRAP_MODE_OPTIONAL: FfiMode = 0;
+pub const GIFT_WRAP_MODE_EPHEMERAL: FfiMode = 1;
+pub const GIFT_WRAP_MODE_PERSISTENT: FfiMode = 2;
 
 /// JSON-RPC message type discriminator.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum JsonRpcType {
-    Request = 0,
-    Response = 1,
-    ErrorResponse = 2,
-    Notification = 3,
-}
+pub type JsonRpcType = i32;
+
+pub const JSON_RPC_TYPE_REQUEST: JsonRpcType = 0;
+pub const JSON_RPC_TYPE_RESPONSE: JsonRpcType = 1;
+pub const JSON_RPC_TYPE_ERROR_RESPONSE: JsonRpcType = 2;
+pub const JSON_RPC_TYPE_NOTIFICATION: JsonRpcType = 3;
 
 /// An FFI-safe JSON-RPC message.
 #[repr(C)]
@@ -122,14 +93,31 @@ pub struct FfiProviderProfile {
     pub nip05: *mut c_char,
 }
 
+/// A capability exclusion pattern that bypasses pubkey whitelisting.
+#[repr(C)]
+#[derive(Debug)]
+pub struct FfiCapabilityExclusion {
+    pub method: *mut c_char,
+    pub name: *mut c_char,
+}
+
+/// Learned peer capability flags.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FfiPeerCapabilities {
+    pub supports_encryption: bool,
+    pub supports_ephemeral_encryption: bool,
+    pub supports_oversized_transfer: bool,
+}
+
 /// Server transport config for FFI.
 #[repr(C)]
 #[derive(Debug)]
 pub struct FfiServerConfig {
     pub relay_urls: *mut *mut c_char,
     pub relay_url_count: usize,
-    pub encryption_mode: EncryptionMode,
-    pub gift_wrap_mode: GiftWrapMode,
+    pub encryption_mode: FfiMode,
+    pub gift_wrap_mode: FfiMode,
     pub is_announced_server: bool,
     pub server_name: *mut c_char,
     pub server_version: *mut c_char,
@@ -140,6 +128,16 @@ pub struct FfiServerConfig {
     pub allowed_pubkey_count: usize,
     pub session_timeout_secs: u64,
     pub cleanup_interval_secs: u64,
+    pub excluded_capabilities: *mut FfiCapabilityExclusion,
+    pub excluded_capability_count: usize,
+    pub max_sessions: usize,
+    pub request_timeout_secs: u64,
+    pub relay_list_urls: *mut *mut c_char,
+    pub relay_list_url_count: usize,
+    pub bootstrap_relay_urls: *mut *mut c_char,
+    pub bootstrap_relay_url_count: usize,
+    pub publish_relay_list: bool,
+    pub profile_metadata_json: *mut c_char,
 }
 
 /// Client transport config for FFI.
@@ -149,10 +147,14 @@ pub struct FfiClientConfig {
     pub relay_urls: *mut *mut c_char,
     pub relay_url_count: usize,
     pub server_pubkey: *mut c_char,
-    pub encryption_mode: EncryptionMode,
-    pub gift_wrap_mode: GiftWrapMode,
+    pub encryption_mode: FfiMode,
+    pub gift_wrap_mode: FfiMode,
     pub is_stateless: bool,
     pub timeout_secs: u64,
+    pub discovery_relay_urls: *mut *mut c_char,
+    pub discovery_relay_url_count: usize,
+    pub fallback_operational_relay_urls: *mut *mut c_char,
+    pub fallback_operational_relay_url_count: usize,
 }
 
 // ─── Internal conversion helpers ───────────────────────────────────────
@@ -162,6 +164,36 @@ pub fn c_str_to_string(ptr: *const c_char) -> Option<String> {
         return None;
     }
     unsafe { CStr::from_ptr(ptr).to_str().ok().map(String::from) }
+}
+
+pub fn c_str_to_string_checked(ptr: *const c_char, name: &str) -> Result<String, FfiError> {
+    if ptr.is_null() {
+        return Err(FfiError {
+            code: ErrorCode::Validation,
+            message: format!("null {name}"),
+        });
+    }
+
+    unsafe {
+        CStr::from_ptr(ptr)
+            .to_str()
+            .map(String::from)
+            .map_err(|e| FfiError {
+                code: ErrorCode::Validation,
+                message: format!("{name} is not valid UTF-8: {e}"),
+            })
+    }
+}
+
+pub fn optional_c_str_to_string_checked(
+    ptr: *const c_char,
+    name: &str,
+) -> Result<Option<String>, FfiError> {
+    if ptr.is_null() {
+        Ok(None)
+    } else {
+        c_str_to_string_checked(ptr, name).map(Some)
+    }
 }
 
 pub fn string_to_c(s: String) -> *mut c_char {
@@ -182,20 +214,102 @@ pub fn c_str_array_to_vec(ptr: *mut *mut c_char, count: usize) -> Vec<String> {
     }
 }
 
+pub fn c_str_array_to_vec_checked(
+    ptr: *mut *mut c_char,
+    count: usize,
+    name: &str,
+) -> Result<Vec<String>, FfiError> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    if ptr.is_null() {
+        return Err(FfiError {
+            code: ErrorCode::Validation,
+            message: format!("{name} has count {count} but null pointer"),
+        });
+    }
+
+    unsafe {
+        std::slice::from_raw_parts(ptr, count)
+            .iter()
+            .enumerate()
+            .map(|(index, &p)| {
+                if p.is_null() {
+                    return Err(FfiError {
+                        code: ErrorCode::Validation,
+                        message: format!("{name}[{index}] is null"),
+                    });
+                }
+
+                CStr::from_ptr(p)
+                    .to_str()
+                    .map(String::from)
+                    .map_err(|e| FfiError {
+                        code: ErrorCode::Validation,
+                        message: format!("{name}[{index}] is not valid UTF-8: {e}"),
+                    })
+            })
+            .collect()
+    }
+}
+
+pub fn ffi_encryption_mode_to_sdk(
+    mode: FfiMode,
+) -> Result<contextvm_sdk::EncryptionMode, FfiError> {
+    match mode {
+        ENCRYPTION_MODE_OPTIONAL => Ok(contextvm_sdk::EncryptionMode::Optional),
+        ENCRYPTION_MODE_REQUIRED => Ok(contextvm_sdk::EncryptionMode::Required),
+        ENCRYPTION_MODE_DISABLED => Ok(contextvm_sdk::EncryptionMode::Disabled),
+        _ => Err(FfiError {
+            code: ErrorCode::Validation,
+            message: format!("invalid encryption_mode {mode}"),
+        }),
+    }
+}
+
+pub fn ffi_gift_wrap_mode_to_sdk(mode: FfiMode) -> Result<contextvm_sdk::GiftWrapMode, FfiError> {
+    match mode {
+        GIFT_WRAP_MODE_OPTIONAL => Ok(contextvm_sdk::GiftWrapMode::Optional),
+        GIFT_WRAP_MODE_EPHEMERAL => Ok(contextvm_sdk::GiftWrapMode::Ephemeral),
+        GIFT_WRAP_MODE_PERSISTENT => Ok(contextvm_sdk::GiftWrapMode::Persistent),
+        _ => Err(FfiError {
+            code: ErrorCode::Validation,
+            message: format!("invalid gift_wrap_mode {mode}"),
+        }),
+    }
+}
+
+pub fn json_rpc_id_to_string(id: &serde_json::Value) -> String {
+    match id {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+pub fn peer_capabilities_to_ffi(
+    caps: contextvm_sdk::transport::discovery_tags::PeerCapabilities,
+) -> FfiPeerCapabilities {
+    FfiPeerCapabilities {
+        supports_encryption: caps.supports_encryption,
+        supports_ephemeral_encryption: caps.supports_ephemeral_encryption,
+        supports_oversized_transfer: caps.supports_oversized_transfer,
+    }
+}
+
 /// Convert an SDK `JsonRpcMessage` to the FFI representation.
 pub fn message_to_ffi(msg: &contextvm_sdk::JsonRpcMessage) -> FfiJsonRpcMessage {
     let json_str = serde_json::to_string(msg).unwrap_or_default();
     let msg_type = match msg {
-        contextvm_sdk::JsonRpcMessage::Request(_) => JsonRpcType::Request,
-        contextvm_sdk::JsonRpcMessage::Response(_) => JsonRpcType::Response,
-        contextvm_sdk::JsonRpcMessage::ErrorResponse(_) => JsonRpcType::ErrorResponse,
-        contextvm_sdk::JsonRpcMessage::Notification(_) => JsonRpcType::Notification,
+        contextvm_sdk::JsonRpcMessage::Request(_) => JSON_RPC_TYPE_REQUEST,
+        contextvm_sdk::JsonRpcMessage::Response(_) => JSON_RPC_TYPE_RESPONSE,
+        contextvm_sdk::JsonRpcMessage::ErrorResponse(_) => JSON_RPC_TYPE_ERROR_RESPONSE,
+        contextvm_sdk::JsonRpcMessage::Notification(_) => JSON_RPC_TYPE_NOTIFICATION,
     };
     FfiJsonRpcMessage {
         msg_type,
         payload_json: string_to_c(json_str),
         method: opt_string_to_c(msg.method().map(String::from)),
-        id: opt_string_to_c(msg.id().map(|v| v.to_string())),
+        id: opt_string_to_c(msg.id().map(json_rpc_id_to_string)),
     }
 }
 
@@ -915,4 +1029,40 @@ fn profiles_to_ffi_array(
     let ptr = ffi_profiles.as_mut_ptr();
     std::mem::forget(ffi_profiles);
     ptr
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn message_to_ffi_string_id_is_unquoted() {
+        let msg = contextvm_sdk::JsonRpcMessage::Request(contextvm_sdk::JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: serde_json::Value::String("request-1".to_string()),
+            method: "tools/list".to_string(),
+            params: None,
+        });
+
+        let ffi = message_to_ffi(&msg);
+        let id = unsafe { CStr::from_ptr(ffi.id).to_str().unwrap().to_string() };
+        cvm_message_free(ffi);
+
+        assert_eq!(id, "request-1");
+    }
+
+    #[test]
+    fn message_to_ffi_non_string_id_remains_json_encoded() {
+        let msg = contextvm_sdk::JsonRpcMessage::Response(contextvm_sdk::JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: serde_json::json!(42),
+            result: serde_json::json!({}),
+        });
+
+        let ffi = message_to_ffi(&msg);
+        let id = unsafe { CStr::from_ptr(ffi.id).to_str().unwrap().to_string() };
+        cvm_message_free(ffi);
+
+        assert_eq!(id, "42");
+    }
 }

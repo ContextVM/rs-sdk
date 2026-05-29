@@ -60,6 +60,21 @@ cvm_keys_free(keys);
 Errors are opaque. Use `cvm_error_code`, `cvm_error_message`, and
 `cvm_error_free` to inspect and release them.
 
+Mode fields in `CvmServerConfig` and `CvmClientConfig` are raw `int32_t`
+values. Set them with the `CVM_ENCRYPTION_*` and `CVM_GIFTWRAP_*` constants;
+invalid values are rejected with `CVM_VALIDATION`.
+
+## JSON Arguments
+
+Several parity APIs use JSON strings to represent SDK values that are not
+portable C structs:
+
+- `profile_metadata_json`: a `ProfileMetadata` JSON object.
+- `*_publish_tools/resources/prompts/resource_templates`: a JSON array of MCP
+  capability objects.
+- `*_set_announcement_*_tags`: a JSON array of Nostr tag arrays, for example
+  `[["pricing","free"]]`.
+
 ## Memory Management
 
 Rust-owned values returned through the C ABI must be released by the caller:

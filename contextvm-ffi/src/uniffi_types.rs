@@ -5,10 +5,12 @@
 //! Kotlin consumers.
 
 use crate::builders::{
-    build_sdk_client_config_from_fields, build_sdk_server_config_from_fields, ServerConfigParts,
+    build_sdk_client_config_from_fields, build_sdk_server_config_from_fields,
+    CapabilityExclusionParts, ClientConfigParts, ServerConfigParts,
 };
 use crate::error::FfiError;
 use crate::runtime::global_runtime;
+use crate::types::json_rpc_id_to_string;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -81,6 +83,21 @@ pub struct ProviderProfile {
     pub nip05: Option<String>,
 }
 
+/// A capability exclusion pattern that bypasses pubkey whitelisting.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct CapabilityExclusion {
+    pub method: String,
+    pub name: Option<String>,
+}
+
+/// Learned peer capability flags.
+#[derive(Debug, Clone, Copy, uniffi::Record)]
+pub struct PeerCapabilities {
+    pub supports_encryption: bool,
+    pub supports_ephemeral_encryption: bool,
+    pub supports_oversized_transfer: bool,
+}
+
 /// A discovered MCP tool and provider metadata used by foreign clients.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct DiscoveredTool {
@@ -110,6 +127,13 @@ pub struct ServerConfig {
     pub allowed_pubkeys: Vec<String>,
     pub session_timeout_secs: u64,
     pub cleanup_interval_secs: u64,
+    pub excluded_capabilities: Vec<CapabilityExclusion>,
+    pub max_sessions: u64,
+    pub request_timeout_secs: u64,
+    pub relay_list_urls: Vec<String>,
+    pub bootstrap_relay_urls: Vec<String>,
+    pub publish_relay_list: bool,
+    pub profile_metadata_json: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -127,6 +151,13 @@ impl Default for ServerConfig {
             allowed_pubkeys: vec![],
             session_timeout_secs: 300,
             cleanup_interval_secs: 60,
+            excluded_capabilities: vec![],
+            max_sessions: 1000,
+            request_timeout_secs: 60,
+            relay_list_urls: vec![],
+            bootstrap_relay_urls: vec![],
+            publish_relay_list: true,
+            profile_metadata_json: None,
         }
     }
 }
@@ -140,6 +171,8 @@ pub struct ClientConfig {
     pub gift_wrap_mode: GiftWrapMode,
     pub is_stateless: bool,
     pub timeout_secs: u64,
+    pub discovery_relay_urls: Vec<String>,
+    pub fallback_operational_relay_urls: Vec<String>,
 }
 
 impl Default for ClientConfig {
@@ -151,6 +184,8 @@ impl Default for ClientConfig {
             gift_wrap_mode: GiftWrapMode::Optional,
             is_stateless: false,
             timeout_secs: 30,
+            discovery_relay_urls: vec![],
+            fallback_operational_relay_urls: vec![],
         }
     }
 }
@@ -185,7 +220,7 @@ fn message_to_uniffi(msg: &contextvm_sdk::JsonRpcMessage) -> JsonRpcMessage {
         msg_type,
         payload_json: serde_json::to_string(msg).unwrap_or_default(),
         method: msg.method().map(String::from).unwrap_or_default(),
-        id: msg.id().map(|v| v.to_string()).unwrap_or_default(),
+        id: msg.id().map(json_rpc_id_to_string).unwrap_or_default(),
     }
 }
 
@@ -227,6 +262,37 @@ fn profile_to_uniffi(profile: crate::discovery::ProviderProfileRecord) -> Provid
         picture: profile.picture,
         nip05: profile.nip05,
     }
+}
+
+fn capabilities_to_uniffi(caps: contextvm_sdk::PeerCapabilities) -> PeerCapabilities {
+    PeerCapabilities {
+        supports_encryption: caps.supports_encryption,
+        supports_ephemeral_encryption: caps.supports_ephemeral_encryption,
+        supports_oversized_transfer: caps.supports_oversized_transfer,
+    }
+}
+
+fn parse_json_value_array(json: &str, name: &str) -> Result<Vec<serde_json::Value>, FfiError> {
+    serde_json::from_str(json).map_err(|e| FfiError {
+        code: crate::error::ErrorCode::Serialization,
+        message: format!("invalid {name}: {e}"),
+    })
+}
+
+fn parse_tags_json(json: &str) -> Result<Vec<nostr_sdk::prelude::Tag>, FfiError> {
+    let parts: Vec<Vec<String>> = serde_json::from_str(json).map_err(|e| FfiError {
+        code: crate::error::ErrorCode::Serialization,
+        message: format!("invalid tags_json: {e}"),
+    })?;
+    parts
+        .into_iter()
+        .map(|tag| {
+            nostr_sdk::prelude::Tag::parse(tag).map_err(|e| FfiError {
+                code: crate::error::ErrorCode::Validation,
+                message: e.to_string(),
+            })
+        })
+        .collect()
 }
 
 // ─── High-level UniFFI objects ─────────────────────────────────────────
@@ -328,7 +394,21 @@ impl Server {
             allowed_pubkeys: config.allowed_pubkeys.clone(),
             session_timeout_secs: config.session_timeout_secs,
             cleanup_interval_secs: config.cleanup_interval_secs,
-        });
+            excluded_capabilities: config
+                .excluded_capabilities
+                .iter()
+                .map(|cap| CapabilityExclusionParts {
+                    method: cap.method.clone(),
+                    name: cap.name.clone(),
+                })
+                .collect(),
+            max_sessions: config.max_sessions as usize,
+            request_timeout_secs: config.request_timeout_secs,
+            relay_list_urls: config.relay_list_urls.clone(),
+            bootstrap_relay_urls: config.bootstrap_relay_urls.clone(),
+            publish_relay_list: config.publish_relay_list,
+            profile_metadata_json: config.profile_metadata_json.clone(),
+        })?;
 
         global_runtime()
             .block_on(async {
@@ -336,6 +416,7 @@ impl Server {
                     contextvm_sdk::NostrServerTransport::new(keys.inner.clone(), sdk_config)
                         .await?;
                 transport.start().await?;
+                transport.spawn_discoverability_publication();
                 let receiver = transport
                     .take_message_receiver()
                     .ok_or_else(|| contextvm_sdk::Error::Other("receiver already taken".into()))?;
@@ -374,6 +455,59 @@ impl Server {
             .map_err(FfiError::from)
     }
 
+    /// Send a notification to a specific client.
+    pub fn send_notification(
+        &self,
+        client_pubkey: &str,
+        payload_json: &str,
+        correlated_event_id: Option<String>,
+    ) -> Result<(), FfiError> {
+        let message = parse_json_rpc(payload_json)?;
+        let transport = self.transport.clone();
+        global_runtime()
+            .block_on(async {
+                let guard = transport.lock().await;
+                guard
+                    .send_notification(client_pubkey, &message, correlated_event_id.as_deref())
+                    .await
+            })
+            .map_err(FfiError::from)
+    }
+
+    /// Broadcast a notification to all initialized clients.
+    pub fn broadcast_notification(&self, payload_json: &str) -> Result<(), FfiError> {
+        let message = parse_json_rpc(payload_json)?;
+        let transport = self.transport.clone();
+        global_runtime()
+            .block_on(async {
+                let guard = transport.lock().await;
+                guard.broadcast_notification(&message).await
+            })
+            .map_err(FfiError::from)
+    }
+
+    /// Sets extra announcement/discovery tags from a JSON array of tag arrays.
+    pub fn set_announcement_extra_tags(&self, tags_json: &str) -> Result<(), FfiError> {
+        let tags = parse_tags_json(tags_json)?;
+        let transport = self.transport.clone();
+        global_runtime().block_on(async {
+            let mut guard = transport.lock().await;
+            guard.set_announcement_extra_tags(tags);
+        });
+        Ok(())
+    }
+
+    /// Sets pricing tags from a JSON array of tag arrays.
+    pub fn set_announcement_pricing_tags(&self, tags_json: &str) -> Result<(), FfiError> {
+        let tags = parse_tags_json(tags_json)?;
+        let transport = self.transport.clone();
+        global_runtime().block_on(async {
+            let mut guard = transport.lock().await;
+            guard.set_announcement_pricing_tags(tags);
+        });
+        Ok(())
+    }
+
     /// Publish server announcement.
     pub fn announce(&self) -> Result<(), FfiError> {
         let transport = self.transport.clone();
@@ -383,6 +517,81 @@ impl Server {
                 guard.announce().await
             })
             .map(|_| ())
+            .map_err(FfiError::from)
+    }
+
+    /// Publish server announcement and return the Nostr event ID.
+    pub fn announce_event_id(&self) -> Result<String, FfiError> {
+        let transport = self.transport.clone();
+        global_runtime()
+            .block_on(async {
+                let guard = transport.lock().await;
+                guard.announce().await
+            })
+            .map(|event_id| event_id.to_hex())
+            .map_err(FfiError::from)
+    }
+
+    /// Publish tools list and return the Nostr event ID.
+    pub fn publish_tools(&self, tools_json: &str) -> Result<String, FfiError> {
+        let tools = parse_json_value_array(tools_json, "tools_json")?;
+        let transport = self.transport.clone();
+        global_runtime()
+            .block_on(async {
+                let guard = transport.lock().await;
+                guard.publish_tools(tools).await
+            })
+            .map(|event_id| event_id.to_hex())
+            .map_err(FfiError::from)
+    }
+
+    /// Publish resources list and return the Nostr event ID.
+    pub fn publish_resources(&self, resources_json: &str) -> Result<String, FfiError> {
+        let resources = parse_json_value_array(resources_json, "resources_json")?;
+        let transport = self.transport.clone();
+        global_runtime()
+            .block_on(async {
+                let guard = transport.lock().await;
+                guard.publish_resources(resources).await
+            })
+            .map(|event_id| event_id.to_hex())
+            .map_err(FfiError::from)
+    }
+
+    /// Publish prompts list and return the Nostr event ID.
+    pub fn publish_prompts(&self, prompts_json: &str) -> Result<String, FfiError> {
+        let prompts = parse_json_value_array(prompts_json, "prompts_json")?;
+        let transport = self.transport.clone();
+        global_runtime()
+            .block_on(async {
+                let guard = transport.lock().await;
+                guard.publish_prompts(prompts).await
+            })
+            .map(|event_id| event_id.to_hex())
+            .map_err(FfiError::from)
+    }
+
+    /// Publish resource templates list and return the Nostr event ID.
+    pub fn publish_resource_templates(&self, templates_json: &str) -> Result<String, FfiError> {
+        let templates = parse_json_value_array(templates_json, "templates_json")?;
+        let transport = self.transport.clone();
+        global_runtime()
+            .block_on(async {
+                let guard = transport.lock().await;
+                guard.publish_resource_templates(templates).await
+            })
+            .map(|event_id| event_id.to_hex())
+            .map_err(FfiError::from)
+    }
+
+    /// Delete previously published server announcements.
+    pub fn delete_announcements(&self, reason: &str) -> Result<(), FfiError> {
+        let transport = self.transport.clone();
+        global_runtime()
+            .block_on(async {
+                let guard = transport.lock().await;
+                guard.delete_announcements(reason).await
+            })
             .map_err(FfiError::from)
     }
 
@@ -412,14 +621,16 @@ impl Client {
     /// Create and start a client transport.
     #[uniffi::constructor]
     pub fn new(keys: &Keys, config: &ClientConfig) -> Result<Self, FfiError> {
-        let sdk_config = build_sdk_client_config_from_fields(
-            config.relay_urls.clone(),
-            config.server_pubkey.clone(),
-            sdk_encryption_mode(config.encryption_mode),
-            sdk_gift_wrap_mode(config.gift_wrap_mode),
-            config.is_stateless,
-            config.timeout_secs,
-        );
+        let sdk_config = build_sdk_client_config_from_fields(ClientConfigParts {
+            relay_urls: config.relay_urls.clone(),
+            server_pubkey: config.server_pubkey.clone(),
+            encryption_mode: sdk_encryption_mode(config.encryption_mode),
+            gift_wrap_mode: sdk_gift_wrap_mode(config.gift_wrap_mode),
+            is_stateless: config.is_stateless,
+            timeout_secs: config.timeout_secs,
+            discovery_relay_urls: config.discovery_relay_urls.clone(),
+            fallback_operational_relay_urls: config.fallback_operational_relay_urls.clone(),
+        });
 
         global_runtime()
             .block_on(async {
@@ -465,6 +676,42 @@ impl Client {
             })
     }
 
+    /// Return a snapshot of server capabilities learned from discovery tags.
+    pub fn discovered_server_capabilities(&self) -> PeerCapabilities {
+        let transport = self.transport.clone();
+        let caps = global_runtime().block_on(async {
+            let guard = transport.lock().await;
+            guard.discovered_server_capabilities()
+        });
+        capabilities_to_uniffi(caps)
+    }
+
+    /// Return whether the client has learned ephemeral gift-wrap support.
+    pub fn server_supports_ephemeral_encryption(&self) -> bool {
+        let transport = self.transport.clone();
+        global_runtime().block_on(async {
+            let guard = transport.lock().await;
+            guard.server_supports_ephemeral_encryption()
+        })
+    }
+
+    /// Return the first server event carrying discovery tags as JSON, if present.
+    pub fn server_initialize_event_json(&self) -> Result<Option<String>, FfiError> {
+        let transport = self.transport.clone();
+        let event = global_runtime().block_on(async {
+            let guard = transport.lock().await;
+            guard.get_server_initialize_event()
+        });
+        event
+            .map(|event| {
+                serde_json::to_string(&event).map_err(|e| FfiError {
+                    code: crate::error::ErrorCode::Serialization,
+                    message: e.to_string(),
+                })
+            })
+            .transpose()
+    }
+
     /// Close the client transport.
     pub fn close(&self) -> Result<(), FfiError> {
         let transport = self.transport.clone();
@@ -472,6 +719,138 @@ impl Client {
             .block_on(async {
                 let mut guard = transport.lock().await;
                 guard.close().await
+            })
+            .map_err(FfiError::from)
+    }
+}
+
+/// A gateway that bridges a local MCP server to Nostr.
+#[derive(uniffi::Object)]
+pub struct Gateway {
+    gateway: Arc<tokio::sync::Mutex<contextvm_sdk::gateway::NostrMCPGateway>>,
+    receiver: Arc<
+        tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<contextvm_sdk::IncomingRequest>>,
+    >,
+}
+
+#[uniffi::export]
+impl Gateway {
+    /// Create and start a gateway transport.
+    #[uniffi::constructor]
+    pub fn new(keys: &Keys, config: &ServerConfig) -> Result<Self, FfiError> {
+        let sdk_config = build_sdk_server_config_from_fields(ServerConfigParts {
+            relay_urls: config.relay_urls.clone(),
+            encryption_mode: sdk_encryption_mode(config.encryption_mode),
+            gift_wrap_mode: sdk_gift_wrap_mode(config.gift_wrap_mode),
+            server_name: config.server_name.clone(),
+            server_version: config.server_version.clone(),
+            server_picture: config.server_picture.clone(),
+            server_about: config.server_about.clone(),
+            server_website: config.server_website.clone(),
+            is_announced_server: config.is_announced_server,
+            allowed_pubkeys: config.allowed_pubkeys.clone(),
+            session_timeout_secs: config.session_timeout_secs,
+            cleanup_interval_secs: config.cleanup_interval_secs,
+            excluded_capabilities: config
+                .excluded_capabilities
+                .iter()
+                .map(|cap| CapabilityExclusionParts {
+                    method: cap.method.clone(),
+                    name: cap.name.clone(),
+                })
+                .collect(),
+            max_sessions: config.max_sessions as usize,
+            request_timeout_secs: config.request_timeout_secs,
+            relay_list_urls: config.relay_list_urls.clone(),
+            bootstrap_relay_urls: config.bootstrap_relay_urls.clone(),
+            publish_relay_list: config.publish_relay_list,
+            profile_metadata_json: config.profile_metadata_json.clone(),
+        })?;
+        let gateway_config = contextvm_sdk::gateway::GatewayConfig::new(sdk_config);
+
+        global_runtime()
+            .block_on(async {
+                let mut gateway = contextvm_sdk::gateway::NostrMCPGateway::new(
+                    keys.inner.clone(),
+                    gateway_config,
+                )
+                .await?;
+                let receiver = gateway.start().await?;
+                Ok::<_, contextvm_sdk::Error>(Self {
+                    gateway: Arc::new(tokio::sync::Mutex::new(gateway)),
+                    receiver: Arc::new(tokio::sync::Mutex::new(receiver)),
+                })
+            })
+            .map_err(FfiError::from)
+    }
+
+    /// Receive the next incoming request.
+    pub fn recv(&self) -> Result<IncomingRequest, FfiError> {
+        let rx = self.receiver.clone();
+        global_runtime()
+            .block_on(async {
+                let mut guard = rx.lock().await;
+                guard.recv().await
+            })
+            .map(|req| incoming_to_uniffi(&req))
+            .ok_or_else(|| FfiError {
+                code: crate::error::ErrorCode::Transport,
+                message: "channel closed".into(),
+            })
+    }
+
+    /// Send a response for a given event ID.
+    pub fn send_response(&self, event_id: &str, payload_json: &str) -> Result<(), FfiError> {
+        let message = parse_json_rpc(payload_json)?;
+        let gateway = self.gateway.clone();
+        global_runtime()
+            .block_on(async {
+                let guard = gateway.lock().await;
+                guard.send_response(event_id, message).await
+            })
+            .map_err(FfiError::from)
+    }
+
+    /// Publish server announcement.
+    pub fn announce(&self) -> Result<(), FfiError> {
+        let gateway = self.gateway.clone();
+        global_runtime()
+            .block_on(async {
+                let guard = gateway.lock().await;
+                guard.announce().await
+            })
+            .map(|_| ())
+            .map_err(FfiError::from)
+    }
+
+    /// Publish server announcement and return the Nostr event ID.
+    pub fn announce_event_id(&self) -> Result<String, FfiError> {
+        let gateway = self.gateway.clone();
+        global_runtime()
+            .block_on(async {
+                let guard = gateway.lock().await;
+                guard.announce().await
+            })
+            .map(|event_id| event_id.to_hex())
+            .map_err(FfiError::from)
+    }
+
+    /// Check if the gateway is active.
+    pub fn is_active(&self) -> bool {
+        let gateway = self.gateway.clone();
+        global_runtime().block_on(async {
+            let guard = gateway.lock().await;
+            guard.is_active()
+        })
+    }
+
+    /// Stop the gateway transport.
+    pub fn stop(&self) -> Result<(), FfiError> {
+        let gateway = self.gateway.clone();
+        global_runtime()
+            .block_on(async {
+                let mut guard = gateway.lock().await;
+                guard.stop().await
             })
             .map_err(FfiError::from)
     }
@@ -491,14 +870,16 @@ impl Proxy {
     /// Create and start a proxy transport.
     #[uniffi::constructor]
     pub fn new(keys: &Keys, config: &ClientConfig) -> Result<Self, FfiError> {
-        let sdk_config = build_sdk_client_config_from_fields(
-            config.relay_urls.clone(),
-            config.server_pubkey.clone(),
-            sdk_encryption_mode(config.encryption_mode),
-            sdk_gift_wrap_mode(config.gift_wrap_mode),
-            config.is_stateless,
-            config.timeout_secs,
-        );
+        let sdk_config = build_sdk_client_config_from_fields(ClientConfigParts {
+            relay_urls: config.relay_urls.clone(),
+            server_pubkey: config.server_pubkey.clone(),
+            encryption_mode: sdk_encryption_mode(config.encryption_mode),
+            gift_wrap_mode: sdk_gift_wrap_mode(config.gift_wrap_mode),
+            is_stateless: config.is_stateless,
+            timeout_secs: config.timeout_secs,
+            discovery_relay_urls: config.discovery_relay_urls.clone(),
+            fallback_operational_relay_urls: config.fallback_operational_relay_urls.clone(),
+        });
         let proxy_config = contextvm_sdk::proxy::ProxyConfig::new(sdk_config);
 
         global_runtime()
@@ -559,6 +940,15 @@ impl Proxy {
                 message: "receive timed out".into(),
             }),
         }
+    }
+
+    /// Check if the proxy is active.
+    pub fn is_active(&self) -> bool {
+        let proxy = self.proxy.clone();
+        global_runtime().block_on(async {
+            let guard = proxy.lock().await;
+            guard.is_active()
+        })
     }
 
     /// Stop the proxy transport.

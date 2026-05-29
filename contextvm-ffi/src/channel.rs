@@ -1,7 +1,7 @@
 //! Channel-based wrapper types that allow FFI consumers to receive messages.
 
 use crate::builders::{build_sdk_client_config, build_sdk_server_config};
-use crate::error::{set_error, FfiError};
+use crate::error::{set_error, ErrorCode, FfiError};
 use crate::handle::FfiHandle;
 use crate::kv;
 use crate::runtime::global_runtime;
@@ -51,11 +51,18 @@ pub extern "C" fn cvm_server_ch_new(
         None => return FfiHandle { id: 0 },
     };
 
-    let sdk_config = build_sdk_server_config(&config);
+    let sdk_config = match build_sdk_server_config(&config) {
+        Ok(config) => config,
+        Err(e) => {
+            set_error(error, e);
+            return FfiHandle { id: 0 };
+        }
+    };
 
     let result = global_runtime().block_on(async {
         let mut transport = contextvm_sdk::NostrServerTransport::new(keys, sdk_config).await?;
         transport.start().await?;
+        transport.spawn_discoverability_publication();
         let receiver = transport
             .take_message_receiver()
             .ok_or_else(|| contextvm_sdk::Error::Other("receiver already taken".into()))?;
@@ -179,6 +186,134 @@ pub extern "C" fn cvm_server_ch_send_response(
     }
 }
 
+/// Send a notification to a specific client through a server channel.
+#[no_mangle]
+pub extern "C" fn cvm_server_ch_send_notification(
+    handle: FfiHandle,
+    client_pubkey: *const c_char,
+    payload_json: *const c_char,
+    correlated_event_id: *const c_char,
+    error: *mut *mut FfiError,
+) -> bool {
+    let channel = match kv::get::<ServerChannel>(handle) {
+        Some(ch) => ch,
+        None => {
+            set_invalid_handle_error(error, "server channel");
+            return false;
+        }
+    };
+
+    let client_pubkey = match c_str_to_string(client_pubkey) {
+        Some(s) => s,
+        None => {
+            set_null_arg_error(error, "client_pubkey");
+            return false;
+        }
+    };
+    let msg = match parse_json_rpc_message(payload_json, error) {
+        Some(m) => m,
+        None => return false,
+    };
+    let correlated_event_id = c_str_to_string(correlated_event_id);
+
+    match global_runtime().block_on(async {
+        let transport = channel.transport.lock().await;
+        transport
+            .send_notification(&client_pubkey, &msg, correlated_event_id.as_deref())
+            .await
+    }) {
+        Ok(()) => true,
+        Err(e) => {
+            set_error(error, e.into());
+            false
+        }
+    }
+}
+
+/// Broadcast a notification to all initialized clients.
+#[no_mangle]
+pub extern "C" fn cvm_server_ch_broadcast_notification(
+    handle: FfiHandle,
+    payload_json: *const c_char,
+    error: *mut *mut FfiError,
+) -> bool {
+    let channel = match kv::get::<ServerChannel>(handle) {
+        Some(ch) => ch,
+        None => {
+            set_invalid_handle_error(error, "server channel");
+            return false;
+        }
+    };
+
+    let msg = match parse_json_rpc_message(payload_json, error) {
+        Some(m) => m,
+        None => return false,
+    };
+
+    match global_runtime().block_on(async {
+        let transport = channel.transport.lock().await;
+        transport.broadcast_notification(&msg).await
+    }) {
+        Ok(()) => true,
+        Err(e) => {
+            set_error(error, e.into());
+            false
+        }
+    }
+}
+
+/// Sets extra announcement/discovery tags from a JSON array of tag arrays.
+#[no_mangle]
+pub extern "C" fn cvm_server_ch_set_announcement_extra_tags(
+    handle: FfiHandle,
+    tags_json: *const c_char,
+    error: *mut *mut FfiError,
+) -> bool {
+    let channel = match kv::get::<ServerChannel>(handle) {
+        Some(ch) => ch,
+        None => {
+            set_invalid_handle_error(error, "server channel");
+            return false;
+        }
+    };
+    let tags = match parse_tags_json(tags_json, error) {
+        Some(tags) => tags,
+        None => return false,
+    };
+
+    global_runtime().block_on(async {
+        let mut transport = channel.transport.lock().await;
+        transport.set_announcement_extra_tags(tags);
+    });
+    true
+}
+
+/// Sets pricing tags from a JSON array of tag arrays.
+#[no_mangle]
+pub extern "C" fn cvm_server_ch_set_announcement_pricing_tags(
+    handle: FfiHandle,
+    tags_json: *const c_char,
+    error: *mut *mut FfiError,
+) -> bool {
+    let channel = match kv::get::<ServerChannel>(handle) {
+        Some(ch) => ch,
+        None => {
+            set_invalid_handle_error(error, "server channel");
+            return false;
+        }
+    };
+    let tags = match parse_tags_json(tags_json, error) {
+        Some(tags) => tags,
+        None => return false,
+    };
+
+    global_runtime().block_on(async {
+        let mut transport = channel.transport.lock().await;
+        transport.set_announcement_pricing_tags(tags);
+    });
+    true
+}
+
 /// Publish server announcement.
 #[no_mangle]
 pub extern "C" fn cvm_server_ch_announce(handle: FfiHandle, error: *mut *mut FfiError) -> bool {
@@ -202,6 +337,122 @@ pub extern "C" fn cvm_server_ch_announce(handle: FfiHandle, error: *mut *mut Ffi
         transport.announce().await
     }) {
         Ok(_) => true,
+        Err(e) => {
+            set_error(error, e.into());
+            false
+        }
+    }
+}
+
+/// Publish server announcement and return the Nostr event ID.
+#[no_mangle]
+pub extern "C" fn cvm_server_ch_announce_event_id(
+    handle: FfiHandle,
+    error: *mut *mut FfiError,
+) -> *mut c_char {
+    let channel = match kv::get::<ServerChannel>(handle) {
+        Some(ch) => ch,
+        None => {
+            set_invalid_handle_error(error, "server channel");
+            return std::ptr::null_mut();
+        }
+    };
+
+    match global_runtime().block_on(async {
+        let transport = channel.transport.lock().await;
+        transport.announce().await
+    }) {
+        Ok(event_id) => string_to_c(event_id.to_hex()),
+        Err(e) => {
+            set_error(error, e.into());
+            std::ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cvm_server_ch_publish_tools(
+    handle: FfiHandle,
+    tools_json: *const c_char,
+    error: *mut *mut FfiError,
+) -> *mut c_char {
+    let tools = match parse_json_value_array(tools_json, "tools_json", error) {
+        Some(values) => values,
+        None => return std::ptr::null_mut(),
+    };
+    publish_server_values(handle, tools, ServerPublishListKind::Tools, error)
+}
+
+#[no_mangle]
+pub extern "C" fn cvm_server_ch_publish_resources(
+    handle: FfiHandle,
+    resources_json: *const c_char,
+    error: *mut *mut FfiError,
+) -> *mut c_char {
+    let resources = match parse_json_value_array(resources_json, "resources_json", error) {
+        Some(values) => values,
+        None => return std::ptr::null_mut(),
+    };
+    publish_server_values(handle, resources, ServerPublishListKind::Resources, error)
+}
+
+#[no_mangle]
+pub extern "C" fn cvm_server_ch_publish_prompts(
+    handle: FfiHandle,
+    prompts_json: *const c_char,
+    error: *mut *mut FfiError,
+) -> *mut c_char {
+    let prompts = match parse_json_value_array(prompts_json, "prompts_json", error) {
+        Some(values) => values,
+        None => return std::ptr::null_mut(),
+    };
+    publish_server_values(handle, prompts, ServerPublishListKind::Prompts, error)
+}
+
+#[no_mangle]
+pub extern "C" fn cvm_server_ch_publish_resource_templates(
+    handle: FfiHandle,
+    templates_json: *const c_char,
+    error: *mut *mut FfiError,
+) -> *mut c_char {
+    let templates = match parse_json_value_array(templates_json, "templates_json", error) {
+        Some(values) => values,
+        None => return std::ptr::null_mut(),
+    };
+    publish_server_values(
+        handle,
+        templates,
+        ServerPublishListKind::ResourceTemplates,
+        error,
+    )
+}
+
+#[no_mangle]
+pub extern "C" fn cvm_server_ch_delete_announcements(
+    handle: FfiHandle,
+    reason: *const c_char,
+    error: *mut *mut FfiError,
+) -> bool {
+    let channel = match kv::get::<ServerChannel>(handle) {
+        Some(ch) => ch,
+        None => {
+            set_invalid_handle_error(error, "server channel");
+            return false;
+        }
+    };
+    let reason = match c_str_to_string(reason) {
+        Some(s) => s,
+        None => {
+            set_null_arg_error(error, "reason");
+            return false;
+        }
+    };
+
+    match global_runtime().block_on(async {
+        let transport = channel.transport.lock().await;
+        transport.delete_announcements(&reason).await
+    }) {
+        Ok(()) => true,
         Err(e) => {
             set_error(error, e.into());
             false
@@ -256,15 +507,9 @@ pub extern "C" fn cvm_client_ch_new(
     };
 
     let sdk_config = match build_sdk_client_config(&config) {
-        Some(c) => c,
-        None => {
-            set_error(
-                error,
-                FfiError {
-                    code: crate::error::ErrorCode::Validation,
-                    message: "server_pubkey is required".into(),
-                },
-            );
+        Ok(c) => c,
+        Err(e) => {
+            set_error(error, e);
             return FfiHandle { id: 0 };
         }
     };
@@ -375,6 +620,92 @@ pub extern "C" fn cvm_client_ch_recv(
     }
 }
 
+/// Return a snapshot of server capabilities learned from discovery tags.
+#[no_mangle]
+pub extern "C" fn cvm_client_ch_discovered_server_capabilities(
+    handle: FfiHandle,
+    out_caps: *mut FfiPeerCapabilities,
+    error: *mut *mut FfiError,
+) -> bool {
+    let channel = match kv::get::<ClientChannel>(handle) {
+        Some(ch) => ch,
+        None => {
+            set_invalid_handle_error(error, "client channel");
+            return false;
+        }
+    };
+    if out_caps.is_null() {
+        set_null_arg_error(error, "out_caps");
+        return false;
+    }
+
+    let caps = global_runtime().block_on(async {
+        let transport = channel.transport.lock().await;
+        transport.discovered_server_capabilities()
+    });
+    unsafe {
+        *out_caps = peer_capabilities_to_ffi(caps);
+    }
+    true
+}
+
+/// Return whether the client has learned ephemeral gift-wrap support.
+#[no_mangle]
+pub extern "C" fn cvm_client_ch_server_supports_ephemeral_encryption(
+    handle: FfiHandle,
+    error: *mut *mut FfiError,
+) -> bool {
+    let channel = match kv::get::<ClientChannel>(handle) {
+        Some(ch) => ch,
+        None => {
+            set_invalid_handle_error(error, "client channel");
+            return false;
+        }
+    };
+
+    global_runtime().block_on(async {
+        let transport = channel.transport.lock().await;
+        transport.server_supports_ephemeral_encryption()
+    })
+}
+
+/// Return the first server event carrying discovery tags as JSON, or NULL if none.
+#[no_mangle]
+pub extern "C" fn cvm_client_ch_server_initialize_event_json(
+    handle: FfiHandle,
+    error: *mut *mut FfiError,
+) -> *mut c_char {
+    let channel = match kv::get::<ClientChannel>(handle) {
+        Some(ch) => ch,
+        None => {
+            set_invalid_handle_error(error, "client channel");
+            return std::ptr::null_mut();
+        }
+    };
+
+    let event = global_runtime().block_on(async {
+        let transport = channel.transport.lock().await;
+        transport.get_server_initialize_event()
+    });
+
+    match event {
+        Some(event) => match serde_json::to_string(&event) {
+            Ok(json) => string_to_c(json),
+            Err(e) => {
+                set_error(
+                    error,
+                    FfiError {
+                        code: ErrorCode::Serialization,
+                        message: e.to_string(),
+                    },
+                );
+                std::ptr::null_mut()
+            }
+        },
+        None => std::ptr::null_mut(),
+    }
+}
+
 /// Close a client channel.
 #[no_mangle]
 pub extern "C" fn cvm_client_ch_close(handle: FfiHandle, error: *mut *mut FfiError) -> bool {
@@ -421,7 +752,13 @@ pub extern "C" fn cvm_gateway_ch_new(
         None => return FfiHandle { id: 0 },
     };
 
-    let sdk_config = build_sdk_server_config(&config);
+    let sdk_config = match build_sdk_server_config(&config) {
+        Ok(config) => config,
+        Err(e) => {
+            set_error(error, e);
+            return FfiHandle { id: 0 };
+        }
+    };
     let gw_config = contextvm_sdk::gateway::GatewayConfig::new(sdk_config);
 
     let result = global_runtime().block_on(async {
@@ -577,6 +914,49 @@ pub extern "C" fn cvm_gateway_ch_announce(handle: FfiHandle, error: *mut *mut Ff
     }
 }
 
+/// Publish gateway server announcement and return the Nostr event ID.
+#[no_mangle]
+pub extern "C" fn cvm_gateway_ch_announce_event_id(
+    handle: FfiHandle,
+    error: *mut *mut FfiError,
+) -> *mut c_char {
+    let channel = match kv::get::<GatewayChannel>(handle) {
+        Some(ch) => ch,
+        None => {
+            set_invalid_handle_error(error, "gateway channel");
+            return std::ptr::null_mut();
+        }
+    };
+
+    match global_runtime().block_on(async {
+        let gateway = channel.gateway.lock().await;
+        gateway.announce().await
+    }) {
+        Ok(event_id) => string_to_c(event_id.to_hex()),
+        Err(e) => {
+            set_error(error, e.into());
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Check if a gateway channel is active.
+#[no_mangle]
+pub extern "C" fn cvm_gateway_ch_is_active(handle: FfiHandle, error: *mut *mut FfiError) -> bool {
+    let channel = match kv::get::<GatewayChannel>(handle) {
+        Some(ch) => ch,
+        None => {
+            set_invalid_handle_error(error, "gateway channel");
+            return false;
+        }
+    };
+
+    global_runtime().block_on(async {
+        let gateway = channel.gateway.lock().await;
+        gateway.is_active()
+    })
+}
+
 /// Stop a gateway channel.
 #[no_mangle]
 pub extern "C" fn cvm_gateway_ch_stop(handle: FfiHandle, error: *mut *mut FfiError) -> bool {
@@ -624,15 +1004,9 @@ pub extern "C" fn cvm_proxy_ch_new(
     };
 
     let sdk_config = match build_sdk_client_config(&config) {
-        Some(c) => c,
-        None => {
-            set_error(
-                error,
-                FfiError {
-                    code: crate::error::ErrorCode::Validation,
-                    message: "server_pubkey is required".into(),
-                },
-            );
+        Ok(c) => c,
+        Err(e) => {
+            set_error(error, e);
             return FfiHandle { id: 0 };
         }
     };
@@ -799,6 +1173,23 @@ pub extern "C" fn cvm_proxy_ch_recv_timeout(
     }
 }
 
+/// Check if a proxy channel is active.
+#[no_mangle]
+pub extern "C" fn cvm_proxy_ch_is_active(handle: FfiHandle, error: *mut *mut FfiError) -> bool {
+    let channel = match kv::get::<ProxyChannel>(handle) {
+        Some(ch) => ch,
+        None => {
+            set_invalid_handle_error(error, "proxy channel");
+            return false;
+        }
+    };
+
+    global_runtime().block_on(async {
+        let proxy = channel.proxy.lock().await;
+        proxy.is_active()
+    })
+}
+
 /// Stop a proxy channel.
 #[no_mangle]
 pub extern "C" fn cvm_proxy_ch_stop(handle: FfiHandle, error: *mut *mut FfiError) -> bool {
@@ -880,4 +1271,131 @@ fn parse_json_rpc_message(
             None
         }
     }
+}
+
+fn parse_json_value_array(
+    payload_json: *const c_char,
+    name: &str,
+    error: *mut *mut FfiError,
+) -> Option<Vec<serde_json::Value>> {
+    let json_str = match c_str_to_string(payload_json) {
+        Some(s) => s,
+        None => {
+            set_null_arg_error(error, name);
+            return None;
+        }
+    };
+
+    match serde_json::from_str::<Vec<serde_json::Value>>(&json_str) {
+        Ok(values) => Some(values),
+        Err(e) => {
+            set_error(
+                error,
+                FfiError {
+                    code: ErrorCode::Serialization,
+                    message: e.to_string(),
+                },
+            );
+            None
+        }
+    }
+}
+
+fn parse_tags_json(
+    tags_json: *const c_char,
+    error: *mut *mut FfiError,
+) -> Option<Vec<nostr_sdk::prelude::Tag>> {
+    let json_str = match c_str_to_string(tags_json) {
+        Some(s) => s,
+        None => {
+            set_null_arg_error(error, "tags_json");
+            return None;
+        }
+    };
+
+    let parts = match serde_json::from_str::<Vec<Vec<String>>>(&json_str) {
+        Ok(parts) => parts,
+        Err(e) => {
+            set_error(
+                error,
+                FfiError {
+                    code: ErrorCode::Serialization,
+                    message: e.to_string(),
+                },
+            );
+            return None;
+        }
+    };
+
+    parts
+        .into_iter()
+        .map(|tag| {
+            nostr_sdk::prelude::Tag::parse(tag).map_err(|e| FfiError {
+                code: ErrorCode::Validation,
+                message: e.to_string(),
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| set_error(error, e))
+        .ok()
+}
+
+enum ServerPublishListKind {
+    Tools,
+    Resources,
+    Prompts,
+    ResourceTemplates,
+}
+
+fn publish_server_values(
+    handle: FfiHandle,
+    values: Vec<serde_json::Value>,
+    kind: ServerPublishListKind,
+    error: *mut *mut FfiError,
+) -> *mut c_char {
+    let channel = match kv::get::<ServerChannel>(handle) {
+        Some(ch) => ch,
+        None => {
+            set_invalid_handle_error(error, "server channel");
+            return std::ptr::null_mut();
+        }
+    };
+
+    match global_runtime().block_on(async {
+        let transport = channel.transport.lock().await;
+        match kind {
+            ServerPublishListKind::Tools => transport.publish_tools(values).await,
+            ServerPublishListKind::Resources => transport.publish_resources(values).await,
+            ServerPublishListKind::Prompts => transport.publish_prompts(values).await,
+            ServerPublishListKind::ResourceTemplates => {
+                transport.publish_resource_templates(values).await
+            }
+        }
+    }) {
+        Ok(event_id) => string_to_c(event_id.to_hex()),
+        Err(e) => {
+            set_error(error, e.into());
+            std::ptr::null_mut()
+        }
+    }
+}
+
+fn set_invalid_handle_error(error: *mut *mut FfiError, handle_type: &str) {
+    set_error(
+        error,
+        FfiError {
+            code: ErrorCode::Other,
+            message: format!("invalid {handle_type} handle"),
+        },
+    );
+}
+
+fn set_null_arg_error(error: *mut *mut FfiError, name: &str) {
+    set_error(
+        error,
+        FfiError {
+            code: ErrorCode::Validation,
+            message: format!("null {name}"),
+        },
+    );
 }
