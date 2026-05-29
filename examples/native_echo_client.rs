@@ -62,15 +62,14 @@ async fn main() -> Result<()> {
     }
 
     let result = client
-        .call_tool(CallToolRequestParams {
-            name: "echo".into(),
-            arguments: serde_json::from_value(serde_json::json!({
-                "message": "hello from native contextvm client"
-            }))
-            .ok(),
-            meta: None,
-            task: None,
-        })
+        .call_tool(
+            CallToolRequestParams::new("echo").with_arguments(
+                serde_json::from_value(serde_json::json!({
+                    "message": "hello from native contextvm client"
+                }))
+                .unwrap(),
+            ),
+        )
         .await?;
 
     println!("Echo result: {}", first_text(&result));

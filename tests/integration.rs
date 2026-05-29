@@ -77,22 +77,13 @@ impl DemoServer {
 #[tool_handler]
 impl ServerHandler for DemoServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            protocol_version: ProtocolVersion::LATEST,
-            capabilities: ServerCapabilities::builder()
+        ServerInfo::new(
+            ServerCapabilities::builder()
                 .enable_tools()
                 .enable_resources()
                 .build(),
-            server_info: Implementation {
-                name: "integration-test".to_string(),
-                title: None,
-                version: "0.1.0".to_string(),
-                description: None,
-                icons: None,
-                website_url: None,
-            },
-            instructions: None,
-        }
+        )
+        .with_server_info(Implementation::new("integration-test", "0.1.0"))
     }
 
     async fn list_resources(
@@ -115,9 +106,10 @@ impl ServerHandler for DemoServer {
         _ctx: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResult, ErrorData> {
         match req.uri.as_str() {
-            "demo://readme" => Ok(ReadResourceResult {
-                contents: vec![ResourceContents::text("Demo content.", req.uri)],
-            }),
+            "demo://readme" => Ok(ReadResourceResult::new(vec![ResourceContents::text(
+                "Demo content.",
+                req.uri,
+            )])),
             other => Err(ErrorData::resource_not_found(
                 "not_found",
                 Some(serde_json::json!({ "uri": other })),
@@ -162,27 +154,20 @@ async fn test_local_rmcp() {
     let tools = client.list_all_tools().await.expect("list tools");
     assert_eq!(tools.len(), 3);
 
-    let add = client
-        .call_tool(CallToolRequestParams {
-            name: "add".into(),
-            arguments: serde_json::from_value(serde_json::json!({ "a": 7, "b": 5 })).ok(),
-            meta: None,
-            task: None,
-        })
-        .await
-        .expect("call add");
+    let add =
+        client
+            .call_tool(CallToolRequestParams::new("add").with_arguments(
+                serde_json::from_value(serde_json::json!({ "a": 7, "b": 5 })).unwrap(),
+            ))
+            .await
+            .expect("call add");
     assert!(first_text(&add).contains("12"));
 
     let resources = client.list_all_resources().await.expect("list resources");
     assert_eq!(resources.len(), 1);
 
     match client
-        .call_tool(CallToolRequestParams {
-            name: "no_such_tool".into(),
-            arguments: None,
-            meta: None,
-            task: None,
-        })
+        .call_tool(CallToolRequestParams::new("no_such_tool"))
         .await
     {
         Err(_) => {}
