@@ -19,6 +19,29 @@ pub fn validate_and_parse(content: &str) -> Option<JsonRpcMessage> {
     validate_message(&value)
 }
 
+/// Validate size against a custom byte bound, then parse into a [`JsonRpcMessage`].
+///
+/// Unlike [`validate_and_parse`], which enforces the 1 MB per-event cap
+/// ([`MAX_MESSAGE_SIZE`]), this bounds `content` to `max_bytes` — the receiver
+/// policy's `maxTransferBytes` (100 MiB default). It is the dedicated entrypoint
+/// for **reassembled** CEP-22 oversized payloads, which legitimately exceed the
+/// per-event cap (the very limit the transfer profile works around). The bound
+/// keeps a single ceiling on reassembled-payload memory rather than leaving it
+/// unbounded.
+pub fn validate_and_parse_oversized(content: &str, max_bytes: usize) -> Option<JsonRpcMessage> {
+    if content.len() > max_bytes {
+        tracing::warn!(
+            "Oversized message exceeds max transfer bytes: {} > {}",
+            content.len(),
+            max_bytes
+        );
+        return None;
+    }
+
+    let value: serde_json::Value = serde_json::from_str(content).ok()?;
+    validate_message(&value)
+}
+
 /// Validate that a JSON value is a well-formed JSON-RPC 2.0 message.
 ///
 /// Checks:
@@ -97,5 +120,36 @@ mod tests {
     #[test]
     fn test_validate_and_parse_rejects_invalid_json() {
         assert!(validate_and_parse("not json").is_none());
+    }
+
+    #[test]
+    fn test_validate_and_parse_oversized_bypasses_1mb_cap() {
+        // A valid message larger than the 1 MB per-event cap.
+        let big_value = "m".repeat(MAX_MESSAGE_SIZE + 1024);
+        let content = format!(r#"{{"jsonrpc":"2.0","id":1,"result":{{"value":"{big_value}"}}}}"#);
+        assert!(content.len() > MAX_MESSAGE_SIZE);
+
+        // The standard entrypoint rejects it on size...
+        assert!(validate_and_parse(&content).is_none());
+        // ...but the oversized entrypoint accepts it under a higher bound.
+        let parsed = validate_and_parse_oversized(&content, 100 * 1024 * 1024).unwrap();
+        assert!(parsed.is_response());
+    }
+
+    #[test]
+    fn test_validate_and_parse_oversized_enforces_its_own_bound() {
+        let content = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+        // Rejected when the content exceeds the supplied max_bytes.
+        assert!(validate_and_parse_oversized(content, 8).is_none());
+        // Accepted under a sufficient bound.
+        assert!(validate_and_parse_oversized(content, 1024)
+            .unwrap()
+            .is_request());
+    }
+
+    #[test]
+    fn test_validate_and_parse_oversized_rejects_invalid_version() {
+        let content = r#"{"jsonrpc":"1.0","id":1,"method":"test"}"#;
+        assert!(validate_and_parse_oversized(content, 1024).is_none());
     }
 }
