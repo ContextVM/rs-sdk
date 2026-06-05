@@ -55,6 +55,7 @@ impl NostrMCPGateway {
         }
 
         self.transport.start().await?;
+        self.transport.spawn_discoverability_publication();
         self.is_running = true;
 
         self.transport
