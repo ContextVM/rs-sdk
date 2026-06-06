@@ -39,7 +39,7 @@ pub(crate) struct AnnouncementManager {
     gift_wrap_mode: GiftWrapMode,
     /// User-provided extra tags (e.g. PMI discovery for CEP-8).
     extra_common_tags: Vec<Tag>,
-    /// Transport-owned internal tags (future CEP-22 oversized support signal).
+    /// Transport-owned internal tags (e.g. CEP-22 oversized support signal).
     internal_common_tags: Vec<Tag>,
     /// CEP-8 pricing tags for capability list responses.
     pricing_tags: Vec<Tag>,
@@ -277,7 +277,6 @@ impl AnnouncementManager {
     /// Set transport-owned internal common tags (e.g. CEP-22 oversized support).
     ///
     /// Invalidates the common tags cache.
-    #[allow(dead_code)] // API reserved for CEP-22 oversized transfer integration
     pub fn set_internal_common_tags(&mut self, tags: Vec<Tag>) {
         self.internal_common_tags = tags;
         *self
@@ -645,6 +644,7 @@ impl AnnouncementManager {
         CommonTagsSnapshot {
             server_info: self.server_info.clone(),
             extra_common_tags: self.extra_common_tags.clone(),
+            internal_common_tags: self.internal_common_tags.clone(),
             encryption_mode: self.encryption_mode,
             gift_wrap_mode: self.gift_wrap_mode,
         }
@@ -882,6 +882,8 @@ pub(crate) struct CommonTagsSnapshot {
     pub server_info: Option<ServerInfo>,
     /// User-provided extra common tags.
     pub extra_common_tags: Vec<Tag>,
+    /// Transport-owned internal common tags (e.g. CEP-22 oversized support).
+    pub internal_common_tags: Vec<Tag>,
     /// Encryption mode for capability tag decisions.
     pub encryption_mode: EncryptionMode,
     /// Gift-wrap mode for ephemeral tag decisions.
@@ -915,6 +917,7 @@ impl CommonTagsSnapshot {
             }
         }
         tags.extend(self.extra_common_tags.iter().cloned());
+        tags.extend(self.internal_common_tags.iter().cloned());
     }
 }
 

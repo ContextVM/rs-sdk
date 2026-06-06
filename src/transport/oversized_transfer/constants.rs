@@ -33,8 +33,8 @@ pub const DEFAULT_MAX_CONCURRENT_TRANSFERS: usize = 64;
 
 /// Default hard timeout for an in-flight transfer (milliseconds).
 ///
-/// Not enforced by the PR-1 pure engine (no timers yet); wired into the
-/// transport watchdog in a later PR.
+/// Not enforced by the pure engine (no timers yet); wired into the
+/// transport watchdog once transport integration lands.
 pub const DEFAULT_TRANSFER_TIMEOUT_MS: u64 = 5 * 60 * 1000;
 
 /// Default maximum forward gap between the next expected chunk and an
@@ -46,7 +46,7 @@ pub const DEFAULT_MAX_OUT_OF_ORDER_CHUNKS: usize = 42;
 
 /// Default timeout a sender waits for an `accept` frame before giving up (milliseconds).
 ///
-/// Used by the sender handshake in a later PR; defined here for parity.
+/// Used by the sender handshake once transport integration lands; defined here for parity.
 pub const DEFAULT_ACCEPT_TIMEOUT_MS: u64 = 30_000;
 
 /// Canonical progress slot for the `start` frame.

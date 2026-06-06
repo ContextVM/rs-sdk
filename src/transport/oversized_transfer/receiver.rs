@@ -5,7 +5,7 @@
 //! and returns the reassembled [`JsonRpcMessage`] once a transfer completes and
 //! passes byte-length, SHA-256, and JSON-RPC validation.
 //!
-//! This PR-1 engine is **pure and synchronous**: it owns no timers. The hard
+//! This engine is **pure and synchronous**: it owns no timers. The hard
 //! per-transfer watchdog (`transfer_timeout_ms`) and the sender-side
 //! accept-waiter are added when the engine is wired into the transport.
 
@@ -42,7 +42,7 @@ pub struct TransferPolicy {
     /// Maximum number of buffered out-of-order chunks.
     pub max_out_of_order_chunks: usize,
     /// Hard per-transfer timeout (milliseconds). Reserved for the transport
-    /// watchdog in a later PR; the pure engine does not enforce it.
+    /// watchdog; the pure engine does not enforce it.
     pub transfer_timeout_ms: u64,
 }
 

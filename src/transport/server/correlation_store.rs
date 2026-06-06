@@ -20,7 +20,7 @@ pub struct RouteEntry {
     /// Optional progress token for this request.
     pub progress_token: Option<String>,
     /// The outer gift-wrap event kind that carried this request (e.g. 1059 or 21059).
-    /// Populated from the inbound event in a later PR; `None` until then.
+    /// Populated from the inbound event once wrap-kind mirroring is wired; `None` until then.
     pub wrap_kind: Option<u16>,
     /// When the route was registered.
     pub registered_at: Instant,
