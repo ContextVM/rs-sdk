@@ -745,6 +745,13 @@ impl NostrServerTransport {
         self.message_rx.take()
     }
 
+    /// Read-only snapshot of a client's learned session state, or `None` if no
+    /// session exists for that public key (hex). Exposes learned peer
+    /// capabilities (encryption, ephemeral encryption, CEP-22 oversized transfer).
+    pub async fn session_snapshot(&self, client_pubkey: &str) -> Option<SessionSnapshot> {
+        self.sessions.get_session(client_pubkey).await
+    }
+
     /// Sets extra discovery tags to include in announcements and first-response discovery replay.
     pub fn set_announcement_extra_tags(&mut self, tags: Vec<Tag>) {
         self.announcement_manager.set_extra_common_tags(tags);
@@ -1938,11 +1945,11 @@ mod tests {
 
     #[test]
     fn test_server_learns_client_oversized_only_when_enabled() {
-        // Demonstrates the gate's truth table: `learn_peer_capabilities` parses the
-        // client tag, and `enabled && supports` yields the learned flag. This does
-        // NOT pin the production gate at the `session.supports_oversized_transfer |=`
-        // line in `event_loop` - it reimplements that expression here, so a
-        // regression that hardcodes the flag in `event_loop` would not be caught.
+        // Unit-level check that `learn_peer_capabilities` parses the client tag and
+        // the `enabled && supports` truth table holds. The production gate in
+        // `event_loop` is exercised end-to-end by the integration tests
+        // `server_gate_allows_oversized_when_enabled` /
+        // `server_gate_blocks_oversized_when_disabled` in tests/transport_integration.rs.
         let oversized_tag = Tag::custom(
             TagKind::Custom(tags::SUPPORT_OVERSIZED_TRANSFER.into()),
             Vec::<String>::new(),
