@@ -28,6 +28,7 @@ use crate::encryption;
 use crate::relay::{RelayPool, RelayPoolTrait};
 use crate::transport::base::BaseTransport;
 use crate::transport::discovery_tags::{parse_discovered_peer_capabilities, PeerCapabilities};
+use crate::transport::oversized_transfer::OversizedTransferConfig;
 
 const LOG_TARGET: &str = "contextvm_sdk::transport::client";
 
@@ -59,6 +60,8 @@ pub struct NostrClientTransportConfig {
     pub discovery_relay_urls: Option<Vec<String>>,
     /// Non-authoritative operational relays probed in parallel with CEP-17 discovery.
     pub fallback_operational_relay_urls: Option<Vec<String>>,
+    /// CEP-22 oversized payload transfer configuration. Disabled by default.
+    pub oversized_transfer: OversizedTransferConfig,
 }
 
 impl Default for NostrClientTransportConfig {
@@ -72,6 +75,7 @@ impl Default for NostrClientTransportConfig {
             timeout: Duration::from_secs(30),
             discovery_relay_urls: None,
             fallback_operational_relay_urls: None,
+            oversized_transfer: OversizedTransferConfig::default(),
         }
     }
 }
@@ -115,6 +119,16 @@ impl NostrClientTransportConfig {
     /// Set fallback operational relay URLs probed in parallel with discovery.
     pub fn with_fallback_operational_relay_urls(mut self, urls: Vec<String>) -> Self {
         self.fallback_operational_relay_urls = Some(urls);
+        self
+    }
+    /// Set the full CEP-22 oversized payload transfer configuration.
+    pub fn with_oversized_transfer(mut self, config: OversizedTransferConfig) -> Self {
+        self.oversized_transfer = config;
+        self
+    }
+    /// Enable or disable CEP-22 oversized payload transfer, leaving other knobs at default.
+    pub fn with_oversized_enabled(mut self, enabled: bool) -> Self {
+        self.oversized_transfer.enabled = enabled;
         self
     }
 }
@@ -598,6 +612,13 @@ impl NostrClientTransport {
                     Vec::<String>::new(),
                 ));
             }
+        }
+        // CEP-22: advertise oversized-transfer support when enabled.
+        if self.config.oversized_transfer.enabled {
+            tags.push(Tag::custom(
+                TagKind::Custom(tags::SUPPORT_OVERSIZED_TRANSFER.into()),
+                Vec::<String>::new(),
+            ));
         }
         tags
     }
@@ -1218,6 +1239,47 @@ mod tests {
         let tags = t.get_client_capability_tags();
         let names = tag_names(&tags);
         assert_eq!(names, vec!["support_encryption"]);
+    }
+
+    #[test]
+    fn client_capability_tags_oversized_disabled_by_default() {
+        let t = make_transport_for_tags(EncryptionMode::Optional, GiftWrapMode::Optional);
+        assert!(!t.config.oversized_transfer.enabled);
+        let names = tag_names(&t.get_client_capability_tags());
+        assert!(
+            !names.contains(&"support_oversized_transfer".to_string()),
+            "oversized tag must not be advertised when disabled"
+        );
+    }
+
+    #[test]
+    fn client_capability_tags_oversized_enabled() {
+        let mut t = make_transport_for_tags(EncryptionMode::Optional, GiftWrapMode::Optional);
+        t.config.oversized_transfer.enabled = true;
+        let names = tag_names(&t.get_client_capability_tags());
+        assert!(
+            names.contains(&"support_oversized_transfer".to_string()),
+            "oversized tag must be advertised when enabled"
+        );
+    }
+
+    #[test]
+    fn client_capability_tags_oversized_enabled_without_encryption() {
+        // Tag is emitted independently of the encryption capability tags.
+        let mut t = make_transport_for_tags(EncryptionMode::Disabled, GiftWrapMode::Optional);
+        t.config.oversized_transfer.enabled = true;
+        let names = tag_names(&t.get_client_capability_tags());
+        assert_eq!(names, vec!["support_oversized_transfer"]);
+    }
+
+    #[test]
+    fn client_config_oversized_builders() {
+        let cfg = NostrClientTransportConfig::default().with_oversized_enabled(true);
+        assert!(cfg.oversized_transfer.enabled);
+        let cfg = NostrClientTransportConfig::default()
+            .with_oversized_transfer(OversizedTransferConfig::enabled().with_chunk_size(1024));
+        assert!(cfg.oversized_transfer.enabled);
+        assert_eq!(cfg.oversized_transfer.chunk_size, 1024);
     }
 
     #[test]

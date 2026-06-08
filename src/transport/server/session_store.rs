@@ -109,6 +109,9 @@ impl SessionStore {
             is_encrypted: s.is_encrypted,
             has_sent_common_tags: s.has_sent_common_tags,
             supports_ephemeral_gift_wrap: s.supports_ephemeral_gift_wrap,
+            supports_encryption: s.supports_encryption,
+            supports_ephemeral_encryption: s.supports_ephemeral_encryption,
+            supports_oversized_transfer: s.supports_oversized_transfer,
         })
     }
 
@@ -162,6 +165,9 @@ impl SessionStore {
                         is_encrypted: s.is_encrypted,
                         has_sent_common_tags: s.has_sent_common_tags,
                         supports_ephemeral_gift_wrap: s.supports_ephemeral_gift_wrap,
+                        supports_encryption: s.supports_encryption,
+                        supports_ephemeral_encryption: s.supports_ephemeral_encryption,
+                        supports_oversized_transfer: s.supports_oversized_transfer,
                     },
                 )
             })
@@ -235,6 +241,12 @@ pub struct SessionSnapshot {
     pub has_sent_common_tags: bool,
     /// Whether the peer advertised support for ephemeral gift wraps (CEP-19)
     pub supports_ephemeral_gift_wrap: bool,
+    /// Whether the peer advertised encryption support (CEP-35 learned capability)
+    pub supports_encryption: bool,
+    /// Whether the peer advertised ephemeral-encryption support (CEP-35 learned capability)
+    pub supports_ephemeral_encryption: bool,
+    /// Whether the peer advertised CEP-22 oversized-transfer support (learned, gated by server config)
+    pub supports_oversized_transfer: bool,
 }
 
 #[cfg(test)]
@@ -349,6 +361,40 @@ mod tests {
         assert!(!session.supports_encryption);
         assert!(!session.supports_ephemeral_encryption);
         assert!(!session.supports_oversized_transfer);
+    }
+
+    #[tokio::test]
+    async fn snapshot_surfaces_learned_capabilities() {
+        let store = SessionStore::new();
+        let r = routes();
+        store.get_or_create_session("client-1", false, &r).await;
+
+        // A fresh snapshot reports every capability as false.
+        let snap = store.get_session("client-1").await.unwrap();
+        assert!(!snap.supports_encryption);
+        assert!(!snap.supports_ephemeral_encryption);
+        assert!(!snap.supports_oversized_transfer);
+
+        // Learned capabilities must round-trip through the snapshot.
+        {
+            let mut sessions = store.write().await;
+            let session = sessions.get_mut("client-1").unwrap();
+            session.supports_encryption = true;
+            session.supports_ephemeral_encryption = true;
+            session.supports_oversized_transfer = true;
+        }
+
+        let snap = store.get_session("client-1").await.unwrap();
+        assert!(snap.supports_encryption);
+        assert!(snap.supports_ephemeral_encryption);
+        assert!(snap.supports_oversized_transfer);
+
+        // get_all_sessions exposes the same fields.
+        let all = store.get_all_sessions().await;
+        let (_, snap_all) = all.iter().find(|(k, _)| k == "client-1").unwrap();
+        assert!(snap_all.supports_encryption);
+        assert!(snap_all.supports_ephemeral_encryption);
+        assert!(snap_all.supports_oversized_transfer);
     }
 
     #[tokio::test]

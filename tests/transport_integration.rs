@@ -2661,6 +2661,184 @@ async fn server_learns_capabilities_from_client_request() {
     assert_eq!(incoming.client_pubkey, incoming2.client_pubkey);
 }
 
+/// CEP-22: with oversized transfer enabled on the server, the server learns the
+/// client's advertised `support_oversized_transfer` flag as a request flows
+/// through the real `event_loop` gate. Exercises the production gate end-to-end
+/// (not the inline truth-table unit test).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn server_gate_allows_oversized_when_enabled() {
+    let (client_pool, server_pool) = MockRelayPool::create_pair();
+    let server_pubkey = server_pool.mock_public_key();
+
+    let mut server = NostrServerTransport::with_relay_pool(
+        NostrServerTransportConfig::default()
+            .with_encryption_mode(EncryptionMode::Disabled)
+            .with_oversized_enabled(true),
+        as_pool(server_pool),
+    )
+    .await
+    .unwrap();
+
+    let mut client = NostrClientTransport::with_relay_pool(
+        NostrClientTransportConfig::default()
+            .with_relay_urls(vec!["wss://mock.relay".to_string()])
+            .with_server_pubkey(server_pubkey.to_hex())
+            .with_encryption_mode(EncryptionMode::Disabled)
+            .with_oversized_enabled(true),
+        as_pool(client_pool),
+    )
+    .await
+    .unwrap();
+
+    let mut server_rx = server.take_message_receiver().unwrap();
+    server.start().await.unwrap();
+    client.start().await.unwrap();
+    let_event_loops_start().await;
+
+    client
+        .send(&JsonRpcMessage::Request(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: serde_json::json!(1),
+            method: "initialize".to_string(),
+            params: None,
+        }))
+        .await
+        .unwrap();
+
+    let incoming = tokio::time::timeout(Duration::from_millis(500), server_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+
+    // The session-state update precedes the IncomingRequest dispatch, so the
+    // learned flag is committed by the time we receive the request.
+    let snap = server
+        .session_snapshot(&incoming.client_pubkey)
+        .await
+        .expect("server must have a session for the client");
+    assert!(
+        snap.supports_oversized_transfer,
+        "server with oversized enabled must learn the client's advertised support"
+    );
+}
+
+/// CEP-22: with oversized transfer disabled on the server, the gate drops the
+/// client's advertised `support_oversized_transfer` flag — the session never
+/// records support even though the client advertised it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn server_gate_blocks_oversized_when_disabled() {
+    let (client_pool, server_pool) = MockRelayPool::create_pair();
+    let server_pubkey = server_pool.mock_public_key();
+
+    let mut server = NostrServerTransport::with_relay_pool(
+        NostrServerTransportConfig::default()
+            .with_encryption_mode(EncryptionMode::Disabled)
+            .with_oversized_enabled(false),
+        as_pool(server_pool),
+    )
+    .await
+    .unwrap();
+
+    let mut client = NostrClientTransport::with_relay_pool(
+        NostrClientTransportConfig::default()
+            .with_relay_urls(vec!["wss://mock.relay".to_string()])
+            .with_server_pubkey(server_pubkey.to_hex())
+            .with_encryption_mode(EncryptionMode::Disabled)
+            .with_oversized_enabled(true),
+        as_pool(client_pool),
+    )
+    .await
+    .unwrap();
+
+    let mut server_rx = server.take_message_receiver().unwrap();
+    server.start().await.unwrap();
+    client.start().await.unwrap();
+    let_event_loops_start().await;
+
+    client
+        .send(&JsonRpcMessage::Request(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: serde_json::json!(1),
+            method: "initialize".to_string(),
+            params: None,
+        }))
+        .await
+        .unwrap();
+
+    let incoming = tokio::time::timeout(Duration::from_millis(500), server_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+
+    let snap = server
+        .session_snapshot(&incoming.client_pubkey)
+        .await
+        .expect("server must have a session for the client");
+    assert!(
+        !snap.supports_oversized_transfer,
+        "server with oversized disabled must not learn the client's advertised support"
+    );
+}
+
+/// CEP-22: even with oversized transfer enabled, the server only learns support
+/// the client actually advertised. A client that does not advertise the tag
+/// leaves the session flag false. Pins the `&& discovered.supports_oversized_transfer`
+/// operand of the gate — a regression dropping it would learn `true` regardless.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn server_gate_blocks_oversized_when_client_does_not_advertise() {
+    let (client_pool, server_pool) = MockRelayPool::create_pair();
+    let server_pubkey = server_pool.mock_public_key();
+
+    let mut server = NostrServerTransport::with_relay_pool(
+        NostrServerTransportConfig::default()
+            .with_encryption_mode(EncryptionMode::Disabled)
+            .with_oversized_enabled(true),
+        as_pool(server_pool),
+    )
+    .await
+    .unwrap();
+
+    let mut client = NostrClientTransport::with_relay_pool(
+        NostrClientTransportConfig::default()
+            .with_relay_urls(vec!["wss://mock.relay".to_string()])
+            .with_server_pubkey(server_pubkey.to_hex())
+            .with_encryption_mode(EncryptionMode::Disabled)
+            .with_oversized_enabled(false),
+        as_pool(client_pool),
+    )
+    .await
+    .unwrap();
+
+    let mut server_rx = server.take_message_receiver().unwrap();
+    server.start().await.unwrap();
+    client.start().await.unwrap();
+    let_event_loops_start().await;
+
+    client
+        .send(&JsonRpcMessage::Request(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: serde_json::json!(1),
+            method: "initialize".to_string(),
+            params: None,
+        }))
+        .await
+        .unwrap();
+
+    let incoming = tokio::time::timeout(Duration::from_millis(500), server_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+
+    let snap = server
+        .session_snapshot(&incoming.client_pubkey)
+        .await
+        .expect("server must have a session for the client");
+    assert!(
+        !snap.supports_oversized_transfer,
+        "server must not learn oversized support the client never advertised"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn server_disabled_encryption_omits_encryption_tags() {
     let (client_pool, server_pool) = MockRelayPool::create_pair();

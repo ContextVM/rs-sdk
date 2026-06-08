@@ -29,8 +29,22 @@ use crate::encryption;
 use crate::relay::{RelayPool, RelayPoolTrait};
 use crate::transport::base::BaseTransport;
 use crate::transport::discovery_tags::learn_peer_capabilities;
+use crate::transport::oversized_transfer::OversizedTransferConfig;
 
 const LOG_TARGET: &str = "contextvm_sdk::transport::server";
+
+/// CEP-22: the `support_oversized_transfer` capability tags to advertise, or
+/// empty when oversized transfer is disabled.
+fn oversized_support_tags(config: &NostrServerTransportConfig) -> Vec<Tag> {
+    if config.oversized_transfer.enabled {
+        vec![Tag::custom(
+            TagKind::Custom(tags::SUPPORT_OVERSIZED_TRANSFER.into()),
+            Vec::<String>::new(),
+        )]
+    } else {
+        Vec::new()
+    }
+}
 
 /// Configuration for the server transport.
 #[derive(Debug, Clone)]
@@ -75,6 +89,8 @@ pub struct NostrServerTransportConfig {
     pub publish_relay_list: bool,
     /// Optional NIP-01 profile metadata (kind 0) to publish at startup.
     pub profile_metadata: Option<ProfileMetadata>,
+    /// CEP-22 oversized payload transfer configuration. Disabled by default.
+    pub oversized_transfer: OversizedTransferConfig,
 }
 
 impl Default for NostrServerTransportConfig {
@@ -95,6 +111,7 @@ impl Default for NostrServerTransportConfig {
             bootstrap_relay_urls: None,
             publish_relay_list: true,
             profile_metadata: None,
+            oversized_transfer: OversizedTransferConfig::default(),
         }
     }
 }
@@ -202,6 +219,16 @@ impl NostrServerTransportConfig {
         self.profile_metadata = Some(metadata);
         self
     }
+    /// Set the full CEP-22 oversized payload transfer configuration.
+    pub fn with_oversized_transfer(mut self, config: OversizedTransferConfig) -> Self {
+        self.oversized_transfer = config;
+        self
+    }
+    /// Enable or disable CEP-22 oversized payload transfer, leaving other knobs at default.
+    pub fn with_oversized_enabled(mut self, enabled: bool) -> Self {
+        self.oversized_transfer.enabled = enabled;
+        self
+    }
 }
 
 /// An incoming MCP request with metadata for routing the response.
@@ -246,19 +273,22 @@ impl NostrServerTransport {
             gift_wrap_mode = ?config.gift_wrap_mode,
             "Created server transport"
         );
+        let mut announcement_manager = announcement_manager::AnnouncementManager::new(
+            Arc::clone(&relay_pool),
+            config.server_info.clone(),
+            config.encryption_mode,
+            config.gift_wrap_mode,
+            tx.clone(),
+            config.relay_urls.clone(),
+            config.relay_list_urls.clone(),
+            config.bootstrap_relay_urls.clone(),
+            config.publish_relay_list,
+            config.profile_metadata.clone(),
+        );
+        // CEP-22: advertise oversized-transfer support in announcements + first responses.
+        announcement_manager.set_internal_common_tags(oversized_support_tags(&config));
         Ok(Self {
-            announcement_manager: announcement_manager::AnnouncementManager::new(
-                Arc::clone(&relay_pool),
-                config.server_info.clone(),
-                config.encryption_mode,
-                config.gift_wrap_mode,
-                tx.clone(),
-                config.relay_urls.clone(),
-                config.relay_list_urls.clone(),
-                config.bootstrap_relay_urls.clone(),
-                config.publish_relay_list,
-                config.profile_metadata.clone(),
-            ),
+            announcement_manager,
             base: BaseTransport {
                 relay_pool,
                 encryption_mode: config.encryption_mode,
@@ -293,19 +323,22 @@ impl NostrServerTransport {
             encryption_mode = ?config.encryption_mode,
             "Created server transport (with_relay_pool)"
         );
+        let mut announcement_manager = announcement_manager::AnnouncementManager::new(
+            Arc::clone(&relay_pool),
+            config.server_info.clone(),
+            config.encryption_mode,
+            config.gift_wrap_mode,
+            tx.clone(),
+            config.relay_urls.clone(),
+            config.relay_list_urls.clone(),
+            config.bootstrap_relay_urls.clone(),
+            config.publish_relay_list,
+            config.profile_metadata.clone(),
+        );
+        // CEP-22: advertise oversized-transfer support in announcements + first responses.
+        announcement_manager.set_internal_common_tags(oversized_support_tags(&config));
         Ok(Self {
-            announcement_manager: announcement_manager::AnnouncementManager::new(
-                Arc::clone(&relay_pool),
-                config.server_info.clone(),
-                config.encryption_mode,
-                config.gift_wrap_mode,
-                tx.clone(),
-                config.relay_urls.clone(),
-                config.relay_list_urls.clone(),
-                config.bootstrap_relay_urls.clone(),
-                config.publish_relay_list,
-                config.profile_metadata.clone(),
-            ),
+            announcement_manager,
             base: BaseTransport {
                 relay_pool,
                 encryption_mode: config.encryption_mode,
@@ -379,6 +412,7 @@ impl NostrServerTransport {
         let encryption_mode = self.config.encryption_mode;
         let gift_wrap_mode = self.config.gift_wrap_mode;
         let is_announced_server = self.config.is_announced_server;
+        let oversized_enabled = self.config.oversized_transfer.enabled;
         let common_tags_snapshot = self.announcement_manager.common_tags_snapshot();
         let seen_gift_wrap_ids = self.seen_gift_wrap_ids.clone();
         let event_loop_token = self.cancellation_token.child_token();
@@ -395,6 +429,7 @@ impl NostrServerTransport {
                 encryption_mode,
                 gift_wrap_mode,
                 is_announced_server,
+                oversized_enabled,
                 common_tags_snapshot,
                 seen_gift_wrap_ids,
                 event_loop_token,
@@ -710,6 +745,13 @@ impl NostrServerTransport {
         self.message_rx.take()
     }
 
+    /// Read-only snapshot of a client's learned session state, or `None` if no
+    /// session exists for that public key (hex). Exposes learned peer
+    /// capabilities (encryption, ephemeral encryption, CEP-22 oversized transfer).
+    pub async fn session_snapshot(&self, client_pubkey: &str) -> Option<SessionSnapshot> {
+        self.sessions.get_session(client_pubkey).await
+    }
+
     /// Sets extra discovery tags to include in announcements and first-response discovery replay.
     pub fn set_announcement_extra_tags(&mut self, tags: Vec<Tag>) {
         self.announcement_manager.set_extra_common_tags(tags);
@@ -872,6 +914,7 @@ impl NostrServerTransport {
         encryption_mode: EncryptionMode,
         gift_wrap_mode: GiftWrapMode,
         is_announced_server: bool,
+        oversized_enabled: bool,
         common_tags_snapshot: announcement_manager::CommonTagsSnapshot,
         seen_gift_wrap_ids: Arc<Mutex<LruCache<EventId, ()>>>,
         cancel: CancellationToken,
@@ -1153,9 +1196,7 @@ impl NostrServerTransport {
                 let discovered = learn_peer_capabilities(&inner_tags);
                 session.supports_encryption |= discovered.supports_encryption;
                 session.supports_ephemeral_encryption |= discovered.supports_ephemeral_encryption;
-                // Only learn oversized support if CEP-22 is enabled on this server
-                // TODO: wire from config when CEP-22 lands
-                let oversized_enabled = false;
+                // CEP-22: only learn oversized support if it is enabled on this server.
                 session.supports_oversized_transfer |=
                     oversized_enabled && discovered.supports_oversized_transfer;
 
@@ -1610,6 +1651,7 @@ mod tests {
         let snapshot = announcement_manager::CommonTagsSnapshot {
             server_info: None,
             extra_common_tags: vec![],
+            internal_common_tags: vec![],
             encryption_mode: EncryptionMode::Optional,
             gift_wrap_mode: GiftWrapMode::Optional,
         };
@@ -1627,6 +1669,7 @@ mod tests {
         let snapshot = announcement_manager::CommonTagsSnapshot {
             server_info: None,
             extra_common_tags: vec![],
+            internal_common_tags: vec![],
             encryption_mode: EncryptionMode::Disabled,
             gift_wrap_mode: GiftWrapMode::Optional,
         };
@@ -1724,6 +1767,7 @@ mod tests {
         let snapshot = announcement_manager::CommonTagsSnapshot {
             server_info: None,
             extra_common_tags: vec![],
+            internal_common_tags: vec![],
             encryption_mode: EncryptionMode::Optional,
             gift_wrap_mode: GiftWrapMode::Optional,
         };
@@ -1747,6 +1791,7 @@ mod tests {
         let snapshot = announcement_manager::CommonTagsSnapshot {
             server_info: Some(server_info),
             extra_common_tags: vec![],
+            internal_common_tags: vec![],
             encryption_mode: EncryptionMode::Disabled,
             gift_wrap_mode: GiftWrapMode::Optional,
         };
@@ -1768,6 +1813,7 @@ mod tests {
         let snapshot = announcement_manager::CommonTagsSnapshot {
             server_info: None,
             extra_common_tags: extra_tags,
+            internal_common_tags: vec![],
             encryption_mode: EncryptionMode::Disabled,
             gift_wrap_mode: GiftWrapMode::Optional,
         };
@@ -1810,5 +1856,118 @@ mod tests {
     fn test_config_gift_wrap_mode_default() {
         let config = NostrServerTransportConfig::default();
         assert_eq!(config.gift_wrap_mode, GiftWrapMode::Optional);
+    }
+
+    // ── CEP-22 oversized transfer capability advertisement ──────
+
+    fn first_tag_values(tags: &[Tag]) -> Vec<String> {
+        tags.iter().map(|t| t.clone().to_vec()[0].clone()).collect()
+    }
+
+    async fn make_server_with_oversized(enabled: bool) -> NostrServerTransport {
+        let config = NostrServerTransportConfig {
+            oversized_transfer: OversizedTransferConfig::default().with_enabled(enabled),
+            ..Default::default()
+        };
+        let pool: Arc<dyn RelayPoolTrait> = Arc::new(crate::relay::mock::MockRelayPool::new());
+        NostrServerTransport::with_relay_pool(config, pool)
+            .await
+            .expect("server transport construction")
+    }
+
+    #[test]
+    fn test_oversized_disabled_by_default() {
+        let config = NostrServerTransportConfig::default();
+        assert!(!config.oversized_transfer.enabled);
+    }
+
+    #[test]
+    fn test_oversized_support_tags_helper() {
+        let mut config = NostrServerTransportConfig::default();
+        assert!(oversized_support_tags(&config).is_empty());
+        config.oversized_transfer.enabled = true;
+        let names = first_tag_values(&oversized_support_tags(&config));
+        assert_eq!(names, vec!["support_oversized_transfer"]);
+    }
+
+    #[test]
+    fn test_oversized_builders() {
+        let config = NostrServerTransportConfig::default().with_oversized_enabled(true);
+        assert!(config.oversized_transfer.enabled);
+        let config = NostrServerTransportConfig::default()
+            .with_oversized_transfer(OversizedTransferConfig::enabled().with_threshold(123));
+        assert!(config.oversized_transfer.enabled);
+        assert_eq!(config.oversized_transfer.threshold, 123);
+    }
+
+    #[tokio::test]
+    async fn test_announcement_includes_oversized_tag_when_enabled() {
+        let server = make_server_with_oversized(true).await;
+        let names = first_tag_values(&server.announcement_manager.get_common_tags());
+        assert!(
+            names.contains(&"support_oversized_transfer".to_string()),
+            "announcement common tags must advertise oversized support when enabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_announcement_omits_oversized_tag_when_disabled() {
+        let server = make_server_with_oversized(false).await;
+        let names = first_tag_values(&server.announcement_manager.get_common_tags());
+        assert!(
+            !names.contains(&"support_oversized_transfer".to_string()),
+            "announcement must not advertise oversized support when disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_first_response_snapshot_includes_oversized_tag_when_enabled() {
+        let server = make_server_with_oversized(true).await;
+        let snapshot = server.announcement_manager.common_tags_snapshot();
+        let mut tags = Vec::new();
+        snapshot.append_common_response_tags(&mut tags);
+        let names = first_tag_values(&tags);
+        assert!(
+            names.contains(&"support_oversized_transfer".to_string()),
+            "first-response replay must carry the oversized tag when enabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_first_response_snapshot_omits_oversized_tag_when_disabled() {
+        let server = make_server_with_oversized(false).await;
+        let snapshot = server.announcement_manager.common_tags_snapshot();
+        let mut tags = Vec::new();
+        snapshot.append_common_response_tags(&mut tags);
+        let names = first_tag_values(&tags);
+        assert!(!names.contains(&"support_oversized_transfer".to_string()));
+    }
+
+    #[test]
+    fn test_server_learns_client_oversized_only_when_enabled() {
+        // Unit-level check that `learn_peer_capabilities` parses the client tag and
+        // the `enabled && supports` truth table holds. The production gate in
+        // `event_loop` is exercised end-to-end by the integration tests
+        // `server_gate_allows_oversized_when_enabled` /
+        // `server_gate_blocks_oversized_when_disabled` in tests/transport_integration.rs.
+        let oversized_tag = Tag::custom(
+            TagKind::Custom(tags::SUPPORT_OVERSIZED_TRANSFER.into()),
+            Vec::<String>::new(),
+        );
+        let discovered = learn_peer_capabilities(&[oversized_tag]);
+        assert!(discovered.supports_oversized_transfer);
+
+        // Disabled server: client flag must be ignored.
+        let mut session = ClientSession::new(false);
+        let oversized_enabled = false;
+        session.supports_oversized_transfer |=
+            oversized_enabled && discovered.supports_oversized_transfer;
+        assert!(!session.supports_oversized_transfer);
+
+        // Enabled server: client flag is learned.
+        let oversized_enabled = true;
+        session.supports_oversized_transfer |=
+            oversized_enabled && discovered.supports_oversized_transfer;
+        assert!(session.supports_oversized_transfer);
     }
 }
