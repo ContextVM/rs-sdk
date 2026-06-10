@@ -96,6 +96,20 @@ impl ClientCorrelationStore {
             .map(|r| r.original_id.clone())
     }
 
+    /// Refresh a pending request's registration timestamp without disturbing its
+    /// `original_id`/`is_initialize`. Used by CEP-22 oversized transfers (OD-2):
+    /// each inbound frame "touches" the entry so [`sweep_expired`](Self::sweep_expired)
+    /// does not evict it mid-transfer. Returns `true` if the entry existed.
+    pub async fn touch(&self, event_id: &str) -> bool {
+        let mut cache = self.pending_requests.write().await;
+        if let Some(entry) = cache.get_mut(event_id) {
+            entry.registered_at = Instant::now();
+            true
+        } else {
+            false
+        }
+    }
+
     /// Number of pending requests currently tracked.
     pub async fn count(&self) -> usize {
         self.pending_requests.read().await.len()

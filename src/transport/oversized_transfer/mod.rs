@@ -47,6 +47,8 @@ pub mod constants;
 pub mod errors;
 pub mod frame;
 pub mod receiver;
+pub mod sender;
+pub mod sizing;
 
 pub use codec::{
     build_oversized_frames, sha256_digest, split_string_by_byte_size, utf8_byte_len,
@@ -56,6 +58,8 @@ pub use constants::*;
 pub use errors::OversizedTransferError;
 pub use frame::{CompletionMode, OversizedFrame};
 pub use receiver::{OversizedTransferReceiver, TransferPolicy};
+pub use sender::send_oversized_transfer;
+pub use sizing::{measure_published_event_size, resolve_safe_chunk_size};
 
 /// CEP-22 oversized-transfer configuration shared by both transports.
 ///
@@ -178,5 +182,20 @@ impl OversizedTransferConfig {
     pub fn with_accept_timeout_ms(mut self, ms: u64) -> Self {
         self.accept_timeout_ms = ms;
         self
+    }
+}
+
+impl From<&OversizedTransferConfig> for TransferPolicy {
+    /// Project the receiver-relevant knobs of an [`OversizedTransferConfig`] into
+    /// a [`TransferPolicy`] (D6 → receiver admission policy).
+    fn from(config: &OversizedTransferConfig) -> Self {
+        TransferPolicy {
+            max_transfer_bytes: config.max_transfer_bytes,
+            max_transfer_chunks: config.max_transfer_chunks,
+            max_concurrent_transfers: config.max_concurrent_transfers,
+            max_out_of_order_window: config.max_out_of_order_window,
+            max_out_of_order_chunks: config.max_out_of_order_chunks,
+            transfer_timeout_ms: config.transfer_timeout_ms,
+        }
     }
 }
