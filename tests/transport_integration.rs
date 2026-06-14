@@ -3650,7 +3650,7 @@ async fn server_close_stops_event_loop() {
     );
 }
 
-// ── CEP-22 PR 3 (M3): oversized transfer end-to-end wiring ───────────────────
+// ── CEP-22: oversized transfer end-to-end wiring ─────────────────────────────
 
 /// C→S: a request whose serialized size exceeds the threshold is fragmented into
 /// multiple kind-25910 frames and reassembled into exactly one IncomingRequest.
@@ -3726,6 +3726,143 @@ async fn oversized_request_roundtrip_client_to_server() {
     assert!(second.is_err(), "only one reassembled request expected");
 }
 
+/// CEP-22 parity (TS T3.1): one-shot discovery-tag placement across an oversized
+/// *request*'s frames. The client advertises `support_oversized_transfer` on the
+/// `start` frame only; the continuation (`chunk`/`end`) frames carry the bare
+/// recipient tags. Encryption is Disabled so the plaintext frame tags are directly
+/// inspectable — and `support_oversized_transfer` is advertised independently of
+/// encryption mode (unlike `support_encryption`; see `get_client_capability_tags`),
+/// so Disabled is a valid mode for this assertion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oversized_continuation_frames_carry_no_discovery_tags() {
+    let (client_pool, server_pool) = MockRelayPool::create_pair();
+    let server_pubkey = server_pool.mock_public_key();
+    let server_pool = Arc::new(server_pool);
+
+    let oversized = OversizedTransferConfig::enabled()
+        .with_threshold(6000)
+        .with_chunk_size(6000);
+
+    let mut server = NostrServerTransport::with_relay_pool(
+        NostrServerTransportConfig::default()
+            .with_encryption_mode(EncryptionMode::Disabled)
+            .with_oversized_transfer(oversized.clone()),
+        Arc::clone(&server_pool) as Arc<dyn RelayPoolTrait>,
+    )
+    .await
+    .expect("create server transport");
+
+    let mut client = NostrClientTransport::with_relay_pool(
+        NostrClientTransportConfig::default()
+            .with_relay_urls(vec!["wss://mock.relay".to_string()])
+            .with_server_pubkey(server_pubkey.to_hex())
+            .with_encryption_mode(EncryptionMode::Disabled)
+            .with_oversized_transfer(oversized),
+        as_pool(client_pool),
+    )
+    .await
+    .expect("create client transport");
+
+    let mut server_rx = server.take_message_receiver().expect("server rx");
+    server.start().await.expect("server start");
+    client.start().await.expect("client start");
+    let_event_loops_start().await;
+
+    // The client's first (and only) request is oversized, so the one-shot discovery
+    // tags ride its `start` frame.
+    let request = JsonRpcMessage::Request(JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: serde_json::json!("disco-1"),
+        method: "tools/call".to_string(),
+        params: Some(serde_json::json!({
+            "_meta": { "progressToken": "tok-disco" },
+            "blob": "A".repeat(10000),
+        })),
+    });
+    client.send(&request).await.expect("send oversized request");
+
+    // Confirm the transfer reassembled (so every frame has landed in the store).
+    let incoming = tokio::time::timeout(Duration::from_millis(1000), server_rx.recv())
+        .await
+        .expect("timeout waiting for reassembled request")
+        .expect("server channel closed");
+    assert_eq!(incoming.message.id(), Some(&serde_json::json!("disco-1")));
+
+    // Classify every cvm-bearing frame in the store by its `cvm.frameType`. The
+    // client authors start/chunk/end; the server's `accept` frame matches none of
+    // the three and is naturally excluded.
+    let events = server_pool.stored_events().await;
+    let mut start_frames: Vec<&Event> = Vec::new();
+    let mut chunk_frames: Vec<&Event> = Vec::new();
+    let mut end_frames: Vec<&Event> = Vec::new();
+    for e in events
+        .iter()
+        .filter(|e| e.kind == Kind::Custom(CTXVM_MESSAGES_KIND))
+    {
+        let frame_type = serde_json::from_str::<serde_json::Value>(&e.content)
+            .ok()
+            .as_ref()
+            .and_then(|v| v.get("params"))
+            .and_then(|p| p.get("cvm"))
+            .and_then(|c| c.get("frameType"))
+            .and_then(|f| f.as_str())
+            .map(str::to_string);
+        match frame_type.as_deref() {
+            Some("start") => start_frames.push(e),
+            Some("chunk") => chunk_frames.push(e),
+            Some("end") => end_frames.push(e),
+            _ => {}
+        }
+    }
+
+    assert_eq!(
+        start_frames.len(),
+        1,
+        "expected exactly one start frame, got {}",
+        start_frames.len()
+    );
+    assert!(
+        !chunk_frames.is_empty(),
+        "expected at least one chunk frame for a fragmented request"
+    );
+    assert_eq!(
+        end_frames.len(),
+        1,
+        "expected exactly one end frame, got {}",
+        end_frames.len()
+    );
+
+    // The start frame advertises oversized support…
+    assert!(
+        has_tag_name(start_frames[0], tags::SUPPORT_OVERSIZED_TRANSFER),
+        "the start frame must carry support_oversized_transfer"
+    );
+    // …and every continuation frame (chunk/end) must NOT repeat it.
+    for &frame in chunk_frames.iter().chain(end_frames.iter()) {
+        assert!(
+            !has_tag_name(frame, tags::SUPPORT_OVERSIZED_TRANSFER),
+            "continuation frames must not carry support_oversized_transfer"
+        );
+    }
+}
+
+/// Receive the next non-notification client message, skipping the stripped
+/// progress forwards that precede an oversized response (their shape is pinned
+/// by `oversized_progress_token_restored` in `oversized_timeout_e2e.rs`).
+async fn recv_skipping_progress_forwards(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<JsonRpcMessage>,
+) -> JsonRpcMessage {
+    loop {
+        let msg = tokio::time::timeout(Duration::from_millis(1000), rx.recv())
+            .await
+            .expect("timeout waiting for client message")
+            .expect("client channel closed");
+        if !matches!(msg, JsonRpcMessage::Notification(_)) {
+            return msg;
+        }
+    }
+}
+
 /// S→C: a large response is fragmented by the server and reassembled by the
 /// client into a single response delivered on its receiver.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3790,11 +3927,9 @@ async fn oversized_response_roundtrip_server_to_client() {
         .await
         .expect("server send oversized response");
 
-    // The client reassembles and delivers the full response.
-    let client_msg = tokio::time::timeout(Duration::from_millis(1000), client_rx.recv())
-        .await
-        .expect("timeout waiting for reassembled response")
-        .expect("client channel closed");
+    // The client reassembles and delivers the full response (preceded by
+    // stripped progress forwards, skipped here).
+    let client_msg = recv_skipping_progress_forwards(&mut client_rx).await;
     assert!(client_msg.is_response());
     assert_eq!(client_msg.id(), Some(&serde_json::json!("rsp-1")));
     if let JsonRpcMessage::Response(r) = client_msg {
@@ -3803,8 +3938,8 @@ async fn oversized_response_roundtrip_server_to_client() {
         panic!("expected a response");
     }
 
-    // Test gap 6: the start frame of the oversized response carried the server's
-    // discovery tags, so the client must have learned the server supports oversized
+    // The start frame of the oversized response carried the server's discovery
+    // tags, so the client must have learned the server supports oversized
     // transfer by the time the reassembled response is delivered.
     assert!(
         client
@@ -3814,7 +3949,203 @@ async fn oversized_response_roundtrip_server_to_client() {
     );
 }
 
-// ── CEP-22 PR 3 (M4): remaining §7 oversized-transfer tests ──────────────────
+// ── CEP-22: number-or-string progressToken plumbing ──────────────────────────
+
+/// Collect the `params` of every cvm-bearing (oversized-transfer) frame stored
+/// in `pool`.
+async fn stored_oversized_frame_params(pool: &MockRelayPool) -> Vec<serde_json::Value> {
+    pool.stored_events()
+        .await
+        .iter()
+        .filter(|e| e.kind == Kind::Custom(CTXVM_MESSAGES_KIND))
+        .filter_map(|e| serde_json::from_str::<serde_json::Value>(&e.content).ok())
+        .filter_map(|v| v.get("params").cloned())
+        .filter(|p| p.get("cvm").is_some())
+        .collect()
+}
+
+/// C→S: rmcp stamps *numeric* progressTokens; a request carrying one must
+/// still fragment (string-only extraction returned `None` and silently fell
+/// back to the single-event path). On the wire every frame carries the
+/// stringified token; the reassembled request preserves the original number.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oversized_request_roundtrip_numeric_token() {
+    let (client_pool, server_pool) = MockRelayPool::create_pair();
+    let server_pubkey = server_pool.mock_public_key();
+    let server_pool = Arc::new(server_pool);
+
+    let oversized = OversizedTransferConfig::enabled()
+        .with_threshold(6000)
+        .with_chunk_size(6000);
+
+    let mut server = NostrServerTransport::with_relay_pool(
+        NostrServerTransportConfig::default()
+            .with_encryption_mode(EncryptionMode::Disabled)
+            .with_oversized_transfer(oversized.clone()),
+        Arc::clone(&server_pool) as Arc<dyn RelayPoolTrait>,
+    )
+    .await
+    .expect("create server transport");
+
+    let mut client = NostrClientTransport::with_relay_pool(
+        NostrClientTransportConfig::default()
+            .with_relay_urls(vec!["wss://mock.relay".to_string()])
+            .with_server_pubkey(server_pubkey.to_hex())
+            .with_encryption_mode(EncryptionMode::Disabled)
+            .with_oversized_transfer(oversized),
+        as_pool(client_pool),
+    )
+    .await
+    .expect("create client transport");
+
+    let mut server_rx = server.take_message_receiver().expect("server rx");
+    server.start().await.expect("server start");
+    client.start().await.expect("client start");
+    let_event_loops_start().await;
+
+    // The token is the JSON number 7 — the shape rmcp emits.
+    let request = JsonRpcMessage::Request(JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: serde_json::json!("big-num-1"),
+        method: "tools/call".to_string(),
+        params: Some(serde_json::json!({
+            "_meta": { "progressToken": 7 },
+            "blob": "A".repeat(10000),
+        })),
+    });
+    client.send(&request).await.expect("send oversized request");
+
+    // Fragmentation must have happened, and every frame (start/chunks/end plus
+    // the server's accept echo) must address the transfer by the *stringified*
+    // token — numbers never appear on the wire.
+    let frame_params = stored_oversized_frame_params(&server_pool).await;
+    assert!(
+        frame_params.len() > 1,
+        "numeric-token oversized request must publish multiple frames, got {}",
+        frame_params.len()
+    );
+    for params in &frame_params {
+        assert_eq!(
+            params.get("progressToken"),
+            Some(&serde_json::json!("7")),
+            "frames must carry the stringified token, got {params}"
+        );
+    }
+
+    // Exactly one reassembled request arrives, original numeric token intact.
+    let incoming = tokio::time::timeout(Duration::from_millis(1000), server_rx.recv())
+        .await
+        .expect("timeout waiting for reassembled request")
+        .expect("server channel closed");
+    assert_eq!(incoming.message.method(), Some("tools/call"));
+    assert_eq!(incoming.message.id(), Some(&serde_json::json!("big-num-1")));
+    if let JsonRpcMessage::Request(r) = &incoming.message {
+        assert_eq!(
+            r.params.as_ref().unwrap()["_meta"]["progressToken"],
+            serde_json::json!(7),
+            "reassembly must reproduce the original numeric token"
+        );
+    } else {
+        panic!("expected a request");
+    }
+
+    let second = tokio::time::timeout(Duration::from_millis(100), server_rx.recv()).await;
+    assert!(second.is_err(), "only one reassembled request expected");
+}
+
+/// S→C: a request whose `_meta.progressToken` is numeric must still open
+/// the server's response fragmentation gate (string-only extraction left
+/// `route.progress_token = None`, so responses to rmcp clients never
+/// fragmented). Response frames carry the stringified token on the wire.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oversized_response_roundtrip_numeric_token() {
+    let (client_pool, server_pool) = MockRelayPool::create_pair();
+    let server_pubkey = server_pool.mock_public_key();
+    let server_pool = Arc::new(server_pool);
+
+    let oversized = OversizedTransferConfig::enabled()
+        .with_threshold(6000)
+        .with_chunk_size(6000);
+
+    let mut server = NostrServerTransport::with_relay_pool(
+        NostrServerTransportConfig::default()
+            .with_encryption_mode(EncryptionMode::Disabled)
+            .with_oversized_transfer(oversized.clone()),
+        Arc::clone(&server_pool) as Arc<dyn RelayPoolTrait>,
+    )
+    .await
+    .expect("create server transport");
+
+    let mut client = NostrClientTransport::with_relay_pool(
+        NostrClientTransportConfig::default()
+            .with_relay_urls(vec!["wss://mock.relay".to_string()])
+            .with_server_pubkey(server_pubkey.to_hex())
+            .with_encryption_mode(EncryptionMode::Disabled)
+            .with_oversized_transfer(oversized),
+        as_pool(client_pool),
+    )
+    .await
+    .expect("create client transport");
+
+    let mut server_rx = server.take_message_receiver().expect("server rx");
+    let mut client_rx = client.take_message_receiver().expect("client rx");
+    server.start().await.expect("server start");
+    client.start().await.expect("client start");
+    let_event_loops_start().await;
+
+    // Small request (single event) carrying the JSON number 7 as its token.
+    let request = JsonRpcMessage::Request(JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: serde_json::json!("rsp-num-1"),
+        method: "tools/call".to_string(),
+        params: Some(serde_json::json!({ "_meta": { "progressToken": 7 } })),
+    });
+    client.send(&request).await.expect("send request");
+
+    let incoming = tokio::time::timeout(Duration::from_millis(1000), server_rx.recv())
+        .await
+        .expect("timeout waiting for request")
+        .expect("server channel closed");
+
+    // Server replies with a payload well over the threshold.
+    let response = JsonRpcMessage::Response(JsonRpcResponse {
+        jsonrpc: "2.0".to_string(),
+        id: serde_json::json!("rsp-num-1"),
+        result: serde_json::json!({ "blob": "B".repeat(10000) }),
+    });
+    server
+        .send_response(&incoming.event_id, response)
+        .await
+        .expect("server send oversized response");
+
+    // The client reassembles and delivers the full response (preceded by
+    // stripped progress forwards, skipped here).
+    let client_msg = recv_skipping_progress_forwards(&mut client_rx).await;
+    assert!(client_msg.is_response());
+    assert_eq!(client_msg.id(), Some(&serde_json::json!("rsp-num-1")));
+    if let JsonRpcMessage::Response(r) = client_msg {
+        assert_eq!(r.result["blob"], serde_json::json!("B".repeat(10000)));
+    } else {
+        panic!("expected a response");
+    }
+
+    // The response was actually fragmented, addressed by the stringified token.
+    let frame_params = stored_oversized_frame_params(&server_pool).await;
+    assert!(
+        frame_params.len() > 1,
+        "numeric-token response must fragment, got {} frames",
+        frame_params.len()
+    );
+    for params in &frame_params {
+        assert_eq!(
+            params.get("progressToken"),
+            Some(&serde_json::json!("7")),
+            "response frames must carry the stringified token, got {params}"
+        );
+    }
+}
+
+// ── CEP-22: remaining oversized-transfer tests ───────────────────────────────
 
 /// Start an oversized-enabled server over `server_pool`, returning the live
 /// transport (keep alive) and its request receiver.
@@ -4176,8 +4507,13 @@ async fn oversized_gate_off_sends_single_event() {
             .with_relay_urls(vec!["wss://mock.relay".to_string()])
             .with_server_pubkey(server_pubkey.to_hex())
             .with_encryption_mode(EncryptionMode::Disabled)
-            // Disabled gate; threshold present only to prove it is above-threshold.
-            .with_oversized_transfer(OversizedTransferConfig::default().with_threshold(256)),
+            // Explicitly disabled gate (the default flipped to enabled);
+            // threshold present only to prove it is above-threshold.
+            .with_oversized_transfer(
+                OversizedTransferConfig::default()
+                    .with_enabled(false)
+                    .with_threshold(256),
+            ),
         as_pool(client_pool),
     )
     .await
@@ -4378,7 +4714,7 @@ async fn oversized_decision_accounts_for_encryption_inflation() {
     );
 }
 
-// ── CEP-22 PR 3 gap 4: server accept-frame emission shape ────────────────────
+// ── CEP-22: server accept-frame emission shape ───────────────────────────────
 
 /// Poll the shared event store for the server's emitted `accept` frame (a
 /// plaintext kind-25910 notification authored by the server whose `cvm.frameType`
@@ -4463,5 +4799,10 @@ async fn server_emits_accept_frame_with_expected_shape() {
         params["progressToken"].as_str(),
         Some("tok-acc"),
         "accept frame must echo the transfer's progressToken"
+    );
+    assert_eq!(
+        params["message"].as_str(),
+        Some("oversized request accepted"),
+        "accept frame must carry the TS-matching human-readable message"
     );
 }

@@ -8,10 +8,11 @@
 //! `sdk/src/transport/oversized-transfer/`.
 //!
 //! This module is the **pure engine**: building frames ([`codec`]) and
-//! reassembling them ([`receiver`]). It carries no transport, I/O, or timers —
-//! those are wired in by the client and server transports once transport
-//! integration lands. Until then the module is intentionally unused by the
-//! rest of the crate.
+//! reassembling them ([`receiver`]). It carries no transport, I/O, or live
+//! timers — the client and server transports drive it. The hard per-transfer
+//! watchdog (`transfer_timeout_ms`) is tracked from `start` admission and
+//! reaped via [`OversizedTransferReceiver::remove_expired`] when the owning
+//! transport sweeps.
 //!
 //! ```
 //! use contextvm_sdk::transport::oversized_transfer::{
@@ -56,26 +57,31 @@ pub use codec::{
 };
 pub use constants::*;
 pub use errors::OversizedTransferError;
-pub use frame::{CompletionMode, OversizedFrame};
+pub use frame::{progress_token_string, CompletionMode, OversizedFrame};
 pub use receiver::{OversizedTransferReceiver, TransferPolicy};
 pub use sender::send_oversized_transfer;
 pub use sizing::{measure_published_event_size, resolve_safe_chunk_size};
 
 /// CEP-22 oversized-transfer configuration shared by both transports.
 ///
-/// Bundles the capability gate plus the sender/receiver tuning knobs (D6) so the
+/// Bundles the capability gate plus the sender/receiver tuning knobs so the
 /// nine numeric defaults don't clutter the flat transport configs. Attached to
 /// [`NostrServerTransportConfig`](crate::transport::NostrServerTransportConfig)
 /// and [`NostrClientTransportConfig`](crate::transport::NostrClientTransportConfig)
 /// via their `with_oversized_transfer` / `with_oversized_enabled` builders.
 ///
-/// **Disabled by default** — until a peer opts in, no `support_oversized_transfer`
-/// capability is advertised and the server never learns or activates the feature.
+/// **Enabled by default** (TS parity) — opt out with
+/// [`with_enabled(false)`](Self::with_enabled) or the transports'
+/// `with_oversized_enabled(false)` builders. The negotiation gates make the
+/// default safe for non-oversized peers: the server activates only for
+/// clients that advertise support, and the client fragments only requests
+/// carrying a `progressToken` — a disabled peer just sees one extra
+/// `support_oversized_transfer` tag.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct OversizedTransferConfig {
-    /// Master gate. When `false` (default) the capability is neither advertised
-    /// nor activated, and the server does not learn a client's flag.
+    /// Master gate, `true` by default. When `false` the capability is neither
+    /// advertised nor activated, and the server does not learn a client's flag.
     pub enabled: bool,
     /// Serialized byte length at or above which the sender switches to oversized transfer.
     pub threshold: usize,
@@ -87,7 +93,8 @@ pub struct OversizedTransferConfig {
     pub max_transfer_chunks: u64,
     /// Upper bound on concurrently active receiver-side transfers.
     pub max_concurrent_transfers: usize,
-    /// Hard timeout for an in-flight transfer (milliseconds).
+    /// Hard timeout for an in-flight transfer (milliseconds), measured from
+    /// admission. `0` disables the receiver-side watchdog.
     pub transfer_timeout_ms: u64,
     /// Maximum forward gap between the next expected chunk and an out-of-order
     /// chunk that will still be buffered.
@@ -95,13 +102,19 @@ pub struct OversizedTransferConfig {
     /// Maximum number of buffered out-of-order chunks.
     pub max_out_of_order_chunks: usize,
     /// Timeout a sender waits for an `accept` frame before giving up (milliseconds).
+    ///
+    /// Used by the **client** transport only. The client is the sole party that
+    /// sends a `start` frame with an accept handshake and then waits for the
+    /// `accept`. On the **server** transport this field is inert: a server is
+    /// always the *receiver* of the handshake — it emits the `accept`, it never
+    /// waits for one — so its value is never read server-side.
     pub accept_timeout_ms: u64,
 }
 
 impl Default for OversizedTransferConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             threshold: DEFAULT_OVERSIZED_THRESHOLD,
             chunk_size: DEFAULT_CHUNK_SIZE,
             max_transfer_bytes: DEFAULT_MAX_TRANSFER_BYTES,
@@ -117,6 +130,9 @@ impl Default for OversizedTransferConfig {
 
 impl OversizedTransferConfig {
     /// An explicitly enabled config with all other knobs at their defaults.
+    ///
+    /// Redundant since `enabled` defaulted to `true` (kept for API
+    /// stability); equivalent to [`OversizedTransferConfig::default`].
     pub fn enabled() -> Self {
         Self {
             enabled: true,
@@ -187,7 +203,7 @@ impl OversizedTransferConfig {
 
 impl From<&OversizedTransferConfig> for TransferPolicy {
     /// Project the receiver-relevant knobs of an [`OversizedTransferConfig`] into
-    /// a [`TransferPolicy`] (D6 → receiver admission policy).
+    /// a [`TransferPolicy`] (the receiver admission policy).
     fn from(config: &OversizedTransferConfig) -> Self {
         TransferPolicy {
             max_transfer_bytes: config.max_transfer_bytes,

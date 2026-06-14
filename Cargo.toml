@@ -70,7 +70,13 @@ required-features = ["rmcp", "test-utils"]
 name = "transport_integration"
 required-features = ["test-utils"]
 
+[[test]]
+name = "oversized_timeout_e2e"
+required-features = ["rmcp", "test-utils"]
+
 [dev-dependencies]
+# `start_paused` deterministic-time tests (tokio's "full" does not include test-util).
+tokio = { version = "1", features = ["test-util"] }
 tokio-test = "0.4"
 anyhow = "1"
 schemars = "0.8"

@@ -33,8 +33,9 @@ pub const DEFAULT_MAX_CONCURRENT_TRANSFERS: usize = 64;
 
 /// Default hard timeout for an in-flight transfer (milliseconds).
 ///
-/// Not enforced by the pure engine (no timers yet); wired into the
-/// transport watchdog once transport integration lands.
+/// Measured from `start` admission, never refreshed by chunk activity, and
+/// enforced by sweeping
+/// [`OversizedTransferReceiver::remove_expired`](super::OversizedTransferReceiver::remove_expired).
 pub const DEFAULT_TRANSFER_TIMEOUT_MS: u64 = 5 * 60 * 1000;
 
 /// Default maximum forward gap between the next expected chunk and an

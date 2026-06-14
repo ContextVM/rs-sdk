@@ -5,11 +5,14 @@
 //! and returns the reassembled [`JsonRpcMessage`] once a transfer completes and
 //! passes byte-length, SHA-256, and JSON-RPC validation.
 //!
-//! This engine is **pure and synchronous**: it owns no timers. The hard
-//! per-transfer watchdog (`transfer_timeout_ms`) and the sender-side
-//! accept-waiter are added when the engine is wired into the transport.
+//! This engine is **pure and synchronous**: it owns no live timers. The hard
+//! per-transfer watchdog deadline (`transfer_timeout_ms`) is measured from
+//! `start` admission and enforced by the owning transport calling
+//! [`OversizedTransferReceiver::remove_expired`] on its sweep tick; the
+//! sender-side accept-waiter lives in the transport.
 
 use std::collections::{BTreeMap, HashMap};
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -23,7 +26,7 @@ use super::constants::{
     DEFAULT_TRANSFER_TIMEOUT_MS, DIGEST_PREFIX,
 };
 use super::errors::OversizedTransferError;
-use super::frame::OversizedFrame;
+use super::frame::{progress_token_string, OversizedFrame};
 
 /// Receiver-side admission and out-of-order policy.
 ///
@@ -41,8 +44,10 @@ pub struct TransferPolicy {
     pub max_out_of_order_window: u64,
     /// Maximum number of buffered out-of-order chunks.
     pub max_out_of_order_chunks: usize,
-    /// Hard per-transfer timeout (milliseconds). Reserved for the transport
-    /// watchdog; the pure engine does not enforce it.
+    /// Hard per-transfer timeout (milliseconds), measured from `start`
+    /// admission and never refreshed by chunk activity (TS parity).
+    /// Enforced by sweeping [`OversizedTransferReceiver::remove_expired`];
+    /// `0` disables the watchdog.
     pub transfer_timeout_ms: u64,
 }
 
@@ -72,6 +77,9 @@ struct ActiveTransfer {
     highest_observed_progress: u64,
     /// Chunk fragments keyed by the outer `progress` value (canonical index).
     chunks: BTreeMap<u64, String>,
+    /// When the `start` frame was admitted. The watchdog deadline is measured
+    /// from here and never refreshed (a hard cap, not an idle timer).
+    admitted_at: Instant,
 }
 
 impl ActiveTransfer {
@@ -158,6 +166,10 @@ pub struct OversizedTransferReceiver {
     max_concurrent_transfers: usize,
     max_out_of_order_window: u64,
     max_out_of_order_chunks: usize,
+    /// Hard per-transfer deadline in milliseconds, from `start` admission.
+    /// `0` disables the watchdog: [`Self::remove_expired`] skips the sweep
+    /// entirely rather than expiring transfers instantly.
+    transfer_timeout_ms: u64,
     transfers: HashMap<String, ActiveTransfer>,
 }
 
@@ -181,6 +193,7 @@ impl OversizedTransferReceiver {
             max_concurrent_transfers: policy.max_concurrent_transfers,
             max_out_of_order_window: policy.max_out_of_order_window,
             max_out_of_order_chunks: policy.max_out_of_order_chunks,
+            transfer_timeout_ms: policy.transfer_timeout_ms,
             transfers: HashMap::new(),
         }
     }
@@ -188,6 +201,43 @@ impl OversizedTransferReceiver {
     /// Number of currently active in-flight transfers.
     pub fn active_transfer_count(&self) -> usize {
         self.transfers.len()
+    }
+
+    /// Whether a transfer keyed by `token` is currently in flight.
+    ///
+    /// Lets the transport gate progress forwarding on tracked transfers, so a
+    /// late or orphan frame (e.g. after watchdog reaping) cannot keep a dead
+    /// request's timer alive.
+    pub fn is_tracking(&self, token: &str) -> bool {
+        self.transfers.contains_key(token)
+    }
+
+    /// Reap transfers whose age since `start` admission exceeds the policy's
+    /// `transfer_timeout_ms`, returning the reaped tokens (for logging).
+    ///
+    /// The deadline is hard — never refreshed by chunk activity (TS parity):
+    /// liveness is the requester's idle timer; this sweep is the receiver's
+    /// memory bound. A `transfer_timeout_ms` of `0` disables the watchdog (no
+    /// sweep). Reaping is local-only — no abort frame is emitted; the peer's
+    /// own timeout covers the other side. The token slot is freed: a later
+    /// `start` re-using a reaped token is admitted as a fresh transfer, while
+    /// its late chunk/end frames are orphan-ignored.
+    pub fn remove_expired(&mut self) -> Vec<String> {
+        if self.transfer_timeout_ms == 0 {
+            return Vec::new();
+        }
+        let deadline = Duration::from_millis(self.transfer_timeout_ms);
+        let now = Instant::now();
+        let mut reaped = Vec::new();
+        self.transfers.retain(|token, transfer| {
+            if now.duration_since(transfer.admitted_at) > deadline {
+                reaped.push(token.clone());
+                false
+            } else {
+                true
+            }
+        });
+        reaped
     }
 
     /// Release all in-flight transfer state.
@@ -299,6 +349,7 @@ impl OversizedTransferReceiver {
                 next_expected_chunk_progress: None,
                 highest_observed_progress: progress,
                 chunks: BTreeMap::new(),
+                admitted_at: Instant::now(),
             },
         );
         Ok(None)
@@ -480,11 +531,7 @@ impl OversizedTransferReceiver {
 
 /// Coerce a `progressToken` value to a string (mirrors TS `String(token ?? '')`).
 fn token_to_string(value: Option<&Value>) -> String {
-    match value {
-        Some(Value::String(s)) => s.clone(),
-        Some(Value::Number(n)) => n.to_string(),
-        _ => String::new(),
-    }
+    value.and_then(progress_token_string).unwrap_or_default()
 }
 
 /// A non-empty token is required on every frame.
@@ -631,7 +678,7 @@ mod tests {
 
     #[test]
     fn roundtrip_multibyte_payload() {
-        // Small chunks force boundaries inside multibyte runs (CEP-22 D4).
+        // Small chunks force boundaries inside multibyte UTF-8 runs.
         let message = sample_response(7, "héllo 🦀 wörld 日本語 ☃ même 🚀🚀");
         let frames = build(&message, 5);
 
@@ -771,6 +818,55 @@ mod tests {
             .unwrap();
         let err = receiver.process_frame(&accept).unwrap_err();
         assert!(matches!(err, OversizedTransferError::Sequence(_)));
+        assert_eq!(receiver.active_transfer_count(), 0);
+    }
+
+    /// An `accept` on the wrong progress slot is rejected by the receiver, so a
+    /// transport that wakes the sender's accept-waiter only on a successful
+    /// `process_frame` leaves the oneshot unfired — the sender stays blocked and
+    /// falls back to its accept-timeout → abort (see [`super`]'s sibling sender
+    /// test `missed_accept_returns_abort`).
+    ///
+    /// Scope: this pins the engine-level accept validation (`handle_accept`
+    /// requires `progress > start_progress`). The live *client* upload path wakes
+    /// its waiter on `cvm.frameType == "accept"` + a matching token alone (the
+    /// accept's slot is only meaningful to a reassembling receiver), so this models
+    /// the receiver/reassembly contract, not that path.
+    #[test]
+    fn invalid_accept_leaves_oneshot_unfired() {
+        use tokio::sync::oneshot;
+
+        let mut receiver = OversizedTransferReceiver::new();
+        receiver
+            .process_frame(&start_frame(TOKEN, START_PROGRESS, "sha256:abcd", 4, 1))
+            .unwrap();
+
+        // The sender registers a oneshot before publishing `start`; a transport
+        // wakes it only once the receiver has accepted the accept frame.
+        let (accept_tx, mut accept_rx) = oneshot::channel::<()>();
+
+        // An accept on the start slot is invalid (it must advance past start).
+        let invalid_accept = OversizedFrame::Accept
+            .into_progress_notification(TOKEN, START_PROGRESS, None)
+            .unwrap();
+
+        // Fire-on-Ok: wake the waiter only if the receiver accepts the frame.
+        match receiver.process_frame(&invalid_accept) {
+            Ok(_) => {
+                let _ = accept_tx.send(());
+            }
+            Err(error) => assert!(matches!(error, OversizedTransferError::Sequence(_))),
+        }
+
+        // The accept was rejected, so the oneshot was never fired: still `Empty`
+        // (the sender — held alive here — has not been signalled).
+        assert!(
+            matches!(
+                accept_rx.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ),
+            "an invalid accept must not fire the sender's accept-waiter"
+        );
         assert_eq!(receiver.active_transfer_count(), 0);
     }
 
@@ -1079,5 +1175,122 @@ mod tests {
             serde_json::to_value(&reconstructed).unwrap(),
             serde_json::to_value(&message).unwrap()
         );
+    }
+
+    // ── watchdog: admitted_at / remove_expired / is_tracking ────────────
+
+    fn watchdog_policy(transfer_timeout_ms: u64) -> TransferPolicy {
+        TransferPolicy {
+            transfer_timeout_ms,
+            ..TransferPolicy::default()
+        }
+    }
+
+    /// Backdate a tracked transfer's admission so deadline checks are
+    /// deterministic (no sleeping in unit tests).
+    fn backdate_admission(receiver: &mut OversizedTransferReceiver, token: &str, ms: u64) {
+        receiver
+            .transfers
+            .get_mut(token)
+            .expect("transfer must be tracked")
+            .admitted_at -= Duration::from_millis(ms);
+    }
+
+    #[test]
+    fn remove_expired_reaps_past_deadline_and_orphans_late_frames() {
+        let mut receiver = OversizedTransferReceiver::with_policy(watchdog_policy(50));
+        let mut frames = build(&sample_response(1, "payload"), 4).into_ordered();
+        let rest = frames.split_off(1);
+        receiver.process_frame(&frames[0]).unwrap();
+        assert!(receiver.is_tracking(TOKEN));
+
+        backdate_admission(&mut receiver, TOKEN, 100);
+        let reaped = receiver.remove_expired();
+        assert_eq!(reaped, vec![TOKEN.to_string()]);
+        assert!(!receiver.is_tracking(TOKEN));
+        assert_eq!(receiver.active_transfer_count(), 0);
+
+        // Late chunk/end frames of the reaped transfer are orphan-ignored:
+        // no error, and nothing is ever surfaced.
+        for frame in rest {
+            assert!(receiver.process_frame(&frame).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn remove_expired_skips_unexpired_transfers() {
+        let mut receiver = OversizedTransferReceiver::with_policy(watchdog_policy(50));
+        receiver
+            .process_frame(&start_frame(TOKEN, 1, "sha256:abcd", 4, 1))
+            .unwrap();
+        receiver
+            .process_frame(&start_frame("tok-stale", 1, "sha256:abcd", 4, 1))
+            .unwrap();
+
+        backdate_admission(&mut receiver, "tok-stale", 100);
+        let reaped = receiver.remove_expired();
+        assert_eq!(reaped, vec!["tok-stale".to_string()]);
+        assert!(receiver.is_tracking(TOKEN), "fresh transfer must survive");
+        assert!(!receiver.is_tracking("tok-stale"));
+    }
+
+    #[test]
+    fn remove_expired_zero_timeout_disables_watchdog() {
+        // 0 means "no watchdog" (sweep skipped), NOT instant expiry.
+        let mut receiver = OversizedTransferReceiver::with_policy(watchdog_policy(0));
+        receiver
+            .process_frame(&start_frame(TOKEN, 1, "sha256:abcd", 4, 1))
+            .unwrap();
+        backdate_admission(&mut receiver, TOKEN, 200);
+
+        assert!(receiver.remove_expired().is_empty());
+        assert!(receiver.is_tracking(TOKEN));
+    }
+
+    #[test]
+    fn reaped_token_is_readmittable_as_fresh_transfer() {
+        // remove_expired frees the slot; a later `start` re-using the token is
+        // a fresh transfer (duplicate-start would error if state lingered), and
+        // it runs to completion.
+        let mut receiver = OversizedTransferReceiver::with_policy(watchdog_policy(50));
+        let message = sample_response(7, "again");
+        let mut first = build(&message, 4).into_ordered();
+        first.truncate(2); // start + one chunk, then the sender stalls
+        for frame in &first {
+            receiver.process_frame(frame).unwrap();
+        }
+
+        backdate_admission(&mut receiver, TOKEN, 100);
+        assert_eq!(receiver.remove_expired(), vec![TOKEN.to_string()]);
+
+        let reconstructed = run_to_completion(&mut receiver, build(&message, 4));
+        assert_eq!(
+            serde_json::to_value(&reconstructed).unwrap(),
+            serde_json::to_value(&message).unwrap()
+        );
+        assert!(
+            !receiver.is_tracking(TOKEN),
+            "completed transfer is released"
+        );
+    }
+
+    #[test]
+    fn is_tracking_reflects_transfer_lifecycle() {
+        let mut receiver = OversizedTransferReceiver::new();
+        assert!(!receiver.is_tracking(TOKEN));
+
+        let frames = build(&sample_response(1, "lifecycle"), 4);
+        let ordered = frames.into_ordered();
+        let (end, mid) = ordered.split_last().expect("frames are never empty");
+
+        for frame in mid {
+            receiver.process_frame(frame).unwrap();
+            assert!(receiver.is_tracking(TOKEN), "tracked while in flight");
+        }
+        receiver
+            .process_frame(end)
+            .unwrap()
+            .expect("end frame completes the transfer");
+        assert!(!receiver.is_tracking(TOKEN), "released after completion");
     }
 }

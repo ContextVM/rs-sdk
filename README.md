@@ -206,6 +206,12 @@ The in-repo Rust SDK guides live in [`docs/README.md`](docs/README.md):
 Encryption uses **NIP-44** for payload encryption and **NIP-59** (Gift Wrap) for
 metadata-private delivery. Server announcements (kinds 11316–11320) are always public.
 
+Messages too large for a single relay event are fragmented into ordered frames
+and reassembled by the receiver (CEP-22 oversized transfer, enabled by default;
+it adds no event kind — frames ride inside `notifications/progress` messages).
+See [docs/oversized-transfer.md](docs/oversized-transfer.md) for the timeout
+model and tuning.
+
 ### Server Transport Config
 
 | Field                    | Default               | Description                              |
@@ -221,6 +227,7 @@ metadata-private delivery. Server announcements (kinds 11316–11320) are always
 | `bootstrap_relay_urls`   | `None`                | Additional relays for publishing announcements (CEP-6/17) |
 | `publish_relay_list`     | `true`                | Whether to publish kind 10002 relay list metadata |
 | `profile_metadata`       | `None`                | Profile metadata for kind 0 publication (CEP-23) |
+| `oversized_transfer`     | enabled               | CEP-22 oversized payload transfer config ([guide](docs/oversized-transfer.md)) |
 
 ### Client Transport Config
 
@@ -233,6 +240,7 @@ metadata-private delivery. Server announcements (kinds 11316–11320) are always
 | `timeout`                          | `30s`                      | Response timeout                     |
 | `discovery_relay_urls`             | `None` (bootstrap relays)  | Relays for CEP-17 kind 10002 discovery |
 | `fallback_operational_relay_urls`  | `None`                     | Relays probed in parallel with CEP-17 discovery |
+| `oversized_transfer`               | enabled                    | CEP-22 oversized payload transfer config ([guide](docs/oversized-transfer.md)) |
 
 When `relay_urls` is empty, `start()` runs automatic relay resolution: configured relays > nprofile hints > CEP-17 kind 10002 discovery > fallback probing > bootstrap defaults.
 

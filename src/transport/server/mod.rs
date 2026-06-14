@@ -30,8 +30,9 @@ use crate::relay::{RelayPool, RelayPoolTrait};
 use crate::transport::base::BaseTransport;
 use crate::transport::discovery_tags::learn_peer_capabilities;
 use crate::transport::oversized_transfer::{
-    build_oversized_frames, resolve_safe_chunk_size, OversizedFrame, OversizedSenderOptions,
-    OversizedTransferConfig, OversizedTransferReceiver, TransferPolicy, ACCEPT_PROGRESS,
+    build_oversized_frames, progress_token_string, resolve_safe_chunk_size, OversizedFrame,
+    OversizedSenderOptions, OversizedTransferConfig, OversizedTransferReceiver, TransferPolicy,
+    ACCEPT_PROGRESS,
 };
 
 const LOG_TARGET: &str = "contextvm_sdk::transport::server";
@@ -103,7 +104,7 @@ pub struct NostrServerTransportConfig {
     pub publish_relay_list: bool,
     /// Optional NIP-01 profile metadata (kind 0) to publish at startup.
     pub profile_metadata: Option<ProfileMetadata>,
-    /// CEP-22 oversized payload transfer configuration. Disabled by default.
+    /// CEP-22 oversized payload transfer configuration. Enabled by default.
     pub oversized_transfer: OversizedTransferConfig,
 }
 
@@ -1076,6 +1077,35 @@ impl NostrServerTransport {
         })
     }
 
+    /// CEP-22: one watchdog sweep over the per-peer reassembly engines. Reaps
+    /// transfers past their hard deadline — local-only (no abort frame is
+    /// emitted): the requester's own timeout fails the call, and late frames
+    /// are orphan-ignored — then drops now-empty receivers so long-gone peers
+    /// stop pinning LRU slots (admission recreates them on demand).
+    async fn sweep_oversized_receivers(
+        oversized_receiver: &Arc<RwLock<LruCache<String, OversizedTransferReceiver>>>,
+    ) {
+        let mut receivers = oversized_receiver.write().await;
+        let mut empty_peers: Vec<String> = Vec::new();
+        for (peer, receiver) in receivers.iter_mut() {
+            for token in receiver.remove_expired() {
+                tracing::warn!(
+                    target: LOG_TARGET,
+                    client_pubkey = %peer,
+                    token = %token,
+                    "Oversized transfer reaped by watchdog"
+                );
+            }
+            if receiver.active_transfer_count() == 0 {
+                empty_peers.push(peer.clone());
+            }
+        }
+        // Keys collected first, popped after: never mutate mid-iteration.
+        for peer in empty_peers {
+            receivers.pop(&peer);
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn event_loop(
         relay_pool: Arc<dyn RelayPoolTrait>,
@@ -1097,6 +1127,15 @@ impl NostrServerTransport {
     ) {
         let mut notifications = relay_pool.notifications();
 
+        // CEP-22: receiver-side watchdog sweep. Same clamp formula as the
+        // client's correlation sweep; the arm is disabled entirely when the
+        // feature is off or the deadline is 0 (no watchdog).
+        let watchdog_enabled = oversized_enabled && transfer_policy.transfer_timeout_ms != 0;
+        let sweep_interval = (Duration::from_millis(transfer_policy.transfer_timeout_ms) / 2)
+            .clamp(Duration::from_secs(1), Duration::from_secs(30));
+        let mut sweep_timer =
+            tokio::time::interval_at(tokio::time::Instant::now() + sweep_interval, sweep_interval);
+
         loop {
             let notification = tokio::select! {
                 _ = cancel.cancelled() => {
@@ -1105,6 +1144,10 @@ impl NostrServerTransport {
                         "Server event loop cancelled"
                     );
                     break;
+                }
+                _ = sweep_timer.tick(), if watchdog_enabled => {
+                    Self::sweep_oversized_receivers(&oversized_receiver).await;
+                    continue;
                 }
                 result = notifications.recv() => {
                     match result {
@@ -1372,7 +1415,7 @@ impl NostrServerTransport {
                 let discovered = learn_peer_capabilities(&inner_tags);
                 session.supports_encryption |= discovered.supports_encryption;
                 session.supports_ephemeral_encryption |= discovered.supports_ephemeral_encryption;
-                // CEP-22 (OD-4): snapshot the flag BEFORE the learning gate mutates
+                // CEP-22: snapshot the flag BEFORE the learning gate mutates
                 // it — the very `start` frame carries the client's support tag, so
                 // without this snapshot the first transfer would never get an `accept`.
                 let client_already_supported = session.supports_oversized_transfer;
@@ -1382,7 +1425,7 @@ impl NostrServerTransport {
 
                 // CEP-22: intercept oversized-transfer frames before request
                 // correlation/dispatch. A disabled server forwards raw progress
-                // notifications as before (OD-6).
+                // notifications as before.
                 if oversized_enabled {
                     if let JsonRpcMessage::Notification(ref n) = mcp_msg {
                         if OversizedTransferReceiver::is_oversized_frame(n) {
@@ -1414,14 +1457,18 @@ impl NostrServerTransport {
                 if let JsonRpcMessage::Request(ref req) = mcp_msg {
                     let original_id = req.id.clone();
 
-                    // Extract progress token from _meta if present.
+                    // Extract progress token from _meta if present. String or
+                    // number (rmcp issues numbers): without numeric acceptance
+                    // the response eligibility gate in `send_response` never
+                    // opens for rmcp clients. Normalized to its stringified form
+                    // for routing and frame addressing (the wire keeps emitting
+                    // string tokens).
                     let progress_token = req
                         .params
                         .as_ref()
                         .and_then(|p| p.get("_meta"))
                         .and_then(|m| m.get("progressToken"))
-                        .and_then(|t| t.as_str())
-                        .map(String::from);
+                        .and_then(progress_token_string);
 
                     // Duplicate into session fields (kept for backward compat).
                     session
@@ -1483,7 +1530,7 @@ impl NostrServerTransport {
     /// CEP-22 server inbound: process one oversized-transfer frame.
     ///
     /// Emits an `accept` on the opening frame when the client's support is not yet
-    /// known (OD-4), feeds the frame to this peer's reassembler, and — on the
+    /// known, feeds the frame to this peer's reassembler, and — on the
     /// `end` frame — registers a response route and dispatches the reassembled
     /// request as a synthetic [`IncomingRequest`] (keyed by the end frame's real
     /// carrying event id, collision-free against the reserved sentinels).
@@ -1506,12 +1553,13 @@ impl NostrServerTransport {
         tx: &tokio::sync::mpsc::UnboundedSender<IncomingRequest>,
     ) {
         // The outer progressToken keys the transfer (needed for accept + route).
+        // String or number — defensive only: every known sender stringifies
+        // tokens into frames.
         let token = frame
             .params
             .as_ref()
             .and_then(|p| p.get("progressToken"))
-            .and_then(|t| t.as_str())
-            .map(String::from);
+            .and_then(progress_token_string);
 
         // 1. Emit `accept` on the opening frame if support is not yet known.
         let is_start = frame
@@ -1598,7 +1646,7 @@ impl NostrServerTransport {
                     is_encrypted,
                 });
             }
-            // D11: clean up locally, let the peer's own timeout fire.
+            // Clean up locally, let the peer's own timeout fire.
             Err(error) => {
                 tracing::warn!(
                     target: LOG_TARGET,
@@ -1630,18 +1678,21 @@ impl NostrServerTransport {
             Err(_) => return,
         };
         let event_id_parsed = EventId::from_hex(start_event_id).unwrap_or(EventId::all_zeros());
-        let accept =
-            match OversizedFrame::Accept.into_progress_notification(token, ACCEPT_PROGRESS, None) {
-                Ok(n) => JsonRpcMessage::Notification(n),
-                Err(error) => {
-                    tracing::error!(
-                        target: LOG_TARGET,
-                        error = %error,
-                        "Failed to build oversized-transfer accept frame"
-                    );
-                    return;
-                }
-            };
+        let accept = match OversizedFrame::Accept.into_progress_notification(
+            token,
+            ACCEPT_PROGRESS,
+            Some("oversized request accepted"),
+        ) {
+            Ok(n) => JsonRpcMessage::Notification(n),
+            Err(error) => {
+                tracing::error!(
+                    target: LOG_TARGET,
+                    error = %error,
+                    "Failed to build oversized-transfer accept frame"
+                );
+                return;
+            }
+        };
         let tags = BaseTransport::create_response_tags(&client_pk, &event_id_parsed);
         let base = BaseTransport {
             relay_pool: Arc::clone(relay_pool),
@@ -2278,14 +2329,15 @@ mod tests {
     }
 
     #[test]
-    fn test_oversized_disabled_by_default() {
+    fn test_oversized_enabled_by_default() {
         let config = NostrServerTransportConfig::default();
-        assert!(!config.oversized_transfer.enabled);
+        assert!(config.oversized_transfer.enabled);
     }
 
     #[test]
     fn test_oversized_support_tags_helper() {
-        let mut config = NostrServerTransportConfig::default();
+        // Start from an explicit opt-out: the default is now enabled.
+        let mut config = NostrServerTransportConfig::default().with_oversized_enabled(false);
         assert!(oversized_support_tags(&config).is_empty());
         config.oversized_transfer.enabled = true;
         let names = first_tag_values(&oversized_support_tags(&config));

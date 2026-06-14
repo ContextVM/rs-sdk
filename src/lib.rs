@@ -90,3 +90,10 @@ pub use transport::server::{
 // ── rmcp re-export ──────────────────────────────────────────────────
 #[cfg(feature = "rmcp")]
 pub use rmcp;
+
+// ── CEP-22 progress-aware request helpers ───────────────────────────
+#[cfg(feature = "rmcp")]
+pub use rmcp_transport::progress::{
+    progress_aware_options, PeerRequestOptionsExt, DEFAULT_OVERSIZED_IDLE_TIMEOUT,
+    DEFAULT_OVERSIZED_MAX_TOTAL_TIMEOUT,
+};

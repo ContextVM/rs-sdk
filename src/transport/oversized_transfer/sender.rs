@@ -9,8 +9,8 @@
 //! `prepare_mcp_message` + `publish_event` (registering a pending entry between
 //! the two), the server via `base.send_mcp_message`. Those signatures differ, so
 //! the publish step is injected as a closure and this module stays transport-free
-//! (D11 / OD-5: there is no active `abort` frame in v1 — on a missed `accept` the
-//! sender fails and cleans up locally, letting the peer's own timeout fire).
+//! (there is no active `abort` frame in v1 — on a missed `accept` the sender
+//! fails and cleans up locally, letting the peer's own timeout fire).
 
 use std::future::Future;
 use std::time::Duration;

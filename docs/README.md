@@ -22,6 +22,7 @@ For most native Rust applications, the primary entry points are `NostrServerTran
 - Encryption guide: plaintext, encrypted, and gift-wrap behavior
 - Stateless mode guide: client-side initialize emulation and when to use it
 - Discovery guide: public discovery helpers and event kinds
+- Oversized transfer guide: CEP-22 fragmentation, the three-timer model, and progress-aware request options
 
 ### Bridging existing MCP applications
 

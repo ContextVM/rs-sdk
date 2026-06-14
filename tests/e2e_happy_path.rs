@@ -318,14 +318,14 @@ async fn run_e2e_scenario(mode: EncryptionMode) {
 
 // ── Tests ─────────────────────────────────────────────────────────────────
 
-// NOTE: EncryptionMode::Disabled is intentionally NOT tested here.
-// MockRelayPool broadcasts all events to all receivers, including the publisher.
-// In Disabled mode (plaintext kind 25910), the server receives its own responses
-// and the RMCP handler rejects them. In encrypted modes, the server naturally
-// can't decrypt events gift-wrapped for the client, so they're filtered out.
-// Real Nostr relays do not echo events back to the publisher, so this is a
-// mock-only limitation. Disabled mode is tested at the transport level in
-// tests/transport_integration.rs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_happy_path_encryption_disabled() {
+    // Plaintext full-stack works since MockRelayPool started respecting
+    // per-subscription filters (commit a0f9413): the server's own responses
+    // are p-tagged to the client, so they no longer echo back into the
+    // server's subscription as they did with the old broadcast-to-all mock.
+    run_e2e_scenario(EncryptionMode::Disabled).await;
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_happy_path_encryption_optional() {

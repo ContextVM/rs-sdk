@@ -109,7 +109,10 @@ impl OversizedFrame {
     /// Wrap this frame in a `notifications/progress` [`JsonRpcNotification`].
     ///
     /// Builds the outer `params` with `progressToken`, `progress`, an optional
-    /// human-readable `message` (non-normative UX), and the `cvm` frame.
+    /// human-readable `message` (non-normative UX), and the `cvm` frame. The
+    /// token is always emitted as a JSON **string**, even when the originating
+    /// request carried a numeric one (matching the TS SDK's
+    /// `String(progressToken)`); see [`progress_token_string`].
     pub fn into_progress_notification(
         &self,
         progress_token: &str,
@@ -132,6 +135,23 @@ impl OversizedFrame {
             method: NOTIFICATIONS_PROGRESS_METHOD.to_string(),
             params: Some(Value::Object(params)),
         })
+    }
+}
+
+/// Coerce a `progressToken` JSON value to its canonical string form.
+///
+/// MCP progress tokens may be JSON strings **or numbers** (rmcp stamps a
+/// numeric token into every outgoing request), so token extraction must accept
+/// both; all transport-internal keying (correlation routes, accept waiters,
+/// reassembly state, frame addressing) uses the stringified form. The wire
+/// format is unchanged — frames always carry a string token
+/// ([`OversizedFrame::into_progress_notification`]), exactly like the TS SDK's
+/// `String(progressToken)`. Returns `None` for any other JSON type.
+pub fn progress_token_string(value: &Value) -> Option<String> {
+    match value {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        _ => None,
     }
 }
 
@@ -243,5 +263,25 @@ mod tests {
             .unwrap();
         let params = notification.params.as_ref().unwrap();
         assert!(!params.as_object().unwrap().contains_key("message"));
+    }
+
+    #[test]
+    fn progress_token_string_accepts_string_and_number() {
+        assert_eq!(
+            progress_token_string(&json!("tok-1")),
+            Some("tok-1".to_string())
+        );
+        assert_eq!(progress_token_string(&json!(7)), Some("7".to_string()));
+        assert_eq!(progress_token_string(&json!(0)), Some("0".to_string()));
+        assert_eq!(progress_token_string(&json!(-3)), Some("-3".to_string()));
+        assert_eq!(progress_token_string(&json!(7.5)), Some("7.5".to_string()));
+    }
+
+    #[test]
+    fn progress_token_string_rejects_other_types() {
+        assert_eq!(progress_token_string(&json!(null)), None);
+        assert_eq!(progress_token_string(&json!(true)), None);
+        assert_eq!(progress_token_string(&json!({ "t": 1 })), None);
+        assert_eq!(progress_token_string(&json!([1])), None);
     }
 }
