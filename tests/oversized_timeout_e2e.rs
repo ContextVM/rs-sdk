@@ -778,7 +778,13 @@ async fn watchdog_reaps_stalled_inbound_transfer_server() {
 /// Timing: 150 ms publish delay vs 400 ms idle (≥ 2.5×); ~240 KB payload = ≥ 5
 /// chunks at the 48 000 B default chunk size, pinned above the 65 535 B
 /// single-event NIP-44 cap so an unfragmented path cannot pass.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+///
+/// Runs on **paused virtual time** so the publish/idle relationship is exact
+/// (each 150 ms publish always fires before the 400 ms idle timer) and the test
+/// is deterministic regardless of host speed or CPU contention. The sibling
+/// `oversized_trickle_trips_max_total_timeout` proves the same machinery under
+/// paused time; this is the success-path counterpart.
+#[tokio::test(start_paused = true)]
 async fn oversized_response_progress_resets_idle_timeout() {
     let (client_pool, server_pool) = MockRelayPool::create_pair();
     let server_pubkey = server_pool.mock_public_key();

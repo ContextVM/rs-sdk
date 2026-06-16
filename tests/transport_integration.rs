@@ -1667,6 +1667,7 @@ async fn response_mirrors_client_encryption_format() {
 
         let mut client = NostrClientTransport::with_relay_pool(
             NostrClientTransportConfig::default()
+                .with_relay_urls(vec!["wss://mock.relay".to_string()])
                 .with_server_pubkey(server_pubkey.to_hex())
                 .with_encryption_mode(EncryptionMode::Disabled),
             as_pool(client_pool),
@@ -1749,6 +1750,7 @@ async fn response_mirrors_client_encryption_format() {
 
         let mut client = NostrClientTransport::with_relay_pool(
             NostrClientTransportConfig::default()
+                .with_relay_urls(vec!["wss://mock.relay".to_string()])
                 .with_server_pubkey(server_pubkey.to_hex())
                 .with_encryption_mode(EncryptionMode::Required),
             as_pool(client_pool),
