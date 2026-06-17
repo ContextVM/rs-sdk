@@ -15,6 +15,7 @@ nostr-sdk = { version = "0.43", features = ["nip59"] }
 tokio = { version = "1", features = ["full"] }
 serde_json = "1"
 uniffi = "0.29"
+parking_lot = "0.12"
 
 [features]
 default = []

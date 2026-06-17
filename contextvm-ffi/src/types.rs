@@ -1065,4 +1065,106 @@ mod tests {
 
         assert_eq!(id, "42");
     }
+
+    // Error handling lifecycle tests
+    mod error_lifecycle_tests {
+        use super::*;
+        use crate::error::{set_error, ErrorCode, FfiError};
+
+        #[test]
+        fn test_error_creation_and_free() {
+            let mut error_ptr: *mut FfiError = std::ptr::null_mut();
+
+            // Create an error using set_error
+            let test_error = FfiError {
+                code: ErrorCode::Transport,
+                message: "test error message".to_string(),
+            };
+            set_error(&mut error_ptr, test_error);
+
+            // Verify error was created with correct code
+            assert!(!error_ptr.is_null());
+            unsafe {
+                assert_eq!((*error_ptr).code, ErrorCode::Transport);
+                // Verify the message round-tripped intact
+                assert_eq!((*error_ptr).message, "test error message");
+            }
+
+            // Free the error - this should not panic
+            cvm_error_free(error_ptr);
+        }
+
+        #[test]
+        fn test_error_free_null_is_safe() {
+            // Should not panic on null
+            cvm_error_free(std::ptr::null_mut());
+        }
+
+        #[test]
+        fn test_error_code_values() {
+            // Verify error code discriminant values match C header
+            assert_eq!(ErrorCode::Ok as i32, 0);
+            assert_eq!(ErrorCode::Transport as i32, 1);
+            assert_eq!(ErrorCode::Encryption as i32, 2);
+            assert_eq!(ErrorCode::Decryption as i32, 3);
+            assert_eq!(ErrorCode::Timeout as i32, 4);
+            assert_eq!(ErrorCode::Validation as i32, 5);
+            assert_eq!(ErrorCode::Unauthorized as i32, 6);
+            assert_eq!(ErrorCode::Serialization as i32, 7);
+            assert_eq!(ErrorCode::Other as i32, 99);
+        }
+
+        #[test]
+        fn test_error_display_format() {
+            let error = FfiError {
+                code: ErrorCode::Timeout,
+                message: "operation timed out".to_string(),
+            };
+            let display = format!("{}", error);
+            assert!(display.contains("Timeout"));
+            assert!(display.contains("operation timed out"));
+        }
+
+        #[test]
+        fn test_error_clone() {
+            let original = FfiError {
+                code: ErrorCode::Validation,
+                message: "validation failed".to_string(),
+            };
+            let cloned = original.clone();
+
+            assert_eq!(original.code, cloned.code);
+            assert_eq!(original.message, cloned.message);
+        }
+
+        #[test]
+        fn test_incoming_request_free_null_is_safe() {
+            cvm_incoming_request_free(FfiIncomingRequest {
+                message: FfiJsonRpcMessage {
+                    msg_type: JSON_RPC_TYPE_REQUEST,
+                    id: std::ptr::null_mut(),
+                    payload_json: std::ptr::null_mut(),
+                    method: std::ptr::null_mut(),
+                },
+                client_pubkey: std::ptr::null_mut(),
+                event_id: std::ptr::null_mut(),
+                is_encrypted: false,
+            });
+        }
+
+        #[test]
+        fn test_string_free_null_is_safe() {
+            cvm_string_free(std::ptr::null_mut());
+        }
+
+        #[test]
+        fn test_message_free_null_is_safe() {
+            cvm_message_free(FfiJsonRpcMessage {
+                msg_type: JSON_RPC_TYPE_RESPONSE,
+                id: std::ptr::null_mut(),
+                payload_json: std::ptr::null_mut(),
+                method: std::ptr::null_mut(),
+            });
+        }
+    }
 }

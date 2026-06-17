@@ -5,14 +5,50 @@
  *   #include "contextvm.h"
  *   Link against libcontextvm_ffi.a (static) or libcontextvm_ffi.so (shared)
  *
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * ERROR HANDLING CONTRACT
+ * ═══════════════════════════════════════════════════════════════════════════════
+ *
+ * All functions take a CvmError **error out-parameter.
+ *   - On success: *error is left untouched (caller should initialize to NULL)
+ *   - On failure: *error is set to a freshly-allocated CvmError object
+ *
+ * IMPORTANT: Error objects are heap-allocated. Callers MUST free them with
+ * cvm_error_free() to avoid memory leaks. This applies even if you ignore the
+ * error details - always call cvm_error_free(*error) after checking the function
+ * return value.
+ *
+ * Example:
+ *   CvmError *err = NULL;
+ *   bool ok = cvm_server_ch_recv(handle, &req, &err);
+ *   if (!ok) {
+ *     fprintf(stderr, "Error: %s\n", cvm_error_message(err));
+ *     cvm_error_free(err);  // REQUIRED - frees the error object
+ *   }
+ *
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * RECEIVE CALLS AND TIMEOUTS
+ * ═══════════════════════════════════════════════════════════════════════════════
+ *
+ * Blocking receive functions (cvm_*_ch_recv) block indefinitely until a message
+ * arrives. These are suitable for dedicated worker threads.
+ *
+ * Timed receive functions (cvm_*_ch_recv_timeout) accept a timeout_secs parameter
+ * and return CVM_TIMEOUT if no message arrives within that duration. These are
+ * preferred for embedding in Python/Swift/Kotlin runtimes where you may not want
+ * to manage dedicated threads.
+ *
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * MEMORY MANAGEMENT
+ * ═══════════════════════════════════════════════════════════════════════════════
+ *
  * All functions that return handles use the pattern:
  *   - On success: returns a valid handle (id > 0)
  *   - On error: returns handle { id: 0 } and sets *error
  *
  * Strings returned by this library must be freed with cvm_string_free().
  * Structs with owned strings must be freed with their respective _free functions.
- *
- * Error pointers should be freed with cvm_error_free().
+ * Error pointers must be freed with cvm_error_free() - see ERROR HANDLING above.
  */
 
 #ifndef CONTEXTVM_FFI_H
@@ -202,6 +238,7 @@ void cvm_relay_pool_free(CvmHandle handle);
 
 CvmHandle cvm_server_ch_new(CvmHandle keys_handle, CvmServerConfig config, CvmError **error);
 bool cvm_server_ch_recv(CvmHandle handle, CvmIncomingRequest *out_req, CvmError **error);
+bool cvm_server_ch_recv_timeout(CvmHandle handle, uint64_t timeout_secs, CvmIncomingRequest *out_req, CvmError **error);
 bool cvm_server_ch_send_response(CvmHandle handle, const char *event_id, const char *payload_json, CvmError **error);
 bool cvm_server_ch_send_notification(CvmHandle handle, const char *client_pubkey, const char *payload_json, const char *correlated_event_id, CvmError **error);
 bool cvm_server_ch_broadcast_notification(CvmHandle handle, const char *payload_json, CvmError **error);
@@ -221,6 +258,7 @@ bool cvm_server_ch_close(CvmHandle handle, CvmError **error);
 CvmHandle cvm_client_ch_new(CvmHandle keys_handle, CvmClientConfig config, CvmError **error);
 bool cvm_client_ch_send(CvmHandle handle, const char *payload_json, CvmError **error);
 bool cvm_client_ch_recv(CvmHandle handle, CvmJsonRpcMessage *out_msg, CvmError **error);
+bool cvm_client_ch_recv_timeout(CvmHandle handle, uint64_t timeout_secs, CvmJsonRpcMessage *out_msg, CvmError **error);
 bool cvm_client_ch_discovered_server_capabilities(CvmHandle handle, CvmPeerCapabilities *out_caps, CvmError **error);
 bool cvm_client_ch_server_supports_ephemeral_encryption(CvmHandle handle, CvmError **error);
 char *cvm_client_ch_server_initialize_event_json(CvmHandle handle, CvmError **error);
@@ -230,6 +268,7 @@ bool cvm_client_ch_close(CvmHandle handle, CvmError **error);
 
 CvmHandle cvm_gateway_ch_new(CvmHandle keys_handle, CvmServerConfig config, CvmError **error);
 bool cvm_gateway_ch_recv(CvmHandle handle, CvmIncomingRequest *out_req, CvmError **error);
+bool cvm_gateway_ch_recv_timeout(CvmHandle handle, uint64_t timeout_secs, CvmIncomingRequest *out_req, CvmError **error);
 bool cvm_gateway_ch_send_response(CvmHandle handle, const char *event_id, const char *payload_json, CvmError **error);
 bool cvm_gateway_ch_announce(CvmHandle handle, CvmError **error);
 char *cvm_gateway_ch_announce_event_id(CvmHandle handle, CvmError **error);

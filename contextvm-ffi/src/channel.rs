@@ -132,6 +132,68 @@ pub extern "C" fn cvm_server_ch_recv(
     }
 }
 
+/// Receive the next incoming request, timing out after `timeout_secs`.
+#[no_mangle]
+pub extern "C" fn cvm_server_ch_recv_timeout(
+    handle: FfiHandle,
+    timeout_secs: u64,
+    out_req: *mut FfiIncomingRequest,
+    error: *mut *mut FfiError,
+) -> bool {
+    let channel = match kv::get::<ServerChannel>(handle) {
+        Some(ch) => ch,
+        None => {
+            set_error(
+                error,
+                FfiError {
+                    code: crate::error::ErrorCode::Other,
+                    message: "invalid server channel handle".into(),
+                },
+            );
+            return false;
+        }
+    };
+
+    match global_runtime().block_on(async {
+        let mut receiver = channel.receiver.lock().await;
+        tokio::time::timeout(Duration::from_secs(timeout_secs), receiver.recv()).await
+    }) {
+        Ok(Some(incoming)) => {
+            if !out_req.is_null() {
+                unsafe {
+                    *out_req = FfiIncomingRequest {
+                        message: message_to_ffi(&incoming.message),
+                        client_pubkey: string_to_c(incoming.client_pubkey),
+                        event_id: string_to_c(incoming.event_id),
+                        is_encrypted: incoming.is_encrypted,
+                    };
+                }
+            }
+            true
+        }
+        Ok(None) => {
+            set_error(
+                error,
+                FfiError {
+                    code: crate::error::ErrorCode::Transport,
+                    message: "channel closed".into(),
+                },
+            );
+            false
+        }
+        Err(_) => {
+            set_error(
+                error,
+                FfiError {
+                    code: crate::error::ErrorCode::Timeout,
+                    message: "receive timed out".into(),
+                },
+            );
+            false
+        }
+    }
+}
+
 /// Send a response through a server channel.
 #[no_mangle]
 pub extern "C" fn cvm_server_ch_send_response(
@@ -620,6 +682,63 @@ pub extern "C" fn cvm_client_ch_recv(
     }
 }
 
+/// Receive the next message from a client channel, timing out after `timeout_secs`.
+#[no_mangle]
+pub extern "C" fn cvm_client_ch_recv_timeout(
+    handle: FfiHandle,
+    timeout_secs: u64,
+    out_msg: *mut FfiJsonRpcMessage,
+    error: *mut *mut FfiError,
+) -> bool {
+    let channel = match kv::get::<ClientChannel>(handle) {
+        Some(ch) => ch,
+        None => {
+            set_error(
+                error,
+                FfiError {
+                    code: crate::error::ErrorCode::Other,
+                    message: "invalid client channel handle".into(),
+                },
+            );
+            return false;
+        }
+    };
+
+    match global_runtime().block_on(async {
+        let mut receiver = channel.receiver.lock().await;
+        tokio::time::timeout(Duration::from_secs(timeout_secs), receiver.recv()).await
+    }) {
+        Ok(Some(message)) => {
+            if !out_msg.is_null() {
+                unsafe {
+                    *out_msg = message_to_ffi(&message);
+                }
+            }
+            true
+        }
+        Ok(None) => {
+            set_error(
+                error,
+                FfiError {
+                    code: crate::error::ErrorCode::Transport,
+                    message: "channel closed".into(),
+                },
+            );
+            false
+        }
+        Err(_) => {
+            set_error(
+                error,
+                FfiError {
+                    code: crate::error::ErrorCode::Timeout,
+                    message: "receive timed out".into(),
+                },
+            );
+            false
+        }
+    }
+}
+
 /// Return a snapshot of server capabilities learned from discovery tags.
 #[no_mangle]
 pub extern "C" fn cvm_client_ch_discovered_server_capabilities(
@@ -823,6 +942,68 @@ pub extern "C" fn cvm_gateway_ch_recv(
                 FfiError {
                     code: crate::error::ErrorCode::Transport,
                     message: "channel closed".into(),
+                },
+            );
+            false
+        }
+    }
+}
+
+/// Receive the next request from a gateway channel, timing out after `timeout_secs`.
+#[no_mangle]
+pub extern "C" fn cvm_gateway_ch_recv_timeout(
+    handle: FfiHandle,
+    timeout_secs: u64,
+    out_req: *mut FfiIncomingRequest,
+    error: *mut *mut FfiError,
+) -> bool {
+    let channel = match kv::get::<GatewayChannel>(handle) {
+        Some(ch) => ch,
+        None => {
+            set_error(
+                error,
+                FfiError {
+                    code: crate::error::ErrorCode::Other,
+                    message: "invalid gateway channel handle".into(),
+                },
+            );
+            return false;
+        }
+    };
+
+    match global_runtime().block_on(async {
+        let mut receiver = channel.receiver.lock().await;
+        tokio::time::timeout(Duration::from_secs(timeout_secs), receiver.recv()).await
+    }) {
+        Ok(Some(incoming)) => {
+            if !out_req.is_null() {
+                unsafe {
+                    *out_req = FfiIncomingRequest {
+                        message: message_to_ffi(&incoming.message),
+                        client_pubkey: string_to_c(incoming.client_pubkey),
+                        event_id: string_to_c(incoming.event_id),
+                        is_encrypted: incoming.is_encrypted,
+                    };
+                }
+            }
+            true
+        }
+        Ok(None) => {
+            set_error(
+                error,
+                FfiError {
+                    code: crate::error::ErrorCode::Transport,
+                    message: "channel closed".into(),
+                },
+            );
+            false
+        }
+        Err(_) => {
+            set_error(
+                error,
+                FfiError {
+                    code: crate::error::ErrorCode::Timeout,
+                    message: "receive timed out".into(),
                 },
             );
             false
@@ -1398,4 +1579,178 @@ fn set_null_arg_error(error: *mut *mut FfiError, name: &str) {
             message: format!("null {name}"),
         },
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    mod timeout_tests {
+        use super::*;
+
+        #[test]
+        fn test_server_recv_timeout_invalid_handle() {
+            let invalid_handle = FfiHandle { id: 99999 };
+            let mut out_req = std::mem::MaybeUninit::<FfiIncomingRequest>::uninit();
+            let mut error: *mut FfiError = std::ptr::null_mut();
+
+            let result =
+                cvm_server_ch_recv_timeout(invalid_handle, 1, out_req.as_mut_ptr(), &mut error);
+
+            assert!(!result, "Should return false for invalid handle");
+            assert!(!error.is_null(), "Should set error for invalid handle");
+
+            unsafe {
+                assert_eq!((*error).code, ErrorCode::Other);
+                crate::types::cvm_error_free(error);
+            }
+        }
+
+        #[test]
+        fn test_client_recv_timeout_invalid_handle() {
+            let invalid_handle = FfiHandle { id: 99999 };
+            let mut out_msg = std::mem::MaybeUninit::<FfiJsonRpcMessage>::uninit();
+            let mut error: *mut FfiError = std::ptr::null_mut();
+
+            let result =
+                cvm_client_ch_recv_timeout(invalid_handle, 1, out_msg.as_mut_ptr(), &mut error);
+
+            assert!(!result, "Should return false for invalid handle");
+            assert!(!error.is_null(), "Should set error for invalid handle");
+
+            unsafe {
+                assert_eq!((*error).code, ErrorCode::Other);
+                crate::types::cvm_error_free(error);
+            }
+        }
+
+        #[test]
+        fn test_gateway_recv_timeout_invalid_handle() {
+            let invalid_handle = FfiHandle { id: 99999 };
+            let mut out_req = std::mem::MaybeUninit::<FfiIncomingRequest>::uninit();
+            let mut error: *mut FfiError = std::ptr::null_mut();
+
+            let result =
+                cvm_gateway_ch_recv_timeout(invalid_handle, 1, out_req.as_mut_ptr(), &mut error);
+
+            assert!(!result, "Should return false for invalid handle");
+            assert!(!error.is_null(), "Should set error for invalid handle");
+
+            unsafe {
+                assert_eq!((*error).code, ErrorCode::Other);
+                crate::types::cvm_error_free(error);
+            }
+        }
+
+        #[test]
+        fn test_proxy_recv_timeout_invalid_handle() {
+            let invalid_handle = FfiHandle { id: 99999 };
+            let mut out_msg = std::mem::MaybeUninit::<FfiJsonRpcMessage>::uninit();
+            let mut error: *mut FfiError = std::ptr::null_mut();
+
+            let result =
+                cvm_proxy_ch_recv_timeout(invalid_handle, 1, out_msg.as_mut_ptr(), &mut error);
+
+            assert!(!result, "Should return false for invalid handle");
+            assert!(!error.is_null(), "Should set error for invalid handle");
+
+            unsafe {
+                assert_eq!((*error).code, ErrorCode::Other);
+                crate::types::cvm_error_free(error);
+            }
+        }
+    }
+
+    mod blocking_recv_tests {
+        use super::*;
+
+        #[test]
+        fn test_server_recv_invalid_handle() {
+            let invalid_handle = FfiHandle { id: 99999 };
+            let mut out_req = std::mem::MaybeUninit::<FfiIncomingRequest>::uninit();
+            let mut error: *mut FfiError = std::ptr::null_mut();
+
+            let start = std::time::Instant::now();
+            let result = cvm_server_ch_recv(invalid_handle, out_req.as_mut_ptr(), &mut error);
+            let elapsed = start.elapsed();
+
+            assert!(!result, "Should return false for invalid handle");
+            assert!(!error.is_null(), "Should set error");
+            assert!(
+                elapsed < std::time::Duration::from_secs(1),
+                "Should return quickly for invalid handle, took {:?}",
+                elapsed
+            );
+
+            unsafe {
+                assert_eq!((*error).code, ErrorCode::Other);
+                crate::types::cvm_error_free(error);
+            }
+        }
+
+        #[test]
+        fn test_client_recv_invalid_handle() {
+            let invalid_handle = FfiHandle { id: 99999 };
+            let mut out_msg = std::mem::MaybeUninit::<FfiJsonRpcMessage>::uninit();
+            let mut error: *mut FfiError = std::ptr::null_mut();
+
+            let start = std::time::Instant::now();
+            let result = cvm_client_ch_recv(invalid_handle, out_msg.as_mut_ptr(), &mut error);
+            let elapsed = start.elapsed();
+
+            assert!(!result, "Should return false for invalid handle");
+            assert!(!error.is_null(), "Should set error");
+            assert!(
+                elapsed < std::time::Duration::from_secs(1),
+                "Should return quickly for invalid handle, took {:?}",
+                elapsed
+            );
+
+            unsafe {
+                assert_eq!((*error).code, ErrorCode::Other);
+                crate::types::cvm_error_free(error);
+            }
+        }
+
+        #[test]
+        fn test_gateway_recv_invalid_handle() {
+            let invalid_handle = FfiHandle { id: 99999 };
+            let mut out_req = std::mem::MaybeUninit::<FfiIncomingRequest>::uninit();
+            let mut error: *mut FfiError = std::ptr::null_mut();
+
+            let start = std::time::Instant::now();
+            let result = cvm_gateway_ch_recv(invalid_handle, out_req.as_mut_ptr(), &mut error);
+            let elapsed = start.elapsed();
+
+            assert!(!result, "Should return false for invalid handle");
+            assert!(!error.is_null(), "Should set error");
+            assert!(
+                elapsed < std::time::Duration::from_secs(1),
+                "Should return quickly for invalid handle, took {:?}",
+                elapsed
+            );
+
+            unsafe {
+                assert_eq!((*error).code, ErrorCode::Other);
+                crate::types::cvm_error_free(error);
+            }
+        }
+    }
+
+    mod error_handling_tests {
+        use super::*;
+
+        #[test]
+        fn test_error_codes_match_c_header() {
+            assert_eq!(ErrorCode::Ok as i32, 0, "CVM_OK");
+            assert_eq!(ErrorCode::Transport as i32, 1, "CVM_TRANSPORT");
+            assert_eq!(ErrorCode::Encryption as i32, 2, "CVM_ENCRYPTION");
+            assert_eq!(ErrorCode::Decryption as i32, 3, "CVM_DECRYPTION");
+            assert_eq!(ErrorCode::Timeout as i32, 4, "CVM_TIMEOUT");
+            assert_eq!(ErrorCode::Validation as i32, 5, "CVM_VALIDATION");
+            assert_eq!(ErrorCode::Unauthorized as i32, 6, "CVM_UNAUTHORIZED");
+            assert_eq!(ErrorCode::Serialization as i32, 7, "CVM_SERIALIZATION");
+            assert_eq!(ErrorCode::Other as i32, 99, "CVM_OTHER");
+        }
+    }
 }
