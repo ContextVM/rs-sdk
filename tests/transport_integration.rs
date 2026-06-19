@@ -3951,6 +3951,141 @@ async fn oversized_response_roundtrip_server_to_client() {
     );
 }
 
+/// S→C, ENCRYPTED: a server response whose *raw* size sits below the oversized
+/// threshold but whose gift-wrapped single-event build overflows NIP-44's
+/// 65 535-byte plaintext cap must still fragment and reassemble. This is the rs
+/// analog of TS commit c71d556's `oversized-gift-wrap.e2e.test.ts` Test B, and
+/// it is the path that exercises the Fix-2 error arm in `send_response`
+/// (`server/mod.rs:682`): the single-event build `Err(_) => fragment`.
+///
+/// The threshold is deliberately set ABOVE NIP-44's cap. With the default
+/// 48 000 threshold a >65 KB payload would trip the cheap raw-length
+/// short-circuit (`serialized.len() >= threshold`) and fragment WITHOUT ever
+/// building the single event — never reaching the error arm. Raising the
+/// threshold to 78 000 keeps the ~72 KB raw response below it (so the gate
+/// builds the single encrypted event), while the gift-wrap inner plaintext
+/// (~72 KB) still exceeds 65 535, so `prepare_mcp_message` errors and the gate
+/// falls back to fragmentation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oversized_encrypted_response_roundtrip_server_to_client() {
+    let (client_pool, server_pool) = MockRelayPool::create_pair();
+    let server_pubkey = server_pool.mock_public_key();
+    let server_pool = Arc::new(server_pool);
+
+    // Threshold > NIP-44's 65 535-byte cap so the raw ~72 KB response does NOT
+    // hit the raw-length short-circuit; the gate builds the single encrypted
+    // event and that build overflows NIP-44 → fragments via the error arm.
+    let oversized = OversizedTransferConfig::enabled().with_threshold(78_000);
+
+    let mut server = NostrServerTransport::with_relay_pool(
+        NostrServerTransportConfig::default()
+            .with_encryption_mode(EncryptionMode::Optional)
+            .with_oversized_transfer(oversized.clone()),
+        Arc::clone(&server_pool) as Arc<dyn RelayPoolTrait>,
+    )
+    .await
+    .expect("create server transport");
+
+    let mut client = NostrClientTransport::with_relay_pool(
+        NostrClientTransportConfig::default()
+            .with_relay_urls(vec!["wss://mock.relay".to_string()])
+            .with_server_pubkey(server_pubkey.to_hex())
+            .with_encryption_mode(EncryptionMode::Optional)
+            .with_oversized_transfer(oversized),
+        as_pool(client_pool),
+    )
+    .await
+    .expect("create client transport");
+
+    let mut server_rx = server.take_message_receiver().expect("server rx");
+    let mut client_rx = client.take_message_receiver().expect("client rx");
+    server.start().await.expect("server start");
+    client.start().await.expect("client start");
+    let_event_loops_start().await;
+
+    // Small request carrying a progressToken (so the response is oversized-
+    // eligible). Optional/Optional → the client encrypts by default, so the
+    // server mirrors with an encrypted (gift-wrapped) response.
+    let request = JsonRpcMessage::Request(JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: serde_json::json!("enc-rsp-1"),
+        method: "tools/call".to_string(),
+        params: Some(serde_json::json!({ "_meta": { "progressToken": "tok-enc-rsp" } })),
+    });
+    client.send(&request).await.expect("send request");
+
+    let incoming = tokio::time::timeout(Duration::from_millis(1500), server_rx.recv())
+        .await
+        .expect("timeout waiting for request")
+        .expect("server channel closed");
+    assert!(
+        incoming.is_encrypted,
+        "Optional/Optional: the client must encrypt its request so the response is gift-wrapped"
+    );
+
+    // Count gift-wrap frames published before the response so we can isolate the
+    // response's own frames (gift-wraps are signed by ephemeral keys, so they
+    // can't be filtered by author).
+    let gift_wraps_before = server_pool
+        .stored_events()
+        .await
+        .iter()
+        .filter(|e| {
+            e.kind == Kind::Custom(GIFT_WRAP_KIND)
+                || e.kind == Kind::Custom(EPHEMERAL_GIFT_WRAP_KIND)
+        })
+        .count();
+
+    // Payload: raw ≈ 72 050 B (< 78 000 threshold, so the gate builds the single
+    // event) but the gift-wrap inner plaintext (~72 KB) exceeds NIP-44's
+    // 65 535-byte cap, so the build errors and the response must fragment.
+    let blob = "x".repeat(72_000);
+    let response = JsonRpcMessage::Response(JsonRpcResponse {
+        jsonrpc: "2.0".to_string(),
+        id: serde_json::json!("enc-rsp-1"),
+        result: serde_json::json!({ "blob": blob.clone() }),
+    });
+    server
+        .send_response(&incoming.event_id, response)
+        .await
+        .expect("server send encrypted oversized response");
+
+    // The client reassembles the gift-wrapped frames into the full response.
+    let client_msg = recv_skipping_progress_forwards(&mut client_rx).await;
+    assert!(client_msg.is_response());
+    assert_eq!(client_msg.id(), Some(&serde_json::json!("enc-rsp-1")));
+    if let JsonRpcMessage::Response(r) = client_msg {
+        assert_eq!(
+            r.result["blob"],
+            serde_json::json!(blob),
+            "the >65 535-byte encrypted payload must reassemble byte-for-byte"
+        );
+    } else {
+        panic!("expected a response");
+    }
+
+    // Under encryption the frames are gift-wrapped (opaque content), so frame
+    // types can't be parsed off the wire. Count the gift-wrap events the server
+    // published for this response instead: a fragmented oversized transfer emits
+    // start + chunks + end (≥ 2 gift-wraps), whereas an un-fragmented single
+    // response would emit exactly one — and, at this size, that single encrypted
+    // event could not even be built (the NIP-44 overflow this test pins).
+    let gift_wraps_after = server_pool
+        .stored_events()
+        .await
+        .iter()
+        .filter(|e| {
+            e.kind == Kind::Custom(GIFT_WRAP_KIND)
+                || e.kind == Kind::Custom(EPHEMERAL_GIFT_WRAP_KIND)
+        })
+        .count();
+    let response_frames = gift_wraps_after - gift_wraps_before;
+    assert!(
+        response_frames >= 2,
+        "encrypted oversized response must publish ≥2 gift-wrap frames, got {response_frames}"
+    );
+}
+
 // ── CEP-22: number-or-string progressToken plumbing ──────────────────────────
 
 /// Collect the `params` of every cvm-bearing (oversized-transfer) frame stored
