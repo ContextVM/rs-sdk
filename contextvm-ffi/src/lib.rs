@@ -24,7 +24,10 @@ mod runtime;
 pub mod types;
 mod uniffi_types;
 
-// Public re-exports for integration testing
+// Test-only re-exports. These expose flat-C-ABI symbols and internal modules so the
+// `tests/` integration binaries can call them directly. They are `#[doc(hidden)]` to
+// keep them out of the published rustdoc surface; do not rely on them as a stable API.
+#[doc(hidden)]
 pub use channel::{
     cvm_client_ch_close, cvm_client_ch_discovered_server_capabilities, cvm_client_ch_new,
     cvm_client_ch_recv, cvm_client_ch_recv_timeout, cvm_client_ch_send,
@@ -40,10 +43,13 @@ pub use channel::{
     cvm_server_ch_recv_timeout, cvm_server_ch_send_notification, cvm_server_ch_send_response,
     cvm_server_ch_set_announcement_extra_tags, cvm_server_ch_set_announcement_pricing_tags,
 };
+#[doc(hidden)]
 pub use error::{ErrorCode, FfiError};
+#[doc(hidden)]
 pub use handle::FfiHandle;
 
-// Re-export types module functions for integration testing
+// Re-export types module functions for integration testing (see note above).
+#[doc(hidden)]
 pub use types::{
     cvm_announcements_free, cvm_decrypt_nip44, cvm_discover_all_tools, cvm_discover_servers,
     cvm_discover_tools, cvm_discovered_tools_free, cvm_encrypt_nip44, cvm_error_code,

@@ -38,6 +38,10 @@
  * preferred for embedding in Python/Swift/Kotlin runtimes where you may not want
  * to manage dedicated threads.
  *
+ * Passing timeout_secs = 0 is equivalent to a try-recv: it returns immediately,
+ * yielding CVM_TIMEOUT if no message is already buffered. Use this for non-blocking
+ * polls instead of blocking worker-thread consumption.
+ *
  * ═══════════════════════════════════════════════════════════════════════════════
  * MEMORY MANAGEMENT
  * ═══════════════════════════════════════════════════════════════════════════════

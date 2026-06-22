@@ -1,7 +1,9 @@
-//! End-to-end tests for ContextVM FFI using mock relay.
+//! Structure and validation tests for ContextVM FFI types.
 //!
-//! These tests exercise actual message flow through FFI channels
-//! using the mock relay implementation.
+//! These verify the layout and round-trip conversion of the FFI structs
+//! (configs, messages, announcements, profiles) plus channel handle error
+//! paths — without any relay or network. Live message flow lives in
+//! `e2e_ffi_nak_relay.rs`.
 
 use contextvm_ffi::{
     cvm_client_ch_recv_timeout, cvm_gateway_ch_recv_timeout, cvm_proxy_ch_recv_timeout,

@@ -124,6 +124,7 @@ mod tests {
             timeout: Duration::from_secs(60),
             discovery_relay_urls: None,
             fallback_operational_relay_urls: None,
+            oversized_transfer: Default::default(),
         };
 
         let config = ProxyConfig { nostr_config };

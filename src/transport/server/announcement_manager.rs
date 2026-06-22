@@ -39,7 +39,7 @@ pub(crate) struct AnnouncementManager {
     gift_wrap_mode: GiftWrapMode,
     /// User-provided extra tags (e.g. PMI discovery for CEP-8).
     extra_common_tags: Vec<Tag>,
-    /// Transport-owned internal tags (future CEP-22 oversized support signal).
+    /// Transport-owned internal tags (e.g. CEP-22 oversized support signal).
     internal_common_tags: Vec<Tag>,
     /// CEP-8 pricing tags for capability list responses.
     pricing_tags: Vec<Tag>,
@@ -203,8 +203,10 @@ impl AnnouncementManager {
         tags
     }
 
-    /// Build capability tags based on encryption and gift-wrap mode.
-    pub fn get_capability_tags(&self) -> Vec<Tag> {
+    /// Build the **encryption** capability tags based on encryption and gift-wrap
+    /// mode. Returns encryption capability tags only; CEP-22 oversized transfer and
+    /// other capabilities are contributed separately via `internal_common_tags`.
+    pub fn get_encryption_capability_tags(&self) -> Vec<Tag> {
         let mut tags = Vec::new();
         if self.encryption_mode != EncryptionMode::Disabled {
             tags.push(Tag::custom(
@@ -234,7 +236,7 @@ impl AnnouncementManager {
             return cached.clone();
         }
         let mut tags = self.get_server_info_tags();
-        tags.extend(self.get_capability_tags());
+        tags.extend(self.get_encryption_capability_tags());
         tags.extend(self.extra_common_tags.iter().cloned());
         tags.extend(self.internal_common_tags.iter().cloned());
         *cache = Some(tags.clone());
@@ -277,7 +279,6 @@ impl AnnouncementManager {
     /// Set transport-owned internal common tags (e.g. CEP-22 oversized support).
     ///
     /// Invalidates the common tags cache.
-    #[allow(dead_code)] // API reserved for CEP-22 oversized transfer integration
     pub fn set_internal_common_tags(&mut self, tags: Vec<Tag>) {
         self.internal_common_tags = tags;
         *self
@@ -645,6 +646,7 @@ impl AnnouncementManager {
         CommonTagsSnapshot {
             server_info: self.server_info.clone(),
             extra_common_tags: self.extra_common_tags.clone(),
+            internal_common_tags: self.internal_common_tags.clone(),
             encryption_mode: self.encryption_mode,
             gift_wrap_mode: self.gift_wrap_mode,
         }
@@ -882,6 +884,8 @@ pub(crate) struct CommonTagsSnapshot {
     pub server_info: Option<ServerInfo>,
     /// User-provided extra common tags.
     pub extra_common_tags: Vec<Tag>,
+    /// Transport-owned internal common tags (e.g. CEP-22 oversized support).
+    pub internal_common_tags: Vec<Tag>,
     /// Encryption mode for capability tag decisions.
     pub encryption_mode: EncryptionMode,
     /// Gift-wrap mode for ephemeral tag decisions.
@@ -915,6 +919,7 @@ impl CommonTagsSnapshot {
             }
         }
         tags.extend(self.extra_common_tags.iter().cloned());
+        tags.extend(self.internal_common_tags.iter().cloned());
     }
 }
 
@@ -987,7 +992,7 @@ mod tests {
     #[test]
     fn capability_tags_encryption_enabled() {
         let mgr = make_manager(EncryptionMode::Optional, GiftWrapMode::Persistent, None);
-        let tags = mgr.get_capability_tags();
+        let tags = mgr.get_encryption_capability_tags();
         let names: Vec<String> = tags.iter().map(tag_name).collect();
         assert!(names.contains(&tags::SUPPORT_ENCRYPTION.to_string()));
     }
@@ -995,7 +1000,7 @@ mod tests {
     #[test]
     fn capability_tags_ephemeral_enabled() {
         let mgr = make_manager(EncryptionMode::Optional, GiftWrapMode::Optional, None);
-        let tags = mgr.get_capability_tags();
+        let tags = mgr.get_encryption_capability_tags();
         let names: Vec<String> = tags.iter().map(tag_name).collect();
         assert!(names.contains(&tags::SUPPORT_ENCRYPTION_EPHEMERAL.to_string()));
     }
@@ -1003,7 +1008,7 @@ mod tests {
     #[test]
     fn capability_tags_ephemeral_excluded() {
         let mgr = make_manager(EncryptionMode::Optional, GiftWrapMode::Persistent, None);
-        let tags = mgr.get_capability_tags();
+        let tags = mgr.get_encryption_capability_tags();
         let names: Vec<String> = tags.iter().map(tag_name).collect();
         assert!(
             !names.contains(&tags::SUPPORT_ENCRYPTION_EPHEMERAL.to_string()),
@@ -1014,7 +1019,7 @@ mod tests {
     #[test]
     fn capability_tags_encryption_disabled() {
         let mgr = make_manager(EncryptionMode::Disabled, GiftWrapMode::Optional, None);
-        let tags = mgr.get_capability_tags();
+        let tags = mgr.get_encryption_capability_tags();
         assert!(
             tags.is_empty(),
             "Disabled encryption should produce no capability tags"

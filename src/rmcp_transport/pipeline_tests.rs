@@ -76,19 +76,13 @@ mod tests {
     #[tool_handler]
     impl ServerHandler for StatelessTestServer {
         fn get_info(&self) -> ServerInfo {
-            ServerInfo {
-                protocol_version: ProtocolVersion::LATEST,
-                capabilities: ServerCapabilities::builder().enable_tools().build(),
-                server_info: Implementation {
-                    name: "stateless-test-server".to_string(),
-                    title: Some("Stateless Test Server".to_string()),
-                    version: "0.1.0".to_string(),
-                    description: Some("Stateless rmcp regression test server".to_string()),
-                    icons: None,
-                    website_url: None,
-                },
-                instructions: Some("Use the echo tool".to_string()),
-            }
+            ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+                .with_server_info(
+                    Implementation::new("stateless-test-server", "0.1.0")
+                        .with_title("Stateless Test Server")
+                        .with_description("Stateless rmcp regression test server"),
+                )
+                .with_instructions("Use the echo tool")
         }
     }
 
@@ -381,7 +375,7 @@ mod tests {
                 message: "Method not found".into(),
                 data: None,
             },
-            RequestId::String(std::sync::Arc::from(event_id)),
+            Some(RequestId::String(std::sync::Arc::from(event_id))),
         );
         let internal = rmcp_server_tx_to_internal(rmcp_err).unwrap();
 
@@ -454,15 +448,14 @@ mod tests {
         );
 
         let result = client
-            .call_tool(CallToolRequestParams {
-                name: "echo".into(),
-                arguments: serde_json::from_value(serde_json::json!({
-                    "message": "hello from stateless test"
-                }))
-                .ok(),
-                meta: None,
-                task: None,
-            })
+            .call_tool(
+                CallToolRequestParams::new("echo").with_arguments(
+                    serde_json::from_value(serde_json::json!({
+                        "message": "hello from stateless test"
+                    }))
+                    .unwrap(),
+                ),
+            )
             .await
             .expect("tools/call should succeed");
 

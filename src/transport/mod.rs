@@ -6,6 +6,7 @@
 pub mod base;
 pub mod client;
 pub mod discovery_tags;
+pub mod oversized_transfer;
 pub mod server;
 
 pub use client::{ClientCorrelationStore, NostrClientTransport, NostrClientTransportConfig};

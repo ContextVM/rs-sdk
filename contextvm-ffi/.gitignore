@@ -1,3 +1,6 @@
 /target
 __pycache__/
 *.py[cod]
+
+# C test binary built by c-tests/Makefile
+c-tests/test_ffi

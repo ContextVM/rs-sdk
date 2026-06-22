@@ -1,7 +1,10 @@
-//! End-to-end tests using nak relay simulation.
+//! End-to-end tests driven by a real `nak serve` relay.
 //!
-//! These tests use `nak serve` to start an actual in-memory relay
-//! and test real message flow through the FFI bindings.
+//! These tests spawn the `nak` CLI (https://github.com/nbd-wtf/nostr-cli) to run
+//! an actual in-process relay and exercise real message flow through the FFI
+//! bindings. They are gated behind the `nak-tests` feature and additionally
+//! no-op when the `nak` binary is not on PATH, so they are safe under
+//! `cargo test --all --all-features` without `nak` installed.
 
 use contextvm_ffi::{
     cvm_client_ch_close, cvm_client_ch_new, cvm_client_ch_recv_timeout, cvm_client_ch_send,
@@ -10,6 +13,7 @@ use contextvm_ffi::{
     error::FfiError, types::*,
 };
 use std::ffi::{CStr, CString};
+use std::net::TcpStream;
 use std::os::raw::c_char;
 use std::process::{Child, Command, Stdio};
 use std::ptr;
@@ -35,8 +39,37 @@ struct NakRelay {
     url: String,
 }
 
+/// Returns true if the `nak` binary is available on PATH.
+///
+/// The nak-tests target is feature-gated, but CI runs `cargo test --all-features`,
+/// which enables it. To stay green without `nak` installed, tests call this and
+/// no-op when the binary is absent.
+fn nak_available() -> bool {
+    Command::new("nak")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok()
+}
+
+/// Skip helper for tests that need `nak`. Prints a note and returns true if the
+/// test should be skipped (binary absent), false if it should proceed.
+fn skip_if_no_nak() -> bool {
+    if !nak_available() {
+        eprintln!(
+            "nak binary not found on PATH; skipping nak e2e test \
+             (enable `nak-tests` and install nak to run it)"
+        );
+        return true;
+    }
+    false
+}
+
 impl NakRelay {
-    /// Start a nak relay on a random available port
+    /// Start a nak relay on a random available port.
+    ///
+    /// Panics with an actionable message if `nak` cannot be launched.
     fn start() -> Self {
         // Try ports in a range to find an available one
         for port in 33333..33400 {
@@ -56,31 +89,54 @@ impl NakRelay {
                 .spawn();
 
             match child {
-                Ok(process) => {
-                    // Wait a moment for the relay to start
-                    thread::sleep(Duration::from_millis(500));
-
-                    // Try to verify the relay is accepting connections
-                    let test_url = url.clone();
-                    if Self::check_relay_ready(&test_url) {
+                Ok(mut process) => {
+                    // Probe the listener with a short TCP connect retry loop so
+                    // we only proceed once nak is actually accepting sockets.
+                    if Self::wait_for_relay(&url, Duration::from_secs(5)) {
                         return NakRelay { process, url };
                     } else {
-                        // Relay didn't start, try next port
+                        // Relay didn't come up on this port; clean up and try next.
+                        let _ = process.kill();
+                        let _ = process.wait();
                         continue;
                     }
                 }
-                Err(_) => continue, // Port might be in use, try next
+                Err(e) => {
+                    // Most likely `nak` is not installed at all — surface that
+                    // clearly rather than masking it as a port conflict.
+                    if e.kind() == std::io::ErrorKind::NotFound {
+                        panic!(
+                            "`nak` binary not found on PATH; install it \
+                             (https://github.com/nbd-wtf/nostr-cli) or run without \
+                             the `nak-tests` feature"
+                        );
+                    }
+                    continue; // Transient launch failure; try next port.
+                }
             }
         }
 
-        panic!("Could not start nak relay on any port");
+        panic!("Could not start nak relay on any port in 33333..33400");
     }
 
-    /// Check if relay is ready by attempting a connection
-    fn check_relay_ready(_url: &str) -> bool {
-        // For now, just assume it's ready after the sleep
-        // In production, we might want to do a proper health check
-        true
+    /// Poll the relay address with a TCP connect until it succeeds or times out.
+    fn wait_for_relay(url: &str, deadline: Duration) -> bool {
+        let addr = url.trim_start_matches("ws://");
+        let start = std::time::Instant::now();
+        while start.elapsed() < deadline {
+            if TcpStream::connect_timeout(
+                &addr
+                    .parse()
+                    .unwrap_or_else(|_| "127.0.0.1:0".parse().unwrap()),
+                Duration::from_millis(200),
+            )
+            .is_ok()
+            {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        false
     }
 
     fn url(&self) -> &str {
@@ -99,6 +155,9 @@ impl Drop for NakRelay {
 /// Test that nak relay can be started and stopped
 #[test]
 fn test_nak_relay_lifecycle() {
+    if skip_if_no_nak() {
+        return;
+    }
     let relay = NakRelay::start();
     println!("Started nak relay at: {}", relay.url());
     // Relay will be stopped when dropped
@@ -107,6 +166,9 @@ fn test_nak_relay_lifecycle() {
 /// Test server channel creation with nak relay
 #[test]
 fn test_nak_server_channel_creation() {
+    if skip_if_no_nak() {
+        return;
+    }
     let relay = NakRelay::start();
     let relay_url = relay.url();
 
@@ -184,6 +246,9 @@ fn test_nak_server_channel_creation() {
 /// Test client channel creation with nak relay
 #[test]
 fn test_nak_client_channel_creation() {
+    if skip_if_no_nak() {
+        return;
+    }
     let relay = NakRelay::start();
     let relay_url = relay.url();
 
@@ -256,6 +321,9 @@ fn test_nak_client_channel_creation() {
 /// Test full server-client message flow through nak relay
 #[test]
 fn test_nak_server_client_message_flow() {
+    if skip_if_no_nak() {
+        return;
+    }
     let relay = NakRelay::start();
     let relay_url = relay.url();
 
@@ -365,6 +433,9 @@ fn test_nak_server_client_message_flow() {
 /// Test multiple concurrent connections to nak relay
 #[test]
 fn test_nak_multiple_connections() {
+    if skip_if_no_nak() {
+        return;
+    }
     let relay = NakRelay::start();
     let relay_url = relay.url();
 

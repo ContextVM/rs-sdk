@@ -19,3 +19,13 @@ parking_lot = "0.12"
 
 [features]
 default = []
+# End-to-end tests that spawn the `nak` CLI relay (https://github.com/nbd-wtf/nostr-cli).
+# Off by default so `cargo test` and CI's `cargo test --all --all-features` don't
+# require `nak` to be installed. When enabled but `nak` is absent from PATH, the
+# tests no-op with a stderr note instead of failing.
+nak-tests = []
+
+# `nak` is an external process; only build this test target when explicitly opted in.
+[[test]]
+name = "e2e_ffi_nak_relay"
+required-features = ["nak-tests"]

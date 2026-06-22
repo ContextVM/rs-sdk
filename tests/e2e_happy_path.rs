@@ -87,22 +87,13 @@ impl DemoServer {
 #[tool_handler]
 impl ServerHandler for DemoServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            protocol_version: ProtocolVersion::LATEST,
-            capabilities: ServerCapabilities::builder()
+        ServerInfo::new(
+            ServerCapabilities::builder()
                 .enable_tools()
                 .enable_resources()
                 .build(),
-            server_info: Implementation {
-                name: "e2e-test-server".to_string(),
-                title: None,
-                version: "0.1.0".to_string(),
-                description: None,
-                icons: None,
-                website_url: None,
-            },
-            instructions: None,
-        }
+        )
+        .with_server_info(Implementation::new("e2e-test-server", "0.1.0"))
     }
 
     async fn list_resources(
@@ -125,9 +116,10 @@ impl ServerHandler for DemoServer {
         _ctx: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResult, ErrorData> {
         match req.uri.as_str() {
-            "demo://readme" => Ok(ReadResourceResult {
-                contents: vec![ResourceContents::text("Demo content.", req.uri)],
-            }),
+            "demo://readme" => Ok(ReadResourceResult::new(vec![ResourceContents::text(
+                "Demo content.",
+                req.uri,
+            )])),
             other => Err(ErrorData::resource_not_found(
                 "not_found",
                 Some(serde_json::json!({ "uri": other })),
@@ -158,12 +150,11 @@ fn first_text(result: &CallToolResult) -> String {
 }
 
 fn call_params(name: &'static str, args: Option<serde_json::Value>) -> CallToolRequestParams {
-    CallToolRequestParams {
-        name: name.into(),
-        arguments: args.and_then(|v| serde_json::from_value(v).ok()),
-        meta: None,
-        task: None,
+    let mut params = CallToolRequestParams::new(name);
+    if let Some(v) = args.and_then(|v| serde_json::from_value(v).ok()) {
+        params = params.with_arguments(v);
     }
+    params
 }
 
 // ── Core scenario runner ──────────────────────────────────────────────────
@@ -300,10 +291,7 @@ async fn run_e2e_scenario(mode: EncryptionMode) {
     assert_eq!(resources[0].name.as_str(), "Demo README");
 
     let read_result = client
-        .read_resource(ReadResourceRequestParams {
-            uri: "demo://readme".to_string(),
-            meta: None,
-        })
+        .read_resource(ReadResourceRequestParams::new("demo://readme"))
         .await
         .expect("read_resource");
     assert_eq!(read_result.contents.len(), 1);
@@ -330,14 +318,14 @@ async fn run_e2e_scenario(mode: EncryptionMode) {
 
 // ── Tests ─────────────────────────────────────────────────────────────────
 
-// NOTE: EncryptionMode::Disabled is intentionally NOT tested here.
-// MockRelayPool broadcasts all events to all receivers, including the publisher.
-// In Disabled mode (plaintext kind 25910), the server receives its own responses
-// and the RMCP handler rejects them. In encrypted modes, the server naturally
-// can't decrypt events gift-wrapped for the client, so they're filtered out.
-// Real Nostr relays do not echo events back to the publisher, so this is a
-// mock-only limitation. Disabled mode is tested at the transport level in
-// tests/transport_integration.rs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_happy_path_encryption_disabled() {
+    // Plaintext full-stack works since MockRelayPool started respecting
+    // per-subscription filters (commit a0f9413): the server's own responses
+    // are p-tagged to the client, so they no longer echo back into the
+    // server's subscription as they did with the old broadcast-to-all mock.
+    run_e2e_scenario(EncryptionMode::Disabled).await;
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_happy_path_encryption_optional() {

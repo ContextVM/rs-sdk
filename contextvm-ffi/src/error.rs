@@ -36,6 +36,9 @@ impl From<&contextvm_sdk::Error> for ErrorCode {
             contextvm_sdk::Error::Validation(_) => ErrorCode::Validation,
             contextvm_sdk::Error::Unauthorized(_) => ErrorCode::Unauthorized,
             contextvm_sdk::Error::Serialization(_) => ErrorCode::Serialization,
+            // CEP-22 oversized-transfer failures are transport-layer
+            // framing/reassembly issues, so they surface as CVM_TRANSPORT.
+            contextvm_sdk::Error::OversizedTransfer(_) => ErrorCode::Transport,
             contextvm_sdk::Error::Other(_) => ErrorCode::Other,
         }
     }

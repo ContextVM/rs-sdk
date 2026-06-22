@@ -20,6 +20,10 @@ tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# Hashing for CEP-22 oversized payload transfer (SHA-256 digest of reassembled payloads)
+sha2 = "0.10"
+hex = "0.4"
+
 # Error handling
 thiserror = "2.0"
 async-trait = "0.1"
@@ -31,7 +35,7 @@ nostr-sdk = { version = "0.43", features = ["nip59"] }
 tracing = "0.1"
 
 # Optional MCP integration (Rust equivalent to TS @modelcontextprotocol/sdk)
-rmcp = { version = "0.16.0", features = ["server", "client", "macros", "transport-worker"], optional = true }
+rmcp = { git = "https://github.com/ContextVM-org/rust-sdk", branch = "progress-aware-request-timeouts", features = ["server", "client", "macros", "transport-worker"], optional = true }
 
 # LRU cache for gift-wrap (outer event id) deduplication
 lru = "0.12"
@@ -66,7 +70,13 @@ required-features = ["rmcp", "test-utils"]
 name = "transport_integration"
 required-features = ["test-utils"]
 
+[[test]]
+name = "oversized_timeout_e2e"
+required-features = ["rmcp", "test-utils"]
+
 [dev-dependencies]
+# `start_paused` deterministic-time tests (tokio's "full" does not include test-util).
+tokio = { version = "1", features = ["test-util"] }
 tokio-test = "0.4"
 anyhow = "1"
 schemars = "0.8"

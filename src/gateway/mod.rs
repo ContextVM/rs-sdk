@@ -144,6 +144,7 @@ mod tests {
             bootstrap_relay_urls: None,
             publish_relay_list: true,
             profile_metadata: None,
+            oversized_transfer: Default::default(),
         };
 
         let config = GatewayConfig { nostr_config };

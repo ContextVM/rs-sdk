@@ -10,6 +10,7 @@ pub mod server_relay_discovery;
 
 pub use correlation_store::ClientCorrelationStore;
 
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -17,6 +18,7 @@ use std::time::Duration;
 
 use lru::LruCache;
 use nostr_sdk::prelude::*;
+use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use crate::core::constants::*;
@@ -28,6 +30,11 @@ use crate::encryption;
 use crate::relay::{RelayPool, RelayPoolTrait};
 use crate::transport::base::BaseTransport;
 use crate::transport::discovery_tags::{parse_discovered_peer_capabilities, PeerCapabilities};
+use crate::transport::oversized_transfer::{
+    build_oversized_frames, progress_token_string, resolve_safe_chunk_size,
+    send_oversized_transfer, OversizedFrame, OversizedSenderOptions, OversizedTransferConfig,
+    OversizedTransferReceiver, NOTIFICATIONS_PROGRESS_METHOD,
+};
 
 const LOG_TARGET: &str = "contextvm_sdk::transport::client";
 
@@ -59,6 +66,8 @@ pub struct NostrClientTransportConfig {
     pub discovery_relay_urls: Option<Vec<String>>,
     /// Non-authoritative operational relays probed in parallel with CEP-17 discovery.
     pub fallback_operational_relay_urls: Option<Vec<String>>,
+    /// CEP-22 oversized payload transfer configuration. Enabled by default.
+    pub oversized_transfer: OversizedTransferConfig,
 }
 
 impl Default for NostrClientTransportConfig {
@@ -72,6 +81,7 @@ impl Default for NostrClientTransportConfig {
             timeout: Duration::from_secs(30),
             discovery_relay_urls: None,
             fallback_operational_relay_urls: None,
+            oversized_transfer: OversizedTransferConfig::default(),
         }
     }
 }
@@ -117,6 +127,16 @@ impl NostrClientTransportConfig {
         self.fallback_operational_relay_urls = Some(urls);
         self
     }
+    /// Set the full CEP-22 oversized payload transfer configuration.
+    pub fn with_oversized_transfer(mut self, config: OversizedTransferConfig) -> Self {
+        self.oversized_transfer = config;
+        self
+    }
+    /// Enable or disable CEP-22 oversized payload transfer, leaving other knobs at default.
+    pub fn with_oversized_enabled(mut self, enabled: bool) -> Self {
+        self.oversized_transfer.enabled = enabled;
+        self
+    }
 }
 
 /// Client-side Nostr transport for sending MCP requests and receiving responses.
@@ -144,6 +164,21 @@ pub struct NostrClientTransport {
     /// Duplicate outer ids are skipped before decrypt; ids are inserted only after success
     /// so failed decrypt/verify can be retried on redelivery.
     seen_gift_wrap_ids: Arc<Mutex<LruCache<EventId, ()>>>,
+    /// CEP-22: reassembly engine for inbound oversized responses from the server
+    /// (single peer). Cleared on [`close`](Self::close).
+    oversized_receiver: Arc<Mutex<OversizedTransferReceiver>>,
+    /// CEP-22: outstanding `accept` handshake waiters keyed by `progressToken`. A
+    /// `send()` awaiting the server's `accept` registers a one-shot here before
+    /// publishing `start`; the event loop fires it when the `accept` frame arrives.
+    accept_waiters: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
+    /// CEP-22: original `_meta.progressToken` JSON values of sent
+    /// oversized-eligible requests, keyed by their stringified form. Frames
+    /// stringify tokens on the wire (both SDKs), so the original value —
+    /// `Number` for rmcp-issued tokens — survives only here; progress forwarded
+    /// to the requester must restore it for rmcp's watcher lookup to match
+    /// (`Number(5)` ≠ `String("5")`). LRU-bounded; entries are dropped when
+    /// their transfer concludes and cleared on [`close`](Self::close).
+    original_progress_tokens: Arc<Mutex<LruCache<String, serde_json::Value>>>,
     /// Channel for receiving processed MCP messages from the event loop.
     message_tx: Option<tokio::sync::mpsc::UnboundedSender<JsonRpcMessage>>,
     message_rx: Option<tokio::sync::mpsc::UnboundedReceiver<JsonRpcMessage>>,
@@ -202,12 +237,23 @@ impl NostrClientTransport {
             .clone()
             .unwrap_or_default();
 
+        let oversized_receiver = Arc::new(Mutex::new(OversizedTransferReceiver::with_policy(
+            (&config.oversized_transfer).into(),
+        )));
+        let accept_waiters = Arc::new(Mutex::new(HashMap::new()));
+        let original_progress_tokens = Arc::new(Mutex::new(LruCache::new(
+            NonZeroUsize::new(DEFAULT_LRU_SIZE).expect("DEFAULT_LRU_SIZE must be non-zero"),
+        )));
+
         Ok(Self {
             base: BaseTransport {
                 relay_pool,
                 encryption_mode: config.encryption_mode,
                 is_connected: false,
             },
+            oversized_receiver,
+            accept_waiters,
+            original_progress_tokens,
             config,
             server_pubkey,
             hinted_relay_urls,
@@ -265,12 +311,23 @@ impl NostrClientTransport {
             encryption_mode = ?config.encryption_mode,
             "Created client transport (with_relay_pool)"
         );
+        let oversized_receiver = Arc::new(Mutex::new(OversizedTransferReceiver::with_policy(
+            (&config.oversized_transfer).into(),
+        )));
+        let accept_waiters = Arc::new(Mutex::new(HashMap::new()));
+        let original_progress_tokens = Arc::new(Mutex::new(LruCache::new(
+            NonZeroUsize::new(DEFAULT_LRU_SIZE).expect("DEFAULT_LRU_SIZE must be non-zero"),
+        )));
+
         Ok(Self {
             base: BaseTransport {
                 relay_pool,
                 encryption_mode: config.encryption_mode,
                 is_connected: false,
             },
+            oversized_receiver,
+            accept_waiters,
+            original_progress_tokens,
             config,
             server_pubkey,
             hinted_relay_urls,
@@ -360,6 +417,10 @@ impl NostrClientTransport {
         let init_event = self.server_initialize_event.clone();
         let server_supports_ephemeral = self.server_supports_ephemeral.clone();
         let seen_gift_wrap_ids = self.seen_gift_wrap_ids.clone();
+        let oversized_receiver = self.oversized_receiver.clone();
+        let accept_waiters = self.accept_waiters.clone();
+        let original_progress_tokens = self.original_progress_tokens.clone();
+        let oversized_enabled = self.config.oversized_transfer.enabled;
         let timeout = self.config.timeout;
         let token = self.cancellation_token.child_token();
 
@@ -375,6 +436,10 @@ impl NostrClientTransport {
                 init_event,
                 server_supports_ephemeral,
                 seen_gift_wrap_ids,
+                oversized_receiver,
+                accept_waiters,
+                original_progress_tokens,
+                oversized_enabled,
                 timeout,
                 token,
             )
@@ -396,6 +461,30 @@ impl NostrClientTransport {
             let _ = handle.await;
         }
         self.message_tx.take();
+        // CEP-22: release reassembly state and drop any accept waiters so an
+        // in-flight `send()` awaiter unblocks (cancelled) instead of hanging to
+        // its accept timeout.
+        {
+            let mut receiver = match self.oversized_receiver.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            receiver.clear();
+        }
+        {
+            let mut waiters = match self.accept_waiters.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            waiters.clear();
+        }
+        {
+            let mut originals = match self.original_progress_tokens.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            originals.clear();
+        }
         self.base.disconnect().await
     }
 
@@ -424,7 +513,118 @@ impl NostrClientTransport {
             vec![]
         };
         let tags = BaseTransport::compose_outbound_tags(&base_tags, &discovery_tags, &[]);
+        let gift_wrap_kind = self.choose_outbound_gift_wrap_kind();
+        let discovery_sent = !discovery_tags.is_empty();
 
+        // CEP-22: only a request carrying a `progressToken` is eligible for oversized
+        // fragmentation (the token addresses the frames); extract it once up front.
+        // Tokens may be JSON strings or numbers (rmcp issues numbers): the
+        // stringified form keys all transport state, and the original value is
+        // recorded so progress forwarded to the requester can restore the token's
+        // wire type.
+        let oversized_token: Option<String> =
+            if is_request && self.config.oversized_transfer.enabled {
+                let original = match message {
+                    JsonRpcMessage::Request(req) => req
+                        .params
+                        .as_ref()
+                        .and_then(|p| p.get("_meta"))
+                        .and_then(|m| m.get("progressToken")),
+                    _ => None,
+                };
+                let token = original.and_then(progress_token_string);
+                if let (Some(token), Some(original)) = (token.as_deref(), original) {
+                    self.record_original_progress_token(token, original);
+                }
+                token
+            } else {
+                None
+            };
+
+        // CEP-22: fragment when the message would not fit in a single Nostr event.
+        // Relay size limits apply to the *published* event, so the decision is made
+        // on the published byte size — not the raw payload — which is what actually
+        // grows under JSON escaping and gift-wrap encryption (mirrors TS
+        // `measurePublishedMcpMessageSize`). The raw serialized length is a cheap
+        // lower bound: when it already meets the threshold the message is
+        // conclusively oversized and we fragment without building a single event —
+        // an escape-heavy payload could otherwise overflow NIP-44's plaintext limit
+        // while we measure.
+        if let Some(token) = oversized_token.as_deref() {
+            let content = serde_json::to_string(message)?;
+            let threshold = self.config.oversized_transfer.threshold;
+            if content.len() >= threshold {
+                return self
+                    .send_oversized_request(
+                        message,
+                        &content,
+                        token,
+                        base_tags,
+                        tags,
+                        discovery_sent,
+                    )
+                    .await;
+            }
+            // Borderline: a sub-threshold payload can still cross the threshold once
+            // signed, JSON-escaped, and (when enabled) gift-wrapped. Build the single
+            // event once, measure its real published size, and reuse it if it fits.
+            match self
+                .base
+                .prepare_mcp_message(
+                    message,
+                    &self.server_pubkey,
+                    CTXVM_MESSAGES_KIND,
+                    tags.clone(),
+                    None,
+                    Some(gift_wrap_kind),
+                )
+                .await
+            {
+                Ok((event_id, publishable_event)) => {
+                    let published_len = serde_json::to_string(&publishable_event)
+                        .map(|s| s.len())
+                        .unwrap_or(usize::MAX);
+                    if published_len > threshold {
+                        return self
+                            .send_oversized_request(
+                                message,
+                                &content,
+                                token,
+                                base_tags,
+                                tags,
+                                discovery_sent,
+                            )
+                            .await;
+                    }
+                    return self
+                        .publish_single_event(message, event_id, publishable_event, discovery_sent)
+                        .await;
+                }
+                Err(error) => {
+                    // Could not build even one event (e.g. NIP-44 plaintext overflow
+                    // from an escape-heavy payload) → it cannot be sent as a single
+                    // event; fragment it.
+                    tracing::debug!(
+                        target: LOG_TARGET,
+                        error = %error,
+                        "Single-event build failed; sending as oversized transfer"
+                    );
+                    return self
+                        .send_oversized_request(
+                            message,
+                            &content,
+                            token,
+                            base_tags,
+                            tags,
+                            discovery_sent,
+                        )
+                        .await;
+                }
+            }
+        }
+
+        // Single-event path: not oversized-eligible (notification, feature disabled,
+        // or no progressToken).
         let (event_id, publishable_event) = self
             .base
             .prepare_mcp_message(
@@ -433,7 +633,7 @@ impl NostrClientTransport {
                 CTXVM_MESSAGES_KIND,
                 tags,
                 None,
-                Some(self.choose_outbound_gift_wrap_kind()),
+                Some(gift_wrap_kind),
             )
             .await
             .map_err(|error| {
@@ -447,6 +647,21 @@ impl NostrClientTransport {
                 error
             })?;
 
+        self.publish_single_event(message, event_id, publishable_event, discovery_sent)
+            .await
+    }
+
+    /// Register (for requests) and publish one prepared MCP event, flipping the
+    /// one-shot discovery flag after a successful publish. Shared by the
+    /// non-oversized send paths so the event built for the CEP-22 size check is
+    /// reused for publishing rather than re-encrypted.
+    async fn publish_single_event(
+        &self,
+        message: &JsonRpcMessage,
+        event_id: EventId,
+        publishable_event: Event,
+        discovery_sent: bool,
+    ) -> Result<()> {
         if let JsonRpcMessage::Request(ref req) = message {
             let is_initialize = req.method == INITIALIZE_METHOD;
             self.pending_requests
@@ -467,7 +682,7 @@ impl NostrClientTransport {
         }
 
         // Flip one-shot flag only after successful publish
-        if is_request && !discovery_tags.is_empty() {
+        if discovery_sent {
             self.has_sent_discovery_tags.store(true, Ordering::Relaxed);
         }
 
@@ -478,6 +693,238 @@ impl NostrClientTransport {
             "Sent client message"
         );
         Ok(())
+    }
+
+    /// CEP-22: publish a request as an ordered oversized-transfer sequence.
+    ///
+    /// Builds `start → chunks… → end` frames, registers an `accept` waiter before
+    /// publishing `start` when the server's support is not yet known, drives the
+    /// [`send_oversized_transfer`] sequencer, and registers the pending request
+    /// against the **end** frame's event id (the value the server correlates its
+    /// response to). One-shot discovery tags ride the `start` frame only.
+    async fn send_oversized_request(
+        &self,
+        message: &JsonRpcMessage,
+        content: &str,
+        token: &str,
+        base_tags: Vec<Tag>,
+        start_tags: Vec<Tag>,
+        discovery_sent: bool,
+    ) -> Result<()> {
+        // The handshake is required until the server is known to support oversized
+        // transfer; once learned, chunks start immediately (no accept slot).
+        let needs_accept = !self
+            .discovered_server_capabilities()
+            .supports_oversized_transfer;
+
+        let gift_wrap_kind = self.choose_outbound_gift_wrap_kind();
+        // Effective encryption for these frames (the publish closure passes `None`,
+        // letting `should_encrypt` decide from the mode — resolve the same boolean
+        // here so the sizing measurement matches the real published frames).
+        let is_encrypted = self.base.should_encrypt(CTXVM_MESSAGES_KIND, None);
+
+        // CEP-22: derive a per-chunk payload budget so every published frame stays
+        // under the threshold even after the JSON-RPC envelope, signature, and
+        // (when encrypted) gift-wrap expansion. Mirrors TS `resolveSafeOversizedChunkSize`.
+        // Continuation (chunk) frames carry the bare recipient `p`-tags (`base_tags`),
+        // so size against those.
+        let chunk_size = resolve_safe_chunk_size(
+            self.config.oversized_transfer.chunk_size,
+            &self.base,
+            &self.server_pubkey,
+            &base_tags,
+            is_encrypted,
+            Kind::Custom(gift_wrap_kind),
+            self.config.oversized_transfer.threshold,
+        )
+        .await?;
+
+        let options = OversizedSenderOptions::new(token)
+            .with_chunk_size(chunk_size)
+            .with_accept_handshake(needs_accept);
+        let frames = build_oversized_frames(content, &options)?;
+
+        // Register the accept-waiter BEFORE publishing `start` so an early `accept`
+        // (decoded on the event-loop task) is never lost.
+        let await_accept = if needs_accept {
+            let (accept_tx, accept_rx) = oneshot::channel();
+            {
+                let mut waiters = match self.accept_waiters.lock() {
+                    Ok(g) => g,
+                    Err(p) => p.into_inner(),
+                };
+                waiters.insert(token.to_string(), accept_tx);
+            }
+            Some(accept_rx)
+        } else {
+            None
+        };
+
+        // Per-frame publish: the start frame carries one-shot discovery tags; the
+        // rest carry bare recipient tags. Mirrors the prepare+publish pair in `send`.
+        let base = &self.base;
+        let server_pubkey = self.server_pubkey;
+        let mut start_tags = Some(start_tags);
+        let publish = move |frame: JsonRpcNotification| {
+            let tags = start_tags.take().unwrap_or_else(|| base_tags.clone());
+            async move {
+                let msg = JsonRpcMessage::Notification(frame);
+                let (event_id, publishable) = base
+                    .prepare_mcp_message(
+                        &msg,
+                        &server_pubkey,
+                        CTXVM_MESSAGES_KIND,
+                        tags,
+                        None,
+                        Some(gift_wrap_kind),
+                    )
+                    .await?;
+                base.relay_pool.publish_event(&publishable).await?;
+                Ok::<EventId, crate::core::error::Error>(event_id)
+            }
+        };
+
+        let accept_timeout =
+            Duration::from_millis(self.config.oversized_transfer.accept_timeout_ms);
+        let result =
+            send_oversized_transfer(frames, needs_accept, await_accept, accept_timeout, publish)
+                .await;
+
+        // Drop the accept-waiter entry regardless of outcome.
+        if needs_accept {
+            let mut waiters = match self.accept_waiters.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            waiters.remove(token);
+        }
+
+        let end_id = match result {
+            Ok(id) => id,
+            Err(error) => {
+                tracing::error!(
+                    target: LOG_TARGET,
+                    error = %error,
+                    server_pubkey = %self.server_pubkey.to_hex(),
+                    method = ?message.method(),
+                    "Failed to send oversized client request"
+                );
+                return Err(error);
+            }
+        };
+
+        // Register the pending request against the END frame's event id.
+        if let JsonRpcMessage::Request(ref req) = message {
+            let is_initialize = req.method == INITIALIZE_METHOD;
+            self.pending_requests
+                .register(end_id.to_hex(), req.id.clone(), is_initialize)
+                .await;
+        }
+
+        // Flip the one-shot discovery flag after a successful transfer.
+        if discovery_sent {
+            self.has_sent_discovery_tags.store(true, Ordering::Relaxed);
+        }
+
+        tracing::debug!(
+            target: LOG_TARGET,
+            end_event_id = %end_id.to_hex(),
+            method = ?message.method(),
+            "Sent oversized client request"
+        );
+        Ok(())
+    }
+
+    /// CEP-22: record the original `_meta.progressToken` value of an
+    /// outbound request under its stringified form, replacing any stale entry
+    /// for the same key. See [`Self::original_progress_tokens`].
+    fn record_original_progress_token(&self, token: &str, original: &serde_json::Value) {
+        let mut originals = match self.original_progress_tokens.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        originals.push(token.to_string(), original.clone());
+    }
+
+    /// CEP-22: drop — and return — the original `progressToken` value
+    /// recorded for `token`, once its transfer concludes (delivered or failed).
+    fn remove_original_progress_token(
+        originals: &Mutex<LruCache<String, serde_json::Value>>,
+        token: Option<&str>,
+    ) -> Option<serde_json::Value> {
+        let token = token?;
+        let mut originals = match originals.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        originals.pop(token)
+    }
+
+    /// CEP-22: look up — without removing — the original `progressToken`
+    /// value recorded for `token`, promoting its LRU recency so an in-flight
+    /// transfer's record outlives idle ones.
+    fn original_progress_token(
+        originals: &Mutex<LruCache<String, serde_json::Value>>,
+        token: &str,
+    ) -> Option<serde_json::Value> {
+        let mut originals = match originals.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        originals.get(token).cloned()
+    }
+
+    /// CEP-22: build the plain `notifications/progress` forwarded to the
+    /// local consumer for an inbound oversized-transfer frame: `progress` is
+    /// copied verbatim (plus `total`/`message` when present), the `cvm` frame
+    /// payload is omitted, and `progressToken` is set to `original_token` —
+    /// the value recorded at send time, NOT the frame's wire token. The
+    /// wire stringifies every token, but rmcp's progress-watcher map is keyed
+    /// by exact JSON type (`Number(5)` ≠ `String("5")`), so only the recorded
+    /// original resets the requester's idle timer. Returns `None` when the
+    /// frame has no `progress` (malformed; nothing worth forwarding).
+    fn stripped_progress_notification(
+        params: &serde_json::Value,
+        original_token: &serde_json::Value,
+    ) -> Option<JsonRpcMessage> {
+        let mut stripped = serde_json::Map::new();
+        stripped.insert("progressToken".to_string(), original_token.clone());
+        stripped.insert("progress".to_string(), params.get("progress")?.clone());
+        for key in ["total", "message"] {
+            if let Some(value) = params.get(key) {
+                stripped.insert(key.to_string(), value.clone());
+            }
+        }
+        Some(JsonRpcMessage::Notification(JsonRpcNotification {
+            jsonrpc: "2.0".to_string(),
+            method: NOTIFICATIONS_PROGRESS_METHOD.to_string(),
+            params: Some(serde_json::Value::Object(stripped)),
+        }))
+    }
+
+    /// CEP-22: forward one stripped progress notification for
+    /// the oversized frame `notif` onto the consumer channel, restoring the
+    /// token recorded at send time. Falls back to the wire token for
+    /// transfers with no record (e.g. a transfer addressed to a token this
+    /// transport never sent); rmcp ignores tokens it never issued, so the
+    /// fallback forward is harmless.
+    fn forward_stripped_progress(
+        notif: &JsonRpcNotification,
+        token: &str,
+        originals: &Mutex<LruCache<String, serde_json::Value>>,
+        tx: &tokio::sync::mpsc::UnboundedSender<JsonRpcMessage>,
+    ) {
+        let Some(params) = notif.params.as_ref() else {
+            return;
+        };
+        let Some(original) = Self::original_progress_token(originals, token)
+            .or_else(|| params.get("progressToken").cloned())
+        else {
+            return;
+        };
+        if let Some(stripped) = Self::stripped_progress_notification(params, &original) {
+            let _ = tx.send(stripped);
+        }
     }
 
     /// Take the message receiver for consuming incoming messages.
@@ -521,6 +968,10 @@ impl NostrClientTransport {
         init_event: Arc<Mutex<Option<Event>>>,
         server_supports_ephemeral: Arc<AtomicBool>,
         seen_gift_wrap_ids: Arc<Mutex<LruCache<EventId, ()>>>,
+        oversized_receiver: Arc<Mutex<OversizedTransferReceiver>>,
+        accept_waiters: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
+        original_progress_tokens: Arc<Mutex<LruCache<String, serde_json::Value>>>,
+        oversized_enabled: bool,
         timeout: Duration,
         cancel: CancellationToken,
     ) {
@@ -563,6 +1014,9 @@ impl NostrClientTransport {
                         &init_event,
                         &server_supports_ephemeral,
                         &seen_gift_wrap_ids,
+                        &oversized_receiver,
+                        &accept_waiters,
+                        &original_progress_tokens,
                         &relay_pool,
                     )
                     .await;
@@ -576,6 +1030,28 @@ impl NostrClientTransport {
                             timeout_ms = timeout.as_millis() as u64,
                             "Swept stale pending requests (rmcp handles timeout errors)"
                         );
+                    }
+                    // CEP-22: reap inbound transfers past their hard deadline.
+                    // Local-only (no abort frame is emitted): the requester's
+                    // own timeout fails the call, and late frames are
+                    // orphan-ignored. `remove_expired` no-ops when
+                    // `transfer_timeout_ms` is 0; the sync guard is dropped
+                    // before anything awaits.
+                    if oversized_enabled {
+                        let reaped = {
+                            let mut receiver = match oversized_receiver.lock() {
+                                Ok(g) => g,
+                                Err(p) => p.into_inner(),
+                            };
+                            receiver.remove_expired()
+                        };
+                        for token in reaped {
+                            tracing::warn!(
+                                target: LOG_TARGET,
+                                token = %token,
+                                "Oversized transfer reaped by watchdog"
+                            );
+                        }
                     }
                 }
             }
@@ -598,6 +1074,13 @@ impl NostrClientTransport {
                     Vec::<String>::new(),
                 ));
             }
+        }
+        // CEP-22: advertise oversized-transfer support when enabled.
+        if self.config.oversized_transfer.enabled {
+            tags.push(Tag::custom(
+                TagKind::Custom(tags::SUPPORT_OVERSIZED_TRANSFER.into()),
+                Vec::<String>::new(),
+            ));
         }
         tags
     }
@@ -638,12 +1121,35 @@ impl NostrClientTransport {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        if stored.is_none() {
-            *stored = Some(event.clone());
+        match stored.as_ref() {
+            // First discovery-tag-carrying event becomes the session baseline.
+            None => *stored = Some(event.clone()),
+            // CEP-35 upgrade (mirrors TS `inbound-coordinator`): if the baseline was
+            // captured from a non-initialize event (e.g. the first discovery tags
+            // arrived on a notification) and this event carries a full
+            // `InitializeResult` (has `protocolVersion`), upgrade the baseline to the
+            // richer initialize response so `get_server_initialize_event` exposes the
+            // full server identity/capabilities. Never downgrades.
+            Some(existing) => {
+                if !Self::event_has_initialize_result(existing)
+                    && Self::event_has_initialize_result(event)
+                {
+                    *stored = Some(event.clone());
+                }
+            }
         }
-        // Note: TS SDK has an upgrade path where a later event with an InitializeResult
-        // replaces a non-initialize baseline. Not implemented here -- edge case only
-        // relevant if the first server message with discovery tags is a notification.
+    }
+
+    /// Returns `true` when the event's `content` parses to a JSON-RPC response
+    /// whose `result` is a full MCP `InitializeResult` (keyed on `protocolVersion`,
+    /// matching the TS `InitializeResultSchema` marker).
+    fn event_has_initialize_result(event: &Event) -> bool {
+        serde_json::from_str::<serde_json::Value>(&event.content)
+            .ok()
+            .as_ref()
+            .and_then(|content| content.get("result"))
+            .and_then(|result| result.get("protocolVersion"))
+            .is_some()
     }
 
     /// Returns a clone of the first inbound event that carried server discovery tags.
@@ -676,6 +1182,9 @@ impl NostrClientTransport {
         init_event: &Arc<Mutex<Option<Event>>>,
         server_supports_ephemeral: &Arc<AtomicBool>,
         seen_gift_wrap_ids: &Arc<Mutex<LruCache<EventId, ()>>>,
+        oversized_receiver: &Arc<Mutex<OversizedTransferReceiver>>,
+        accept_waiters: &Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
+        original_progress_tokens: &Arc<Mutex<LruCache<String, serde_json::Value>>>,
         relay_pool: &Arc<dyn RelayPoolTrait>,
     ) {
         let event = match notification {
@@ -817,6 +1326,138 @@ impl NostrClientTransport {
             &verified_tags,
         ) {
             server_supports_ephemeral.store(true, Ordering::Relaxed);
+        }
+
+        // CEP-22: intercept oversized-transfer frames ABOVE the correlation gate
+        // below. This is mandatory: an `accept` is e-tagged to the start frame
+        // (not in `pending`), and chunk/end response frames must be reassembled
+        // rather than delivered raw. Plain `notifications/progress` (no `cvm`) and
+        // ordinary responses fall through untouched.
+        if let Ok(notif) = serde_json::from_str::<JsonRpcNotification>(&actual_event_content) {
+            if notif.method == NOTIFICATIONS_PROGRESS_METHOD
+                && OversizedTransferReceiver::is_oversized_frame(&notif)
+            {
+                // Token extraction accepts string or number — defensive only:
+                // every known sender stringifies tokens into frames.
+                let token = notif
+                    .params
+                    .as_ref()
+                    .and_then(|p| p.get("progressToken"))
+                    .and_then(progress_token_string);
+
+                // Route `accept` frames to the waiting sender by progressToken
+                // (their e-tag is the start-frame id, which is not in `pending`).
+                let is_accept = notif
+                    .params
+                    .as_ref()
+                    .and_then(|p| p.get("cvm"))
+                    .and_then(OversizedFrame::from_cvm_value)
+                    .is_some_and(|f| matches!(f, OversizedFrame::Accept));
+                if is_accept {
+                    if let Some(ref token) = token {
+                        let waiter = {
+                            let mut waiters = match accept_waiters.lock() {
+                                Ok(g) => g,
+                                Err(p) => p.into_inner(),
+                            };
+                            waiters.remove(token)
+                        };
+                        if let Some(waiter) = waiter {
+                            let _ = waiter.send(());
+                            // The accept is the one inbound frame of a
+                            // client→server upload — forward it (stripped) so
+                            // the requester's idle timer re-arms for the
+                            // response-wait phase. Only for a live waiter: a
+                            // duplicate or stray accept must not poke the timer.
+                            Self::forward_stripped_progress(
+                                &notif,
+                                token,
+                                original_progress_tokens,
+                                tx,
+                            );
+                        }
+                    }
+                    return;
+                }
+
+                // Touch the pending entry so the sweep does not evict the
+                // request mid-transfer (chunks do not otherwise refresh it).
+                if let Some(ref correlated_id) = e_tag {
+                    pending.touch(correlated_id.as_str()).await;
+                }
+
+                // Feed the frame to the reassembler (process_frame is sync; the
+                // guard is dropped before any await or channel send).
+                let (outcome, tracked) = {
+                    let mut receiver = match oversized_receiver.lock() {
+                        Ok(g) => g,
+                        Err(p) => p.into_inner(),
+                    };
+                    let outcome = receiver.process_frame(&notif);
+                    // Zombie guard: forward progress only for transfers still
+                    // tracked after this frame — a late/orphan frame must not
+                    // keep a dead request's idle timer alive.
+                    let tracked = token
+                        .as_deref()
+                        .is_some_and(|token| receiver.is_tracking(token));
+                    (outcome, tracked)
+                };
+                match outcome {
+                    // start/chunk consumed — forward a stripped (cvm-less)
+                    // progress notification carrying the original token so the
+                    // requester's progress-aware idle timeout resets.
+                    Ok(None) => {
+                        if tracked {
+                            if let Some(ref token) = token {
+                                Self::forward_stripped_progress(
+                                    &notif,
+                                    token,
+                                    original_progress_tokens,
+                                    tx,
+                                );
+                            }
+                        }
+                        return;
+                    }
+                    // end frame: deliver the reassembled (already-validated, may
+                    // exceed 1 MB) message and clear the pending entry. No extra
+                    // progress forward — the response itself resolves the request.
+                    Ok(Some(message)) => {
+                        if let Some(ref correlated_id) = e_tag {
+                            pending.remove(correlated_id.as_str()).await;
+                        } else {
+                            // Matches the TS SDK: an oversized response that
+                            // reassembles without a correlation `e` tag is still
+                            // delivered (rmcp matches it by JSON-RPC id), but the
+                            // missing transport-level correlation is worth a warn.
+                            tracing::warn!(
+                                target: LOG_TARGET,
+                                "Oversized transfer completed without a correlation `e` tag; \
+                                 delivering the reassembled response uncorrelated"
+                            );
+                        }
+                        Self::remove_original_progress_token(
+                            original_progress_tokens,
+                            token.as_deref(),
+                        );
+                        let _ = tx.send(message);
+                        return;
+                    }
+                    // Failure: clean up locally, let the request time out.
+                    Err(error) => {
+                        tracing::warn!(
+                            target: LOG_TARGET,
+                            error = %error,
+                            "Inbound oversized transfer failed"
+                        );
+                        Self::remove_original_progress_token(
+                            original_progress_tokens,
+                            token.as_deref(),
+                        );
+                        return;
+                    }
+                }
+            }
         }
 
         // Correlate response
@@ -1177,6 +1818,11 @@ mod tests {
             server_initialize_event: Arc::new(Mutex::new(None)),
             server_supports_ephemeral: Arc::new(AtomicBool::new(false)),
             seen_gift_wrap_ids: Arc::new(Mutex::new(LruCache::new(NonZeroUsize::new(10).unwrap()))),
+            oversized_receiver: Arc::new(Mutex::new(OversizedTransferReceiver::new())),
+            accept_waiters: Arc::new(Mutex::new(HashMap::new())),
+            original_progress_tokens: Arc::new(Mutex::new(LruCache::new(
+                NonZeroUsize::new(10).unwrap(),
+            ))),
             message_tx: Some(tokio::sync::mpsc::unbounded_channel().0),
             message_rx: None,
             cancellation_token: CancellationToken::new(),
@@ -1199,9 +1845,14 @@ mod tests {
         let t = make_transport_for_tags(EncryptionMode::Optional, GiftWrapMode::Optional);
         let tags = t.get_client_capability_tags();
         let names = tag_names(&tags);
+        // The oversized tag (default-on) is pushed last.
         assert_eq!(
             names,
-            vec!["support_encryption", "support_encryption_ephemeral"]
+            vec![
+                "support_encryption",
+                "support_encryption_ephemeral",
+                "support_oversized_transfer"
+            ]
         );
     }
 
@@ -1209,7 +1860,8 @@ mod tests {
     fn client_capability_tags_encryption_disabled() {
         let t = make_transport_for_tags(EncryptionMode::Disabled, GiftWrapMode::Optional);
         let tags = t.get_client_capability_tags();
-        assert!(tags.is_empty());
+        // No encryption tags; the default-on oversized tag remains.
+        assert_eq!(tag_names(&tags), vec!["support_oversized_transfer"]);
     }
 
     #[test]
@@ -1217,7 +1869,218 @@ mod tests {
         let t = make_transport_for_tags(EncryptionMode::Optional, GiftWrapMode::Persistent);
         let tags = t.get_client_capability_tags();
         let names = tag_names(&tags);
-        assert_eq!(names, vec!["support_encryption"]);
+        assert_eq!(
+            names,
+            vec!["support_encryption", "support_oversized_transfer"]
+        );
+    }
+
+    #[test]
+    fn client_capability_tags_oversized_enabled_by_default() {
+        let t = make_transport_for_tags(EncryptionMode::Optional, GiftWrapMode::Optional);
+        assert!(t.config.oversized_transfer.enabled);
+        let names = tag_names(&t.get_client_capability_tags());
+        assert!(
+            names.contains(&"support_oversized_transfer".to_string()),
+            "oversized tag must be advertised by default"
+        );
+    }
+
+    #[test]
+    fn client_capability_tags_oversized_opt_out() {
+        // The opt-out gate still works: disabling suppresses the tag.
+        let mut t = make_transport_for_tags(EncryptionMode::Optional, GiftWrapMode::Optional);
+        t.config.oversized_transfer = OversizedTransferConfig::default().with_enabled(false);
+        let names = tag_names(&t.get_client_capability_tags());
+        assert!(
+            !names.contains(&"support_oversized_transfer".to_string()),
+            "oversized tag must not be advertised when disabled"
+        );
+    }
+
+    #[test]
+    fn client_capability_tags_oversized_enabled() {
+        let mut t = make_transport_for_tags(EncryptionMode::Optional, GiftWrapMode::Optional);
+        t.config.oversized_transfer.enabled = true;
+        let names = tag_names(&t.get_client_capability_tags());
+        assert!(
+            names.contains(&"support_oversized_transfer".to_string()),
+            "oversized tag must be advertised when enabled"
+        );
+    }
+
+    #[test]
+    fn client_capability_tags_oversized_enabled_without_encryption() {
+        // Tag is emitted independently of the encryption capability tags.
+        let mut t = make_transport_for_tags(EncryptionMode::Disabled, GiftWrapMode::Optional);
+        t.config.oversized_transfer.enabled = true;
+        let names = tag_names(&t.get_client_capability_tags());
+        assert_eq!(names, vec!["support_oversized_transfer"]);
+    }
+
+    #[test]
+    fn client_config_oversized_builders() {
+        let cfg = NostrClientTransportConfig::default().with_oversized_enabled(true);
+        assert!(cfg.oversized_transfer.enabled);
+        let cfg = NostrClientTransportConfig::default()
+            .with_oversized_transfer(OversizedTransferConfig::enabled().with_chunk_size(1024));
+        assert!(cfg.oversized_transfer.enabled);
+        assert_eq!(cfg.oversized_transfer.chunk_size, 1024);
+    }
+
+    // ── CEP-22 original progressToken record/restore ─────────────
+
+    #[test]
+    fn original_progress_token_roundtrip_preserves_numeric_type() {
+        let t = make_transport_for_tags(EncryptionMode::Optional, GiftWrapMode::Optional);
+        // rmcp stamps numeric tokens; the record keys them by stringified form.
+        t.record_original_progress_token("7", &serde_json::json!(7));
+        let restored = NostrClientTransport::remove_original_progress_token(
+            &t.original_progress_tokens,
+            Some("7"),
+        );
+        assert_eq!(restored, Some(serde_json::json!(7)));
+        // Dropped on first take — the transfer concluded.
+        assert_eq!(
+            NostrClientTransport::remove_original_progress_token(
+                &t.original_progress_tokens,
+                Some("7"),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn original_progress_token_string_never_parsed_to_number() {
+        // A legitimate String("5") token must restore as a string — restoring
+        // by parsing numeric-looking wire strings would corrupt it.
+        let t = make_transport_for_tags(EncryptionMode::Optional, GiftWrapMode::Optional);
+        t.record_original_progress_token("5", &serde_json::json!("5"));
+        assert_eq!(
+            NostrClientTransport::remove_original_progress_token(
+                &t.original_progress_tokens,
+                Some("5"),
+            ),
+            Some(serde_json::json!("5"))
+        );
+    }
+
+    #[test]
+    fn remove_original_progress_token_handles_missing() {
+        let t = make_transport_for_tags(EncryptionMode::Optional, GiftWrapMode::Optional);
+        assert_eq!(
+            NostrClientTransport::remove_original_progress_token(&t.original_progress_tokens, None,),
+            None
+        );
+        assert_eq!(
+            NostrClientTransport::remove_original_progress_token(
+                &t.original_progress_tokens,
+                Some("unknown"),
+            ),
+            None
+        );
+    }
+
+    /// `send()` must record the original token value for every
+    /// oversized-eligible request — including sub-threshold ones, whose
+    /// *responses* may still come back fragmented.
+    #[tokio::test]
+    async fn send_records_numeric_progress_token_original() {
+        let mut t = make_transport_for_tags(EncryptionMode::Disabled, GiftWrapMode::Optional);
+        t.config.oversized_transfer.enabled = true;
+        let request = JsonRpcMessage::Request(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: serde_json::json!(1),
+            method: "tools/call".to_string(),
+            params: Some(serde_json::json!({ "_meta": { "progressToken": 7 } })),
+        });
+        t.send(&request).await.expect("send small request");
+
+        let recorded = NostrClientTransport::remove_original_progress_token(
+            &t.original_progress_tokens,
+            Some("7"),
+        );
+        assert_eq!(
+            recorded,
+            Some(serde_json::json!(7)),
+            "numeric token must be recorded under its stringified form"
+        );
+    }
+
+    /// With oversized transfer disabled (explicit opt-out) nothing is recorded.
+    #[tokio::test]
+    async fn send_records_nothing_when_oversized_disabled() {
+        let mut t = make_transport_for_tags(EncryptionMode::Disabled, GiftWrapMode::Optional);
+        t.config.oversized_transfer = OversizedTransferConfig::default().with_enabled(false);
+        let request = JsonRpcMessage::Request(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: serde_json::json!(1),
+            method: "tools/call".to_string(),
+            params: Some(serde_json::json!({ "_meta": { "progressToken": 7 } })),
+        });
+        t.send(&request).await.expect("send small request");
+
+        assert_eq!(
+            NostrClientTransport::remove_original_progress_token(
+                &t.original_progress_tokens,
+                Some("7"),
+            ),
+            None
+        );
+    }
+
+    // ── CEP-22 stripped progress construction ────────────────────
+
+    #[test]
+    fn stripped_progress_notification_strips_cvm_and_restores_token() {
+        let params = serde_json::json!({
+            "progressToken": "7",
+            "progress": 3,
+            "total": 5,
+            "message": "transferring",
+            "cvm": { "type": "oversized-transfer", "frameType": "chunk", "data": "x" },
+        });
+        let stripped =
+            NostrClientTransport::stripped_progress_notification(&params, &serde_json::json!(7))
+                .expect("frame carries progress");
+        let JsonRpcMessage::Notification(n) = stripped else {
+            panic!("expected a notification");
+        };
+        assert_eq!(n.method, NOTIFICATIONS_PROGRESS_METHOD);
+        let p = n.params.expect("params");
+        assert_eq!(
+            p["progressToken"],
+            serde_json::json!(7),
+            "token must be the restored original, not the wire string"
+        );
+        assert_eq!(p["progress"], serde_json::json!(3));
+        assert_eq!(p["total"], serde_json::json!(5));
+        assert_eq!(p["message"], serde_json::json!("transferring"));
+        assert!(p.get("cvm").is_none(), "cvm payload must be stripped");
+    }
+
+    #[test]
+    fn stripped_progress_notification_requires_progress_and_omits_absent_fields() {
+        // No `progress` → nothing worth forwarding.
+        let malformed = serde_json::json!({ "progressToken": "7", "cvm": {} });
+        assert!(NostrClientTransport::stripped_progress_notification(
+            &malformed,
+            &serde_json::json!(7)
+        )
+        .is_none());
+
+        // Absent total/message are omitted, not nulled.
+        let minimal = serde_json::json!({ "progressToken": "7", "progress": 1 });
+        let stripped =
+            NostrClientTransport::stripped_progress_notification(&minimal, &serde_json::json!("7"))
+                .expect("progress present");
+        let JsonRpcMessage::Notification(n) = stripped else {
+            panic!("expected a notification");
+        };
+        let p = n.params.expect("params");
+        let keys = p.as_object().expect("object params");
+        assert_eq!(keys.len(), 2, "only progressToken + progress: {p}");
+        assert_eq!(p["progressToken"], serde_json::json!("7"));
     }
 
     #[test]
@@ -1234,11 +2097,29 @@ mod tests {
     // ── CEP-35 client capability learning ───────────────────────
 
     fn make_event_with_tags(tag_parts: &[&[&str]]) -> Event {
+        make_event_with_content_and_tags("{}", tag_parts)
+    }
+
+    fn make_event_with_content_and_tags(content: &str, tag_parts: &[&[&str]]) -> Event {
         let keys = Keys::generate();
         let tags: Vec<Tag> = tag_parts.iter().map(|p| make_tag(p)).collect();
-        let builder = EventBuilder::new(Kind::Custom(CTXVM_MESSAGES_KIND), "{}").tags(tags);
+        let builder = EventBuilder::new(Kind::Custom(CTXVM_MESSAGES_KIND), content).tags(tags);
         let unsigned = builder.build(keys.public_key());
         unsigned.sign_with_keys(&keys).unwrap()
+    }
+
+    /// A JSON-RPC response carrying a full `InitializeResult` (has `protocolVersion`).
+    fn initialize_result_content() -> String {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "serverInfo": { "name": "UpgradedServer", "version": "1.0.0" }
+            }
+        })
+        .to_string()
     }
 
     #[test]
@@ -1293,6 +2174,38 @@ mod tests {
             stored.as_ref().unwrap().id,
             first_id,
             "baseline must not be replaced"
+        );
+    }
+
+    #[test]
+    fn client_baseline_upgraded_to_initialize_result() {
+        let caps = Mutex::new(PeerCapabilities::default());
+        let init = Mutex::new(None);
+
+        // First discovery tags arrive on a non-initialize event (e.g. a notification).
+        let baseline = make_event_with_tags(&[&["support_encryption"]]);
+        NostrClientTransport::learn_server_discovery(&caps, &init, &baseline);
+        assert_eq!(init.lock().unwrap().as_ref().unwrap().id, baseline.id);
+
+        // A later event carries a full InitializeResult → baseline is upgraded.
+        let init_event = make_event_with_content_and_tags(
+            &initialize_result_content(),
+            &[&["support_encryption"]],
+        );
+        NostrClientTransport::learn_server_discovery(&caps, &init, &init_event);
+        assert_eq!(
+            init.lock().unwrap().as_ref().unwrap().id,
+            init_event.id,
+            "baseline must upgrade to the initialize-result event"
+        );
+
+        // A still-later non-initialize event must NOT downgrade the baseline.
+        let later = make_event_with_tags(&[&["support_encryption_ephemeral"]]);
+        NostrClientTransport::learn_server_discovery(&caps, &init, &later);
+        assert_eq!(
+            init.lock().unwrap().as_ref().unwrap().id,
+            init_event.id,
+            "baseline must not downgrade away from the initialize result"
         );
     }
 }

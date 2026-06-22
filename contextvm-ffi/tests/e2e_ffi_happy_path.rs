@@ -1,7 +1,9 @@
-//! End-to-end tests for ContextVM FFI bindings using mock relay.
+//! Lifecycle and API-surface tests for the ContextVM FFI bindings.
 //!
-//! These tests exercise the full FFI API surface with actual message flow
-//! through the mock relay - no external network required.
+//! These cover the non-network parts of the FFI contract: keys generation,
+//! config struct layout, message struct conversion, constant values, and
+//! memory-management edge cases (null-safe frees, multiple handles). Real
+//! message flow is exercised in `e2e_ffi_nak_relay.rs`.
 
 use contextvm_ffi::error::{ErrorCode, FfiError};
 use contextvm_ffi::handle::FfiHandle;
