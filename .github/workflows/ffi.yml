@@ -1,0 +1,183 @@
+name: FFI
+
+# Cross-platform build, C-test, and release packaging for the ContextVM FFI
+# bindings (C header + UniFFI Python/Swift/Kotlin surfaces).
+#
+# On push/PR to main: builds every target, runs the C test suite, and
+# generates UniFFI bindings as a verification step.
+# On version tags (v*): additionally assembles per-platform release archives
+# and uploads them to the GitHub Release.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            libs: 'libcontextvm_ffi.so libcontextvm_ffi.a'
+            archive: tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            libs: 'libcontextvm_ffi.dylib libcontextvm_ffi.a'
+            archive: tar.gz
+          - os: macos-13
+            target: x86_64-apple-darwin
+            libs: 'libcontextvm_ffi.dylib libcontextvm_ffi.a'
+            archive: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            libs: 'contextvm_ffi.dll contextvm_ffi.dll.lib contextvm_ffi.lib'
+            archive: zip
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ffi-${{ matrix.target }}
+      - name: Build FFI (release)
+        run: cargo build --release -p contextvm-ffi --target ${{ matrix.target }}
+      - name: Stage artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          STAGE="stage/contextvm-ffi"
+          mkdir -p "$STAGE/lib" "$STAGE/include"
+          for f in ${{ matrix.libs }}; do
+            cp "target/${{ matrix.target }}/release/$f" "$STAGE/lib/"
+          done
+          cp contextvm-ffi/headers/contextvm.h "$STAGE/include/"
+          cp contextvm-ffi/README.md "$STAGE/"
+      - name: Archive (tar.gz)
+        if: matrix.archive == 'tar.gz'
+        run: tar -czf contextvm-ffi-${{ matrix.target }}.tar.gz -C stage contextvm-ffi
+      - name: Archive (zip)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: Compress-Archive -Path stage/contextvm-ffi -DestinationPath contextvm-ffi-${{ matrix.target }}.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: contextvm-ffi-${{ matrix.target }}
+          path: contextvm-ffi-${{ matrix.target }}.*
+          retention-days: 14
+
+  build-macos-universal:
+    name: build macOS universal
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ffi-macos-universal
+      - name: Build arm64
+        run: cargo build --release -p contextvm-ffi --target aarch64-apple-darwin
+      - name: Build x86_64
+        run: cargo build --release -p contextvm-ffi --target x86_64-apple-darwin
+      - name: Create universal libraries
+        shell: bash
+        run: |
+          set -euo pipefail
+          STAGE="stage/contextvm-ffi"
+          mkdir -p "$STAGE/lib" "$STAGE/include"
+          lipo -create \
+            target/aarch64-apple-darwin/release/libcontextvm_ffi.dylib \
+            target/x86_64-apple-darwin/release/libcontextvm_ffi.dylib \
+            -output "$STAGE/lib/libcontextvm_ffi.dylib"
+          lipo -create \
+            target/aarch64-apple-darwin/release/libcontextvm_ffi.a \
+            target/x86_64-apple-darwin/release/libcontextvm_ffi.a \
+            -output "$STAGE/lib/libcontextvm_ffi.a"
+          cp contextvm-ffi/headers/contextvm.h "$STAGE/include/"
+          cp contextvm-ffi/README.md "$STAGE/"
+          tar -czf contextvm-ffi-universal-apple-darwin.tar.gz -C stage contextvm-ffi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: contextvm-ffi-universal-apple-darwin
+          path: contextvm-ffi-universal-apple-darwin.tar.gz
+          retention-days: 14
+
+  c-tests:
+    name: C tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ffi-c-tests
+      # The C test suite is the only check that the hand-written contextvm.h
+      # header matches the Rust extern "C" signatures. It links against the
+      # built FFI library and exercises keys, errors, memory frees, and config
+      # structs directly from C. Linux-only because the c-tests/Makefile links
+      # with -ldl/-lm; signature consistency is platform-independent, and the
+      # macOS build jobs already confirm the dylib links on Darwin.
+      - name: Build and run C tests
+        run: make -C contextvm-ffi/c-tests test
+
+  bindings:
+    name: UniFFI bindings (python/swift/kotlin)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ffi-bindings
+      - name: Build FFI library (for embedded metadata)
+        run: cargo build -p contextvm-ffi
+      - name: Install uniffi-bindgen-cli
+        run: cargo install uniffi-bindgen-cli --version 0.29 --locked
+      - name: Generate bindings
+        run: |
+          set -euo pipefail
+          LIB=target/debug/libcontextvm_ffi.so
+          for lang in python swift kotlin; do
+            uniffi-bindgen generate "$LIB" --library \
+              --language "$lang" --out-dir "bindings/$lang"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: contextvm-ffi-bindings
+          path: bindings/
+          retention-days: 14
+
+  release:
+    name: release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build, build-macos-universal, c-tests, bindings]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Package bindings
+        run: tar -czf contextvm-ffi-bindings.tar.gz -C artifacts/contextvm-ffi-bindings .
+      - name: Publish to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            artifacts/contextvm-ffi-*/*.tar.gz
+            artifacts/contextvm-ffi-*/*.zip
+            contextvm-ffi-bindings.tar.gz
