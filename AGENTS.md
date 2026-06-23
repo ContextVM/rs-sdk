@@ -263,6 +263,15 @@ artifacts automatically; `ci.yml` + `ffi.yml` must both be green.
   hosts; embeds in short-lived CLIs pay a few MB of resident threads.
 - **MSRV job regenerates `Cargo.lock`** — don't commit dependency bumps that
   require a newer compiler without bumping `rust-version`.
+- **`rmcp` is sourced from crates.io (`1.8`)**, not the old
+  `ContextVM-org/rust-sdk` fork. The fork carried a `progress-aware-request-timeouts`
+  branch (with the `transport-worker` feature this crate needs); that work shipped
+  upstream in the official `modelcontextprotocol/rust-sdk`, so the git fork pin was
+  retired. When upgrading `rmcp`, note the 1.x macro pattern: `#[tool_router]` +
+  `#[tool_handler]` generate the tool dispatch wiring — **do not** store a
+  `tool_router: ToolRouter<Self>` field on the handler struct (it's dead in 1.x and
+  trips `dead_code`). The fork's old 0.x-style stored-field pattern was removed
+  during the migration; keep it removed.
 - **The `sdk/` path** (if present) is a sibling reference used during some
   cross-repo work and is not part of this crate's build graph; ignore it unless
   explicitly working on it.
