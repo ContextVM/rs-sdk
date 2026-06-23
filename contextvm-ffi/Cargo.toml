@@ -1,0 +1,31 @@
+[package]
+name = "contextvm-ffi"
+version = "0.1.0"
+edition = "2021"
+description = "FFI bindings for the ContextVM SDK — C header + Python/Swift/Kotlin support"
+license = "MIT"
+
+[lib]
+name = "contextvm_ffi"
+crate-type = ["cdylib", "staticlib", "lib"]
+
+[dependencies]
+contextvm-sdk = { path = ".." }
+nostr-sdk = { version = "0.43", features = ["nip59"] }
+tokio = { version = "1", features = ["full"] }
+serde_json = "1"
+uniffi = "0.29"
+parking_lot = "0.12"
+
+[features]
+default = []
+# End-to-end tests that spawn the `nak` CLI relay (https://github.com/nbd-wtf/nostr-cli).
+# Off by default so `cargo test` and CI's `cargo test --all --all-features` don't
+# require `nak` to be installed. When enabled but `nak` is absent from PATH, the
+# tests no-op with a stderr note instead of failing.
+nak-tests = []
+
+# `nak` is an external process; only build this test target when explicitly opted in.
+[[test]]
+name = "e2e_ffi_nak_relay"
+required-features = ["nak-tests"]
