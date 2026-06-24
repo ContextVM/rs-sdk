@@ -20,6 +20,8 @@ pub struct PeerCapabilities {
     pub supports_ephemeral_encryption: bool,
     /// Peer supports CEP-22 oversized payload transfer.
     pub supports_oversized_transfer: bool,
+    /// Peer supports CEP-41 open-ended streaming.
+    pub supports_open_stream: bool,
 }
 
 /// Returns `true` when the tag list contains a single-valued tag whose name matches `name`.
@@ -57,6 +59,7 @@ pub fn learn_peer_capabilities(tags: &[Tag]) -> PeerCapabilities {
         supports_encryption: has_single_tag(tags, tags::SUPPORT_ENCRYPTION),
         supports_ephemeral_encryption: has_single_tag(tags, tags::SUPPORT_ENCRYPTION_EPHEMERAL),
         supports_oversized_transfer: has_single_tag(tags, tags::SUPPORT_OVERSIZED_TRANSFER),
+        supports_open_stream: has_single_tag(tags, tags::SUPPORT_OPEN_STREAM),
     }
 }
 
@@ -176,11 +179,13 @@ mod tests {
             make_tag(&["support_encryption"]),
             make_tag(&["support_encryption_ephemeral"]),
             make_tag(&["support_oversized_transfer"]),
+            make_tag(&["support_open_stream"]),
         ];
         let caps = learn_peer_capabilities(&tags);
         assert!(caps.supports_encryption);
         assert!(caps.supports_ephemeral_encryption);
         assert!(caps.supports_oversized_transfer);
+        assert!(caps.supports_open_stream);
     }
 
     #[test]
@@ -199,6 +204,20 @@ mod tests {
         assert!(caps.supports_encryption);
         assert!(!caps.supports_ephemeral_encryption);
         assert!(!caps.supports_oversized_transfer);
+        assert!(!caps.supports_open_stream);
+    }
+
+    #[test]
+    fn learn_peer_capabilities_open_stream_only() {
+        // A single-element `support_open_stream` tag flips only the open-stream
+        // flag; multi-element variants of the same tag are ignored.
+        let tags = vec![make_tag(&["support_open_stream"])];
+        let caps = learn_peer_capabilities(&tags);
+        assert!(caps.supports_open_stream);
+        assert!(!caps.supports_encryption);
+
+        let multi = vec![make_tag(&["support_open_stream", "extra"])];
+        assert!(!learn_peer_capabilities(&multi).supports_open_stream);
     }
 
     #[test]
@@ -258,6 +277,7 @@ mod tests {
         assert!(!caps.supports_encryption);
         assert!(!caps.supports_ephemeral_encryption);
         assert!(!caps.supports_oversized_transfer);
+        assert!(!caps.supports_open_stream);
     }
 
     #[test]
@@ -266,6 +286,7 @@ mod tests {
             supports_encryption: true,
             supports_ephemeral_encryption: true,
             supports_oversized_transfer: false,
+            supports_open_stream: true,
         };
         let copy = caps;
         assert_eq!(caps, copy);

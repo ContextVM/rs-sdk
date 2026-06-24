@@ -112,6 +112,7 @@ impl SessionStore {
             supports_encryption: s.supports_encryption,
             supports_ephemeral_encryption: s.supports_ephemeral_encryption,
             supports_oversized_transfer: s.supports_oversized_transfer,
+            supports_open_stream: s.supports_open_stream,
         })
     }
 
@@ -168,6 +169,7 @@ impl SessionStore {
                         supports_encryption: s.supports_encryption,
                         supports_ephemeral_encryption: s.supports_ephemeral_encryption,
                         supports_oversized_transfer: s.supports_oversized_transfer,
+                        supports_open_stream: s.supports_open_stream,
                     },
                 )
             })
@@ -247,6 +249,8 @@ pub struct SessionSnapshot {
     pub supports_ephemeral_encryption: bool,
     /// Whether the peer advertised CEP-22 oversized-transfer support (learned, gated by server config)
     pub supports_oversized_transfer: bool,
+    /// Whether the peer advertised CEP-41 open-stream support (learned, gated by server config)
+    pub supports_open_stream: bool,
 }
 
 #[cfg(test)]
@@ -374,6 +378,7 @@ mod tests {
         assert!(!snap.supports_encryption);
         assert!(!snap.supports_ephemeral_encryption);
         assert!(!snap.supports_oversized_transfer);
+        assert!(!snap.supports_open_stream);
 
         // Learned capabilities must round-trip through the snapshot.
         {
@@ -382,12 +387,14 @@ mod tests {
             session.supports_encryption = true;
             session.supports_ephemeral_encryption = true;
             session.supports_oversized_transfer = true;
+            session.supports_open_stream = true;
         }
 
         let snap = store.get_session("client-1").await.unwrap();
         assert!(snap.supports_encryption);
         assert!(snap.supports_ephemeral_encryption);
         assert!(snap.supports_oversized_transfer);
+        assert!(snap.supports_open_stream);
 
         // get_all_sessions exposes the same fields.
         let all = store.get_all_sessions().await;
@@ -395,6 +402,7 @@ mod tests {
         assert!(snap_all.supports_encryption);
         assert!(snap_all.supports_ephemeral_encryption);
         assert!(snap_all.supports_oversized_transfer);
+        assert!(snap_all.supports_open_stream);
     }
 
     #[tokio::test]

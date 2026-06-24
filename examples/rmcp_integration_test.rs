@@ -85,19 +85,15 @@ struct AddParams {
     b: i64,
 }
 
-use rmcp::handler::server::router::tool::ToolRouter;
-
 #[derive(Clone)]
 struct DemoServer {
     echo_count: Arc<Mutex<u32>>,
-    tool_router: ToolRouter<DemoServer>,
 }
 
 impl DemoServer {
     fn new() -> Self {
         Self {
             echo_count: Arc::new(Mutex::new(0)),
-            tool_router: Self::tool_router(),
         }
     }
 }

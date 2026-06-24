@@ -30,6 +30,7 @@ use crate::encryption;
 use crate::relay::{RelayPool, RelayPoolTrait};
 use crate::transport::base::BaseTransport;
 use crate::transport::discovery_tags::{parse_discovered_peer_capabilities, PeerCapabilities};
+use crate::transport::open_stream::OpenStreamConfig;
 use crate::transport::oversized_transfer::{
     build_oversized_frames, progress_token_string, resolve_safe_chunk_size,
     send_oversized_transfer, OversizedFrame, OversizedSenderOptions, OversizedTransferConfig,
@@ -68,6 +69,11 @@ pub struct NostrClientTransportConfig {
     pub fallback_operational_relay_urls: Option<Vec<String>>,
     /// CEP-22 oversized payload transfer configuration. Enabled by default.
     pub oversized_transfer: OversizedTransferConfig,
+    /// CEP-41 open-stream configuration. Disabled by default (opt-in).
+    ///
+    /// **Data only in PR1** — the event loop does not consult it yet; activation
+    /// (capability advertisement, learning, `call_tool_stream`) lands in PR2.
+    pub open_stream: OpenStreamConfig,
 }
 
 impl Default for NostrClientTransportConfig {
@@ -82,6 +88,7 @@ impl Default for NostrClientTransportConfig {
             discovery_relay_urls: None,
             fallback_operational_relay_urls: None,
             oversized_transfer: OversizedTransferConfig::default(),
+            open_stream: OpenStreamConfig::default(),
         }
     }
 }
@@ -135,6 +142,13 @@ impl NostrClientTransportConfig {
     /// Enable or disable CEP-22 oversized payload transfer, leaving other knobs at default.
     pub fn with_oversized_enabled(mut self, enabled: bool) -> Self {
         self.oversized_transfer.enabled = enabled;
+        self
+    }
+    /// Set the full CEP-41 open-stream configuration.
+    ///
+    /// Data only in PR1: the event loop does not read this until PR2.
+    pub fn with_open_stream(mut self, config: OpenStreamConfig) -> Self {
+        self.open_stream = config;
         self
     }
 }

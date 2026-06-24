@@ -29,6 +29,7 @@ use crate::encryption;
 use crate::relay::{RelayPool, RelayPoolTrait};
 use crate::transport::base::BaseTransport;
 use crate::transport::discovery_tags::learn_peer_capabilities;
+use crate::transport::open_stream::OpenStreamConfig;
 use crate::transport::oversized_transfer::{
     build_oversized_frames, progress_token_string, resolve_safe_chunk_size, OversizedFrame,
     OversizedSenderOptions, OversizedTransferConfig, OversizedTransferReceiver, TransferPolicy,
@@ -106,6 +107,12 @@ pub struct NostrServerTransportConfig {
     pub profile_metadata: Option<ProfileMetadata>,
     /// CEP-22 oversized payload transfer configuration. Enabled by default.
     pub oversized_transfer: OversizedTransferConfig,
+    /// CEP-41 open-stream configuration. Disabled by default (opt-in).
+    ///
+    /// **Data only in PR1** — the event loop does not consult it yet; activation
+    /// (capability advertisement, learning, response deferral, the keepalive
+    /// sweep) lands in PR2.
+    pub open_stream: OpenStreamConfig,
 }
 
 impl Default for NostrServerTransportConfig {
@@ -127,6 +134,7 @@ impl Default for NostrServerTransportConfig {
             publish_relay_list: true,
             profile_metadata: None,
             oversized_transfer: OversizedTransferConfig::default(),
+            open_stream: OpenStreamConfig::default(),
         }
     }
 }
@@ -247,6 +255,13 @@ impl NostrServerTransportConfig {
     /// Enable or disable CEP-22 oversized payload transfer, leaving other knobs at default.
     pub fn with_oversized_enabled(mut self, enabled: bool) -> Self {
         self.oversized_transfer.enabled = enabled;
+        self
+    }
+    /// Set the full CEP-41 open-stream configuration.
+    ///
+    /// Data only in PR1: the event loop does not read this until PR2.
+    pub fn with_open_stream(mut self, config: OpenStreamConfig) -> Self {
+        self.open_stream = config;
         self
     }
 }
@@ -985,7 +1000,15 @@ impl NostrServerTransport {
                 .spawn_publish_public_announcements(self.cancellation_token.child_token());
             self.task_handles.push(handle);
         }
-        // Unconditional: publish profile metadata and relay list (guards inside methods)
+        self.spawn_discoverability_publication();
+    }
+
+    /// Spawn profile metadata and relay-list publication for direct transport users.
+    ///
+    /// This publishes kind 0 and kind 10002 discoverability events when configured.
+    /// It intentionally does not spawn CEP-6 capability announcement tasks because
+    /// those inject synthetic MCP requests that require an rmcp worker.
+    pub fn spawn_discoverability_publication(&mut self) {
         let handle = self.announcement_manager.spawn_publish_discoverability();
         self.task_handles.push(handle);
     }
@@ -1822,6 +1845,7 @@ impl NostrServerTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::relay::mock::MockRelayPool;
     use std::thread;
 
     // ── Session management ──────────────────────────────────────
@@ -2059,6 +2083,42 @@ mod tests {
         assert!(config.bootstrap_relay_urls.is_none());
         assert!(config.publish_relay_list);
         assert!(config.profile_metadata.is_none());
+    }
+
+    #[tokio::test]
+    async fn spawn_discoverability_publication_publishes_kind_0_and_10002_only() {
+        let pool = Arc::new(MockRelayPool::new());
+        let relay_pool: Arc<dyn RelayPoolTrait> = pool.clone();
+        let config = NostrServerTransportConfig::default()
+            .with_relay_urls(vec!["wss://relay.example.com".to_string()])
+            .with_profile_metadata(ProfileMetadata::default().with_name("ffi-server"))
+            .with_publish_relay_list(true);
+        let mut transport = NostrServerTransport::with_relay_pool(config, relay_pool)
+            .await
+            .expect("transport should build");
+
+        transport.spawn_discoverability_publication();
+        for handle in transport.task_handles.drain(..) {
+            handle.await.expect("discoverability task should not panic");
+        }
+
+        let events = pool.stored_events().await;
+        assert!(
+            events.iter().any(|e| e.kind == Kind::Custom(0)),
+            "profile metadata should be published"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| e.kind == Kind::Custom(RELAY_LIST_METADATA_KIND)),
+            "relay list should be published"
+        );
+        assert!(
+            events
+                .iter()
+                .all(|e| e.kind != Kind::Custom(SERVER_ANNOUNCEMENT_KIND)),
+            "direct discoverability publication must not emit CEP-6 announcements"
+        );
     }
 
     // ── CEP-19 helper logic ──────────────────────────────────────

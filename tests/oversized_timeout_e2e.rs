@@ -25,7 +25,6 @@ use contextvm_sdk::{
     PeerRequestOptionsExt, RelayPoolTrait,
 };
 use nostr_sdk::prelude::*;
-use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, Content, ErrorData, Implementation, RawContent,
@@ -286,15 +285,11 @@ struct BigParams {
 /// rmcp server with one tool: `big(len)` returns a `len`-byte text, driving
 /// the response over the oversized threshold on demand.
 #[derive(Clone)]
-struct BigServer {
-    tool_router: ToolRouter<BigServer>,
-}
+struct BigServer {}
 
 impl BigServer {
     fn new() -> Self {
-        Self {
-            tool_router: Self::tool_router(),
-        }
+        Self {}
     }
 }
 

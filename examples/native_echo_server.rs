@@ -7,9 +7,8 @@ use anyhow::Result;
 use contextvm_sdk::transport::server::{NostrServerTransport, NostrServerTransportConfig};
 use contextvm_sdk::{signer, EncryptionMode, GiftWrapMode, ServerInfo};
 use rmcp::{
-    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::*,
-    schemars, tool, tool_handler, tool_router, ServerHandler, ServiceExt,
+    handler::server::wrapper::Parameters, model::*, schemars, tool, tool_handler, tool_router,
+    ServerHandler, ServiceExt,
 };
 
 const RELAY_URL: &str = "wss://relay.contextvm.org";
@@ -20,15 +19,11 @@ struct EchoParams {
 }
 
 #[derive(Clone)]
-struct EchoServer {
-    tool_router: ToolRouter<Self>,
-}
+struct EchoServer {}
 
 impl EchoServer {
     fn new() -> Self {
-        Self {
-            tool_router: Self::tool_router(),
-        }
+        Self {}
     }
 }
 

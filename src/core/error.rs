@@ -38,6 +38,10 @@ pub enum Error {
     #[error("Oversized transfer error: {0}")]
     OversizedTransfer(#[from] crate::transport::oversized_transfer::OversizedTransferError),
 
+    /// CEP-41 open-stream error (sequencing/policy/abort)
+    #[error("Open stream error: {0}")]
+    OpenStream(#[from] crate::transport::open_stream::OpenStreamError),
+
     /// Generic error
     #[error("{0}")]
     Other(String),

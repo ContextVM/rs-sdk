@@ -55,6 +55,7 @@ impl NostrMCPGateway {
         }
 
         self.transport.start().await?;
+        self.transport.spawn_discoverability_publication();
         self.is_running = true;
 
         self.transport
@@ -144,6 +145,7 @@ mod tests {
             publish_relay_list: true,
             profile_metadata: None,
             oversized_transfer: Default::default(),
+            open_stream: Default::default(),
         };
 
         let config = GatewayConfig { nostr_config };

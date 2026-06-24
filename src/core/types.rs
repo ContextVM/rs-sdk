@@ -202,6 +202,9 @@ pub struct ClientSession {
     pub supports_ephemeral_encryption: bool,
     /// Learned from client discovery tags: peer supports CEP-22 oversized transfer.
     pub supports_oversized_transfer: bool,
+    /// Learned from client discovery tags: peer supports CEP-41 open streams
+    /// (learned, gated by server config; data only until PR2 activation).
+    pub supports_open_stream: bool,
     /// Last activity timestamp.
     pub last_activity: Instant,
     /// Pending requests: event_id → original request ID.
@@ -221,6 +224,7 @@ impl ClientSession {
             supports_encryption: false,
             supports_ephemeral_encryption: false,
             supports_oversized_transfer: false,
+            supports_open_stream: false,
             last_activity: Instant::now(),
             pending_requests: HashMap::new(),
             event_to_progress_token: HashMap::new(),

@@ -67,6 +67,9 @@ pub mod tags {
 
     /// Support CEP-22 oversized payload transfer via notifications/progress framing
     pub const SUPPORT_OVERSIZED_TRANSFER: &str = "support_oversized_transfer";
+
+    /// Support CEP-41 open-ended streaming via notifications/progress framing
+    pub const SUPPORT_OPEN_STREAM: &str = "support_open_stream";
 }
 
 /// Maximum message size (1MB)

@@ -125,6 +125,7 @@ mod tests {
             discovery_relay_urls: None,
             fallback_operational_relay_urls: None,
             oversized_transfer: Default::default(),
+            open_stream: Default::default(),
         };
 
         let config = ProxyConfig { nostr_config };

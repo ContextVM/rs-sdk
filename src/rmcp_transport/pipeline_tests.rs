@@ -18,12 +18,12 @@ mod tests {
 
     use rmcp::model::{
         CallToolRequestParams, CallToolResult, ClientJsonRpcMessage, ClientResult, ErrorData,
-        Implementation, ProtocolVersion, RequestId, ServerCapabilities, ServerInfo,
-        ServerJsonRpcMessage, ServerResult,
+        Implementation, RequestId, ServerCapabilities, ServerInfo, ServerJsonRpcMessage,
+        ServerResult,
     };
     use rmcp::{
-        handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-        schemars, tool, tool_handler, tool_router, ClientHandler, ServerHandler, ServiceExt,
+        handler::server::wrapper::Parameters, schemars, tool, tool_handler, tool_router,
+        ClientHandler, ServerHandler, ServiceExt,
     };
 
     use crate::core::serializers;
@@ -48,15 +48,11 @@ mod tests {
     }
 
     #[derive(Clone)]
-    struct StatelessTestServer {
-        tool_router: ToolRouter<Self>,
-    }
+    struct StatelessTestServer {}
 
     impl StatelessTestServer {
         fn new() -> Self {
-            Self {
-                tool_router: Self::tool_router(),
-            }
+            Self {}
         }
     }
 

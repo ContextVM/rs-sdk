@@ -1,0 +1,67 @@
+name: CI
+
+# Quality gates for the Rust SDK + FFI workspace.
+# Runs on every push/PR to main and on version tags. FFI artifact/release
+# packaging lives in ffi.yml.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+      - name: clippy (all features)
+        run: cargo clippy --all --all-features --all-targets -- -D warnings
+
+  test:
+    name: check + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: check (all features)
+        run: cargo check --all --all-features
+      - name: test (all features)
+        # Includes the FFI crate. `nak-tests` no-ops when the `nak` CLI is
+        # absent from PATH (see contextvm-ffi/Cargo.toml).
+        run: cargo test --all --all-features
+      - name: test (no default features)
+        run: cargo test --no-default-features
+      - name: doc
+        run: cargo doc --no-deps --all-features
+      - name: rmcp integration example
+        run: cargo run --example rmcp_integration_test --features rmcp -- local
+
+  msrv:
+    name: MSRV 1.88
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      # Regenerate the lockfile so dependencies resolve to versions that still
+      # support the declared MSRV (1.88).
+      - name: Remove lockfile
+        run: rm -f Cargo.lock
+      - name: check
+        run: cargo check --all-features
+      - name: test
+        run: cargo test --all-features

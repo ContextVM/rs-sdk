@@ -10,6 +10,9 @@
 - CEP-6: expanded server announcements with full `InitializeResult` parsing in `ServerAnnouncement`, auto-publishing on `start()`, relay list publishing, and a tool and resource schema mapping table (#77, #78, #79, #81)
 - CEP-23: optional server profile metadata published as a NIP-01 kind 0 event, via a new `ProfileMetadata` type, so clients see a human-friendly identity (#77, #79)
 - CI: MSRV and feature-matrix checks (#75)
+- `examples/python/`: runnable Python examples using the UniFFI binding — an
+  offline install sanity check, server/tool discovery (mirrors `discovery.rs`),
+  and a client `tools/list` caller (mirrors `proxy.rs`).
 
 ### Changed
 
@@ -17,6 +20,17 @@
 - Raised the minimum supported Rust version (MSRV) from 1.70 to 1.88
 - Added `sha2` and `hex` dependencies for CEP-22 payload digests
 - Enabled the `missing_docs` lint, closed rustdoc coverage gaps, and added SDK documentation links and a CEP-22 oversized-transfer guide (#67, #73)
+- Bumped `nostr-sdk` from `0.43` to `0.44` (pulls core `nostr` `0.44.3`). No source
+  changes were required: the breaking removals in the unreleased 0.45 line
+  (`NostrSigner`, `TagKind`, `EventBuilder::sign_with_keys`, `TagStandard`)
+  are not yet published. The SDK pins `hex` as a direct dependency, so nostr's
+  internal `hex` module removal in 0.44.0 is unaffected.
+- FFI: bumped `uniffi` from `0.29` to `0.31`. This raises the embedded UniFFI
+  contract version (`29` -> `30`), so the generated `contextvm_ffi.py` / Swift /
+  Kotlin bindings and the native library must be taken from the same release —
+  a mismatch now aborts at import time with the bumped contract id. Updated
+  `.github/workflows/ffi.yml` to install `uniffi-bindgen-cli` at tag `v0.31.2`
+  and invoke it as `uniffi-bindgen-cli` (renamed from `uniffi-bindgen` in 0.30).
 
 ### Fixed
 
