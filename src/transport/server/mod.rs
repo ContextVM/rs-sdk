@@ -263,10 +263,11 @@ pub struct NostrServerTransportConfig {
     pub profile_metadata: Option<ProfileMetadata>,
     /// CEP-22 oversized payload transfer configuration. Enabled by default.
     pub oversized_transfer: OversizedTransferConfig,
-    /// CEP-41 open-stream configuration. Enabled by default.
+    /// CEP-41 open-stream configuration. Disabled by default (opt-in).
     ///
-    /// Drives capability advertisement/learning, server→client writers, response
-    /// deferral, and the keepalive sweep. Opt out with `with_enabled(false)`.
+    /// When enabled, drives capability advertisement/learning, server→client
+    /// writers, response deferral, and the keepalive sweep. Opt in with
+    /// `OpenStreamConfig::enabled()` / `with_enabled(true)`.
     pub open_stream: OpenStreamConfig,
 }
 
@@ -416,7 +417,8 @@ impl NostrServerTransportConfig {
         self.oversized_transfer.enabled = enabled;
         self
     }
-    /// Set the full CEP-41 open-stream configuration (enabled by default).
+    /// Set the full CEP-41 open-stream configuration (disabled by default; opt in
+    /// with `OpenStreamConfig::enabled()`).
     pub fn with_open_stream(mut self, config: OpenStreamConfig) -> Self {
         self.open_stream = config;
         self
@@ -2432,7 +2434,7 @@ impl NostrServerTransport {
                             OpenStreamFrame::Accept,
                             token,
                             sender_pubkey,
-                            event_id,
+                            Some(event_id),
                             is_encrypted,
                             is_gift_wrap,
                             outer_kind,
@@ -2504,7 +2506,7 @@ impl NostrServerTransport {
                         OpenStreamFrame::Pong { nonce },
                         &token,
                         sender_pubkey,
-                        event_id,
+                        Some(event_id),
                         is_encrypted,
                         is_gift_wrap,
                         outer_kind,
@@ -2536,7 +2538,7 @@ impl NostrServerTransport {
         frame: OpenStreamFrame,
         token: &str,
         recipient_pubkey: &str,
-        correlated_event_id: &str,
+        correlated_event_id: Option<&str>,
         is_encrypted: bool,
         is_gift_wrap: bool,
         outer_kind: u16,
@@ -2558,7 +2560,10 @@ impl NostrServerTransport {
             }
         };
         let mut tags = BaseTransport::create_recipient_tags(&recipient);
-        if let Ok(eid) = EventId::from_hex(correlated_event_id) {
+        // The `e`-tag is present only when the frame correlates to a known request
+        // event (accept/pong reply to an inbound frame); the keepalive ping for a
+        // server-as-reader session has no correlation and is sent recipient-only.
+        if let Some(eid) = correlated_event_id.and_then(|id| EventId::from_hex(id).ok()) {
             tags.push(Tag::event(eid));
         }
         let base = BaseTransport {
@@ -2622,7 +2627,11 @@ impl NostrServerTransport {
         for (peer, token, action) in actions {
             match action {
                 KeepaliveAction::SendPing(nonce) => {
-                    let correlated = state.event_id_for_token(&token).unwrap_or_default();
+                    // Server-as-reader sessions have no `token_to_event` entry
+                    // (that index is only populated for server→client writers), so
+                    // this ping is uncorrelated until bidirectional streaming wires
+                    // a reader-side event id through.
+                    let correlated = state.event_id_for_token(&token);
                     Self::publish_open_stream_control_frame(
                         state,
                         relay_pool,
@@ -2631,7 +2640,7 @@ impl NostrServerTransport {
                         OpenStreamFrame::Ping { nonce },
                         &token,
                         &peer,
-                        &correlated,
+                        correlated.as_deref(),
                         probe_is_encrypted,
                         false,
                         0,
@@ -3393,10 +3402,8 @@ mod tests {
 
     #[test]
     fn test_open_stream_support_tags_helper() {
-        // Opted out → no tag; enabled (the default) → the single-element tag.
-        assert!(
-            open_stream_support_tags(&OpenStreamConfig::default().with_enabled(false)).is_empty()
-        );
+        // Disabled (the default) → no tag; enabled → the single-element tag.
+        assert!(open_stream_support_tags(&OpenStreamConfig::default()).is_empty());
         let names = first_tag_values(&open_stream_support_tags(&OpenStreamConfig::enabled()));
         assert_eq!(names, vec!["support_open_stream"]);
     }
@@ -3430,13 +3437,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_announcement_omits_open_stream_tag_when_disabled() {
-        // Explicitly opt out (the default is now enabled).
-        let config = NostrServerTransportConfig::default()
-            .with_open_stream(OpenStreamConfig::default().with_enabled(false));
+        // The default config has open-stream disabled (opt-in).
         let pool: Arc<dyn RelayPoolTrait> = Arc::new(crate::relay::mock::MockRelayPool::new());
-        let server = NostrServerTransport::with_relay_pool(config, pool)
-            .await
-            .expect("server transport construction");
+        let server =
+            NostrServerTransport::with_relay_pool(NostrServerTransportConfig::default(), pool)
+                .await
+                .expect("server transport construction");
         let names = first_tag_values(&server.announcement_manager.get_common_tags());
         assert!(!names.contains(&"support_open_stream".to_string()));
     }

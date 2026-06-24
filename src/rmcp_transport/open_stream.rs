@@ -17,7 +17,7 @@ use futures::future::BoxFuture;
 use rmcp::model::{CallToolRequestParams, CallToolResult};
 use rmcp::service::{Peer, PeerRequestOptions, ServiceError};
 use rmcp::RoleClient;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinError, JoinHandle};
 
 use crate::core::error::{Error, Result};
 use crate::transport::client::ClientOpenStreamHandle;
@@ -34,8 +34,12 @@ pub struct ToolStreamCall {
     pub progress_token: String,
     /// The async stream of payload chunks (`impl Stream<Item = Result<String, OpenStreamError>>`).
     pub stream: OpenStreamSession,
-    /// The final `CallToolResult` (resolves after the stream closes — deferral).
-    pub result: JoinHandle<std::result::Result<CallToolResult, ServiceError>>,
+    /// The final `CallToolResult`, resolving after the stream closes (deferral).
+    ///
+    /// A **flat** result: the spawned-task (`JoinError`) and rmcp (`ServiceError`)
+    /// failures are folded into [`crate::Error`], so consumers `await` once rather
+    /// than unwrapping a nested `Result`.
+    pub result: BoxFuture<'static, Result<CallToolResult>>,
     abort_fn: AbortFn,
 }
 
@@ -106,27 +110,49 @@ pub async fn call_tool_stream(
 
     // 3. Issue the call on a spawned task so we can hand back the stream first.
     let peer = peer.clone();
-    let result: JoinHandle<std::result::Result<CallToolResult, ServiceError>> =
+    let mut result_handle: JoinHandle<std::result::Result<CallToolResult, ServiceError>> =
         tokio::spawn(async move { peer.call_tool_with_options(params, options).await });
 
-    // 4. Await the SDK-stamped token + its bound reader session, then release the
-    //    bind lock (the binding is done — the next call may proceed).
-    let bound = pending.await;
-    drop(bind_guard);
-    let (progress_token, stream) = match bound {
-        Ok(Ok(pair)) => pair,
-        Ok(Err(error)) => {
-            result.abort();
-            return Err(error);
-        }
-        Err(_) => {
-            // The transport closed (or dropped the placeholder) before binding.
-            result.abort();
-            return Err(Error::Transport(
-                "transport closed before the outbound open-stream session was bound".to_string(),
-            ));
+    // 4. Bind the reader session. Race `pending` against the call itself: if the
+    //    call settles BEFORE the transport binds the placeholder (e.g. rmcp
+    //    rejects the request before publishing), `pending` would never resolve and
+    //    the bind lock would deadlock every later `call_tool_stream`. `biased`
+    //    prefers the bind (a successful call always publishes — and binds — first,
+    //    so the call-settled arm fires only on a pre-publish failure).
+    let (progress_token, stream) = tokio::select! {
+        biased;
+        bound = pending => match bound {
+            Ok(Ok(pair)) => pair,
+            Ok(Err(error)) => {
+                drop(bind_guard);
+                result_handle.abort();
+                return Err(error);
+            }
+            Err(_) => {
+                // The transport closed (or dropped the placeholder) before binding.
+                drop(bind_guard);
+                result_handle.abort();
+                return Err(Error::Transport(
+                    "transport closed before the outbound open-stream session was bound"
+                        .to_string(),
+                ));
+            }
+        },
+        settled = &mut result_handle => {
+            // The call finished without ever binding a session — drop the orphaned
+            // placeholder so the next `tools/call` is not mis-bound to it, then
+            // surface the (flattened) error.
+            transport.cancel_outbound();
+            drop(bind_guard);
+            return Err(match flatten_call_result(settled) {
+                Err(error) => error,
+                Ok(_) => Error::Other(
+                    "open-stream tool call completed without establishing a stream".to_string(),
+                ),
+            });
         }
     };
+    drop(bind_guard);
 
     // 5. Build the abort handle (publish abort + finalize + free the slot).
     let registry = transport.registry();
@@ -144,10 +170,29 @@ pub async fn call_tool_stream(
         })
     });
 
+    // 6. Flatten the spawned call into a single-`await` future (JoinError +
+    //    ServiceError folded into `crate::Error`).
+    let result: BoxFuture<'static, Result<CallToolResult>> =
+        Box::pin(async move { flatten_call_result(result_handle.await) });
+
     Ok(ToolStreamCall {
         progress_token,
         stream,
         result,
         abort_fn,
     })
+}
+
+/// Fold the doubly-nested `call_tool_with_options` outcome (`JoinError` outside,
+/// `ServiceError` inside) into a flat [`crate::Error`].
+fn flatten_call_result(
+    settled: std::result::Result<std::result::Result<CallToolResult, ServiceError>, JoinError>,
+) -> Result<CallToolResult> {
+    match settled {
+        Ok(Ok(result)) => Ok(result),
+        Ok(Err(service_error)) => Err(Error::Transport(service_error.to_string())),
+        Err(join_error) => Err(Error::Other(format!(
+            "call_tool_stream task failed: {join_error}"
+        ))),
+    }
 }

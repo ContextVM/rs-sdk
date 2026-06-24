@@ -381,7 +381,6 @@ async fn open_stream_roundtrip_numeric_token() {
     let result = tokio::time::timeout(Duration::from_secs(5), &mut call.result)
         .await
         .expect("result timed out")
-        .expect("result task panicked")
         .expect("tool call failed");
     assert_eq!(first_text(&result), "completed:orders");
 
@@ -423,12 +422,10 @@ async fn open_stream_concurrent_calls_stay_isolated_by_token() {
     let order_result = tokio::time::timeout(Duration::from_secs(5), &mut orders.result)
         .await
         .expect("orders result timed out")
-        .expect("orders task panicked")
         .expect("orders tool failed");
     let invoice_result = tokio::time::timeout(Duration::from_secs(5), &mut invoices.result)
         .await
         .expect("invoices result timed out")
-        .expect("invoices task panicked")
         .expect("invoices tool failed");
     assert_eq!(first_text(&order_result), "completed:orders");
     assert_eq!(first_text(&invoice_result), "completed:invoices");
@@ -470,7 +467,6 @@ async fn open_stream_deferred_response_after_close() {
     let result = tokio::time::timeout(Duration::from_secs(5), &mut call.result)
         .await
         .expect("result timed out")
-        .expect("result task panicked")
         .expect("tool call failed");
     assert_eq!(first_text(&result), "deferred:orders");
 
@@ -508,7 +504,6 @@ async fn open_stream_client_abort_propagates() {
     let result = tokio::time::timeout(Duration::from_secs(5), &mut call.result)
         .await
         .expect("result timed out")
-        .expect("result task panicked")
         .expect("tool call failed");
     assert_eq!(first_text(&result), "client-aborted:orders");
 
@@ -531,7 +526,6 @@ async fn open_stream_unstarted_writer_sends_normal_response() {
     let result = tokio::time::timeout(Duration::from_secs(5), &mut call.result)
         .await
         .expect("response must not hang when the writer never started")
-        .expect("result task panicked")
         .expect("tool call failed");
     assert_eq!(first_text(&result), "plain:orders");
 
@@ -556,7 +550,6 @@ async fn open_stream_gate_off_server_disabled_streams_nothing() {
     let result = tokio::time::timeout(Duration::from_secs(5), &mut call.result)
         .await
         .expect("result timed out")
-        .expect("result task panicked")
         .expect("tool call failed");
     assert_eq!(first_text(&result), "completed:orders");
 
@@ -680,7 +673,6 @@ async fn open_stream_oversized_request_streaming_response_composition() {
     let result = tokio::time::timeout(Duration::from_secs(10), &mut call.result)
         .await
         .expect("result timed out")
-        .expect("result task panicked")
         .expect("tool call failed");
     assert_eq!(first_text(&result), format!("len:{big_len}"));
 
@@ -751,7 +743,6 @@ async fn open_stream_oversized_response_while_separate_stream_is_live() {
     let result = tokio::time::timeout(Duration::from_secs(10), &mut call.result)
         .await
         .expect("result timed out")
-        .expect("result task panicked")
         .expect("tool call failed");
     assert_eq!(first_text(&result), "done:orders");
 
@@ -803,7 +794,6 @@ async fn plain_call_with_progress_token_does_not_interfere_with_live_stream() {
     let result = tokio::time::timeout(Duration::from_secs(5), &mut call.result)
         .await
         .expect("result timed out")
-        .expect("result task panicked")
         .expect("tool call failed");
     assert_eq!(first_text(&result), "done:orders");
 

@@ -73,10 +73,11 @@ pub struct NostrClientTransportConfig {
     pub fallback_operational_relay_urls: Option<Vec<String>>,
     /// CEP-22 oversized payload transfer configuration. Enabled by default.
     pub oversized_transfer: OversizedTransferConfig,
-    /// CEP-41 open-stream configuration. Enabled by default.
+    /// CEP-41 open-stream configuration. Disabled by default (opt-in).
     ///
-    /// Drives capability advertisement/learning, the inbound reader engine, the
-    /// keepalive sweep, and `call_tool_stream`. Opt out with `with_enabled(false)`.
+    /// When enabled, drives capability advertisement/learning, the inbound reader
+    /// engine, the keepalive sweep, and `call_tool_stream`. Opt in with
+    /// `OpenStreamConfig::enabled()` / `with_enabled(true)`.
     pub open_stream: OpenStreamConfig,
 }
 
@@ -148,7 +149,8 @@ impl NostrClientTransportConfig {
         self.oversized_transfer.enabled = enabled;
         self
     }
-    /// Set the full CEP-41 open-stream configuration (enabled by default).
+    /// Set the full CEP-41 open-stream configuration (disabled by default; opt in
+    /// with `OpenStreamConfig::enabled()`).
     pub fn with_open_stream(mut self, config: OpenStreamConfig) -> Self {
         self.open_stream = config;
         self
@@ -231,6 +233,10 @@ pub struct NostrClientTransport {
 /// is moved into an rmcp service. It shares the transport's registry + placeholder
 /// `Arc`s, so the served transport's `send` binds the placeholders this handle
 /// pushes.
+///
+/// Only consumed through `call_tool_stream` (the `rmcp` feature); without it the
+/// handle is dead but harmless.
+#[cfg_attr(not(feature = "rmcp"), allow(dead_code))]
 #[derive(Clone)]
 pub struct ClientOpenStreamHandle {
     registry: Arc<AsyncMutex<OpenStreamRegistry>>,
@@ -240,6 +246,7 @@ pub struct ClientOpenStreamHandle {
     config: OpenStreamConfig,
 }
 
+#[cfg_attr(not(feature = "rmcp"), allow(dead_code))]
 impl ClientOpenStreamHandle {
     /// Register a placeholder for the next outbound `call_tool_stream` session
     /// (resolved by the served transport's `send`).
@@ -253,6 +260,20 @@ impl ClientOpenStreamHandle {
         };
         pending.push_back(tx);
         rx
+    }
+
+    /// Drop the most-recently registered (still-unbound) placeholder.
+    ///
+    /// Called by `call_tool_stream` when its request fails before the transport's
+    /// `send` ever binds it — otherwise the orphaned placeholder would be popped
+    /// (and mis-bound) by the next outbound `tools/call`. The bind lock guarantees
+    /// only this call's placeholder can be unbound, so the back of the FIFO is it.
+    pub(crate) fn cancel_outbound(&self) {
+        let mut pending = match self.pending.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        pending.pop_back();
     }
 
     /// Clone the reader-registry handle (for the consumer `abort` path).
@@ -2339,14 +2360,13 @@ mod tests {
         let t = make_transport_for_tags(EncryptionMode::Optional, GiftWrapMode::Optional);
         let tags = t.get_client_capability_tags();
         let names = tag_names(&tags);
-        // The oversized + open-stream tags (both default-on) are pushed last.
+        // The oversized tag (default-on) is pushed last; open-stream is opt-in.
         assert_eq!(
             names,
             vec![
                 "support_encryption",
                 "support_encryption_ephemeral",
-                "support_oversized_transfer",
-                "support_open_stream"
+                "support_oversized_transfer"
             ]
         );
     }
@@ -2355,11 +2375,8 @@ mod tests {
     fn client_capability_tags_encryption_disabled() {
         let t = make_transport_for_tags(EncryptionMode::Disabled, GiftWrapMode::Optional);
         let tags = t.get_client_capability_tags();
-        // No encryption tags; the default-on oversized + open-stream tags remain.
-        assert_eq!(
-            tag_names(&tags),
-            vec!["support_oversized_transfer", "support_open_stream"]
-        );
+        // No encryption tags; the default-on oversized tag remains (open-stream is opt-in).
+        assert_eq!(tag_names(&tags), vec!["support_oversized_transfer"]);
     }
 
     #[test]
@@ -2369,11 +2386,7 @@ mod tests {
         let names = tag_names(&tags);
         assert_eq!(
             names,
-            vec![
-                "support_encryption",
-                "support_oversized_transfer",
-                "support_open_stream"
-            ]
+            vec!["support_encryption", "support_oversized_transfer"]
         );
     }
 
@@ -2417,23 +2430,19 @@ mod tests {
         let mut t = make_transport_for_tags(EncryptionMode::Disabled, GiftWrapMode::Optional);
         t.config.oversized_transfer.enabled = true;
         let names = tag_names(&t.get_client_capability_tags());
-        assert_eq!(
-            names,
-            vec!["support_oversized_transfer", "support_open_stream"]
-        );
+        assert_eq!(names, vec!["support_oversized_transfer"]);
     }
 
     #[test]
     fn client_capability_tags_open_stream_gate() {
-        // Opting out suppresses the tag.
+        // Open-stream is opt-in: absent by default.
         let mut t = make_transport_for_tags(EncryptionMode::Disabled, GiftWrapMode::Optional);
-        t.config.open_stream = OpenStreamConfig::default().with_enabled(false);
         assert!(
             !tag_names(&t.get_client_capability_tags())
                 .contains(&"support_open_stream".to_string()),
-            "open-stream tag must be absent when opted out"
+            "open-stream tag must be absent by default (opt-in)"
         );
-        // Enabled (the default) advertises the single-element tag.
+        // Enabling it advertises the single-element tag.
         t.config.open_stream = OpenStreamConfig::enabled();
         assert!(
             tag_names(&t.get_client_capability_tags()).contains(&"support_open_stream".to_string()),

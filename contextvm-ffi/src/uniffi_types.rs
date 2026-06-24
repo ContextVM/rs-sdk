@@ -96,6 +96,7 @@ pub struct PeerCapabilities {
     pub supports_encryption: bool,
     pub supports_ephemeral_encryption: bool,
     pub supports_oversized_transfer: bool,
+    pub supports_open_stream: bool,
 }
 
 /// A discovered MCP tool and provider metadata used by foreign clients.
@@ -360,6 +361,7 @@ fn capabilities_to_uniffi(caps: contextvm_sdk::PeerCapabilities) -> PeerCapabili
         supports_encryption: caps.supports_encryption,
         supports_ephemeral_encryption: caps.supports_ephemeral_encryption,
         supports_oversized_transfer: caps.supports_oversized_transfer,
+        supports_open_stream: caps.supports_open_stream,
     }
 }
 

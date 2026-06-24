@@ -48,14 +48,15 @@ pub use writer::{OnAbortHook, OnCloseHook, OpenStreamWriter, OpenStreamWriterOpt
 /// and [`NostrClientTransportConfig`](crate::transport::NostrClientTransportConfig)
 /// via their `with_open_stream` builders.
 ///
-/// **Enabled by default**: the capability is advertised and
-/// activated. Opt out with `with_enabled(false)`. It is safe for non-CEP-41
-/// peers — the server activates only for advertising clients, and a writer is
-/// injected only when a request carries a `progressToken`.
+/// **Disabled by default** (opt-in): open-stream is neither advertised nor
+/// activated until enabled (matching the TS SDK's default). Opt in with
+/// [`OpenStreamConfig::enabled`] or `with_enabled(true)`. Once on, it is safe for
+/// non-CEP-41 peers — the server activates only for advertising clients, and a
+/// writer is injected only when a request carries a `progressToken`.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct OpenStreamConfig {
-    /// Master gate, `true` by default. When `false` the capability is neither
+    /// Master gate, `false` by default. When `false` the capability is neither
     /// advertised nor activated, and the server does not learn a client's flag.
     pub enabled: bool,
     /// Upper bound on concurrently active streams (per peer/registry).
@@ -81,12 +82,9 @@ pub struct OpenStreamConfig {
 impl Default for OpenStreamConfig {
     fn default() -> Self {
         Self {
-            // Open-stream is on by default. It stays safe for non-CEP-41 peers
-            // because the server only activates per advertising client and a writer
-            // is injected only when a request carries a `progressToken` (and is
-            // dropped unused if the tool never streams). Opt out with
-            // `with_enabled(false)`.
-            enabled: true,
+            // Open-stream is opt-in (disabled by default), matching the TS SDK.
+            // Enable it with `OpenStreamConfig::enabled()` / `with_enabled(true)`.
+            enabled: false,
             max_concurrent_streams: constants::DEFAULT_MAX_CONCURRENT_OPEN_STREAMS,
             max_buffered_chunks_per_stream: constants::DEFAULT_MAX_BUFFERED_CHUNKS_PER_STREAM,
             max_buffered_bytes_per_stream: constants::DEFAULT_MAX_BUFFERED_BYTES_PER_STREAM,
@@ -176,12 +174,13 @@ mod config_tests {
     use super::*;
 
     #[test]
-    fn default_is_enabled_with_ts_parity_knobs() {
+    fn default_is_disabled_with_ts_parity_knobs() {
         let config = OpenStreamConfig::default();
-        // Open-stream is on by default.
-        assert!(config.enabled);
-        // Opting out is still one call.
-        assert!(!OpenStreamConfig::default().with_enabled(false).enabled);
+        // Open-stream is opt-in (disabled by default), matching the TS SDK.
+        assert!(!config.enabled);
+        // Opting in is one call.
+        assert!(OpenStreamConfig::default().with_enabled(true).enabled);
+        assert!(OpenStreamConfig::enabled().enabled);
         assert_eq!(config.max_concurrent_streams, 64);
         assert_eq!(config.max_buffered_chunks_per_stream, 64);
         assert_eq!(config.max_buffered_bytes_per_stream, 512 * 1024);
