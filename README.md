@@ -1,7 +1,7 @@
 # contextvm-sdk
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
 
 Rust SDK for the [ContextVM protocol](https://contextvm.org) — **MCP over Nostr**.
 
@@ -58,11 +58,11 @@ Add to your `Cargo.toml`:
 contextvm-sdk = { git = "https://github.com/ContextVM/rs-sdk" }
 ```
 
-Or clone and use as a path dependency:
+Or pin a published release from crates.io:
 
 ```toml
 [dependencies]
-contextvm-sdk = { path = "../rust-contextvm-sdk" }
+contextvm-sdk = "0.2.0"
 ```
 
 ## Quick Start
@@ -168,13 +168,17 @@ async fn main() -> contextvm_sdk::Result<()> {
 
 The in-repo Rust SDK guides live in [`docs/README.md`](docs/README.md):
 
-- For most users, the main pattern is: build an `rmcp` server or client, then attach [`NostrServerTransport`](src/transport/server/mod.rs:87) or [`NostrClientTransport`](src/transport/client/mod.rs:69).
+- For most users, the main pattern is: build an `rmcp` server or client, then attach [`NostrServerTransport`](src/transport/server/mod.rs) or [`NostrClientTransport`](src/transport/client/mod.rs).
 
 - [`docs/overview.md`](docs/overview.md)
 - [`docs/server-transport.md`](docs/server-transport.md)
 - [`docs/client-transport.md`](docs/client-transport.md)
+- [`docs/open-stream.md`](docs/open-stream.md)
 - [`docs/discovery.md`](docs/discovery.md)
 - [`docs/encryption.md`](docs/encryption.md)
+- [`docs/transport-modes.md`](docs/transport-modes.md)
+- [`docs/stateless.md`](docs/stateless.md)
+- [`docs/oversized-transfer.md`](docs/oversized-transfer.md)
 - [`docs/rmcp.md`](docs/rmcp.md)
 - [`docs/transports.md`](docs/transports.md)
 - [`docs/gateway.md`](docs/gateway.md)
@@ -212,12 +216,21 @@ it adds no event kind — frames ride inside `notifications/progress` messages).
 See [docs/oversized-transfer.md](docs/oversized-transfer.md) for the timeout
 model and tuning.
 
+Open-ended streaming (CEP-41) lets a server tool emit an ordered sequence of
+chunks back to the client while a request is in flight. The client consumes them
+as an async `Stream` via `call_tool_stream`. Unlike CEP-22, the stream supplements
+the final JSON-RPC response rather than replacing it. Disabled by default; opt in
+with `with_open_stream(OpenStreamConfig::enabled())`. See
+[docs/open-stream.md](docs/open-stream.md) for the writer and client APIs and the
+keepalive timer model.
+
 ### Server Transport Config
 
 | Field                    | Default               | Description                              |
 |--------------------------|-----------------------|------------------------------------------|
 | `relay_urls`             | `["wss://relay.damus.io"]` | Nostr relays to connect to          |
 | `encryption_mode`        | `Optional`            | Encryption policy                        |
+| `gift_wrap_mode`         | `Optional`            | Gift-wrap policy (CEP-19): persistent (1059) vs ephemeral (21059) |
 | `server_info`            | `None`                | Server metadata for announcements        |
 | `is_announced_server`    | `false`               | Auto-publish announcements on start (CEP-6) |
 | `allowed_public_keys`    | `[]` (allow all)      | Client pubkey allowlist (hex)            |
@@ -228,6 +241,7 @@ model and tuning.
 | `publish_relay_list`     | `true`                | Whether to publish kind 10002 relay list metadata |
 | `profile_metadata`       | `None`                | Profile metadata for kind 0 publication (CEP-23) |
 | `oversized_transfer`     | enabled               | CEP-22 oversized payload transfer config ([guide](docs/oversized-transfer.md)) |
+| `open_stream`            | disabled              | CEP-41 open-stream config; opt-in ([guide](docs/open-stream.md)) |
 
 ### Client Transport Config
 
@@ -236,11 +250,13 @@ model and tuning.
 | `relay_urls`                       | `[]`                       | Nostr relays to connect to (empty = use relay resolution) |
 | `server_pubkey`                    | (required)                 | Target server's public key (hex, npub, or nprofile) |
 | `encryption_mode`                  | `Optional`                 | Encryption policy                    |
+| `gift_wrap_mode`                   | `Optional`                 | Gift-wrap policy (CEP-19): persistent (1059) vs ephemeral (21059) |
 | `is_stateless`                     | `false`                    | Emulate initialize locally           |
 | `timeout`                          | `30s`                      | Response timeout                     |
 | `discovery_relay_urls`             | `None` (bootstrap relays)  | Relays for CEP-17 kind 10002 discovery |
 | `fallback_operational_relay_urls`  | `None`                     | Relays probed in parallel with CEP-17 discovery |
 | `oversized_transfer`               | enabled                    | CEP-22 oversized payload transfer config ([guide](docs/oversized-transfer.md)) |
+| `open_stream`                      | disabled                   | CEP-41 open-stream config; opt-in ([guide](docs/open-stream.md)) |
 
 When `relay_urls` is empty, `start()` runs automatic relay resolution: configured relays > nprofile hints > CEP-17 kind 10002 discovery > fallback probing > bootstrap defaults.
 

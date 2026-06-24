@@ -126,3 +126,15 @@ consumers with a custom progress handler observe chunk-granular progress for
 oversized responses — usable as transfer-progress UX. Default rmcp handlers
 ignore progress for tokens they didn't register, so no action is needed if you
 don't want it. Nothing extra goes on the wire; the forwarding is in-process.
+
+## CEP-22 versus CEP-41
+
+CEP-22 and CEP-41 are distinct transfer profiles that share the same
+`notifications/progress` envelope and the same kind 25910. CEP-22 is for bounded
+reassembly of a single oversized message: it replaces the final JSON-RPC response
+with the reassembled payload, validated by byte length and SHA-256. CEP-41
+(open-stream) is for unbounded live streaming: it supplements the final response
+with an ordered sequence of chunks consumed incrementally, and the final response
+still concludes the call. The two profiles are not interchangeable; each carries
+its own `cvm.type` discriminant (`oversized-transfer` versus `open-stream`). See
+[open-stream.md](open-stream.md) for CEP-41.

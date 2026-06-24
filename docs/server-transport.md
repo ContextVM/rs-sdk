@@ -38,7 +38,7 @@ use contextvm_sdk::transport::server::{
 use contextvm_sdk::{signer, EncryptionMode, GiftWrapMode, ServerInfo};
 use rmcp::{
     ServerHandler, ServiceExt,
-    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
+    handler::server::wrapper::Parameters,
     model::*,
     schemars, tool, tool_handler, tool_router,
 };
@@ -46,15 +46,11 @@ use rmcp::{
 const RELAY_URL: &str = "wss://relay.contextvm.org";
 
 #[derive(Clone)]
-struct DemoServer {
-    tool_router: ToolRouter<Self>,
-}
+struct DemoServer {}
 
 impl DemoServer {
     fn new() -> Self {
-        Self {
-            tool_router: Self::tool_router(),
-        }
+        Self {}
     }
 }
 
@@ -79,19 +75,13 @@ impl DemoServer {
 #[tool_handler]
 impl ServerHandler for DemoServer {
     fn get_info(&self) -> rmcp::model::ServerInfo {
-        rmcp::model::ServerInfo {
-            protocol_version: ProtocolVersion::LATEST,
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            server_info: Implementation {
-                name: "contextvm-native-echo".to_string(),
-                title: Some("ContextVM Native Echo Server".to_string()),
-                version: "0.1.0".to_string(),
-                description: Some("Native rmcp echo server over ContextVM/Nostr".to_string()),
-                icons: None,
-                website_url: None,
-            },
-            instructions: Some("Call the echo tool with a message string".to_string()),
-        }
+        rmcp::model::ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(
+                Implementation::new("contextvm-native-echo", "0.1.0")
+                    .with_title("ContextVM Native Echo Server")
+                    .with_description("Native rmcp echo server over ContextVM/Nostr"),
+            )
+            .with_instructions("Call the echo tool with a message string")
     }
 }
 
@@ -156,12 +146,25 @@ Start with these fields in `NostrServerTransportConfig`:
 - `is_announced_server`: whether the server should participate in public discovery
 - `encryption_mode`: plaintext vs encrypted policy
 - `gift_wrap_mode`: persistent vs ephemeral wrapping policy
+- `open_stream`: CEP-41 open-stream settings; disabled by default, opt in with `with_open_stream(OpenStreamConfig::enabled())`
 - `allowed_public_keys`: allowlist for private or restricted servers
 - `excluded_capabilities`: allow specific methods without fully opening the server
 - `relay_list_urls`: relay URLs advertised in kind 10002 (CEP-17); defaults to `relay_urls`
 - `bootstrap_relay_urls`: additional relays for publishing announcements (CEP-6/17); merged with `relay_list_urls`
 - `publish_relay_list`: whether to publish kind 10002 relay list metadata; default `true`
 - `profile_metadata`: optional profile metadata for kind 0 publication (CEP-23)
+
+## Streaming responses with open-stream (CEP-41)
+
+When open-stream is enabled and a `tools/call` request carries a `progressToken`,
+the transport injects an `OpenStreamWriter` into the request extensions before
+dispatch. Tool handlers retrieve it with
+`ctx.extensions.get::<OpenStreamWriter>()` (imported from
+`contextvm_sdk::transport::open_stream`), write chunks with `writer.write(..)`,
+and finish with `writer.close()`. The final `CallToolResult` is returned normally
+after the stream closes. Open-stream is disabled by default; enable it with
+`with_open_stream(OpenStreamConfig::enabled())`. See
+[open-stream.md](open-stream.md) for a full example.
 
 ## When to use this instead of the gateway
 
@@ -175,4 +178,5 @@ Use the gateway guide when you already have a request loop or existing local MCP
 - `rmcp` accepts pre-init ping and enters the main loop immediately after initialization completes.
 - ContextVM response routing depends on request event ids.
 - Encryption mirroring and announcement behavior are covered by the integration tests.
-- When `is_announced_server` is `true`, the transport auto-publishes all announcement events on `start()` via synthetic MCP requests: kind 11316 (server announcement), kinds 11317-11320 (tools, resources, templates, prompts), kind 10002 (relay list), and kind 0 (profile metadata if configured).
+- Announcement publishing is started by the rmcp worker just after `start()` (not by `transport.start()` itself, because it injects synthetic MCP requests that need an rmcp handler to answer). When `is_announced_server` is `true`, the transport publishes the gated announcement events via those synthetic requests: kind 11316 (server announcement) and kinds 11317-11320 (tools, resources, templates, prompts).
+- Independently of `is_announced_server`, it also publishes kind 10002 (relay list, when `publish_relay_list` is true (the default) and the advertised relay URLs are non-empty) and kind 0 (profile metadata, when `profile_metadata` is configured).

@@ -1,9 +1,30 @@
 # Changelog
 
-## [Unreleased]
+## [0.2.0] - 2026-06-24
+
+### Added
+
+- CEP-22: oversized payload transfer for chunking MCP messages that exceed the NIP-44 single-event size limit (~65 KB), using a transport-agnostic framing engine (start/accept/chunk/end/abort frames, SHA-256 digest verification, and out-of-order reassembly), enabled by default and negotiated through the `support_oversized_transfer` capability tag so servers only fragment to clients that advertise support (#88, #89, #91)
+- CEP-22: progress-aware request timeouts and an in-flight transfer watchdog, providing per-chunk idle-timeout reset, a max-total transfer cap, and receiver-side reaping of stalled transfers, opt-in via `call_tool_with_options` and `progress_aware_options` (#92)
+- CEP-17: multi-stage relay resolution with server identity parsing, relay list (NIP-65) fetching, and `fetch_events`, plus transport integration that resolves a server's preferred relays before connecting (#82, #83)
+- CEP-6: expanded server announcements with full `InitializeResult` parsing in `ServerAnnouncement`, auto-publishing on `start()`, relay list publishing, and a tool and resource schema mapping table (#77, #78, #79, #81)
+- CEP-23: optional server profile metadata published as a NIP-01 kind 0 event, via a new `ProfileMetadata` type, so clients see a human-friendly identity (#77, #79)
+- CEP-41: open-ended streaming - a server tool emits ordered chunks back to a
+  client while a request is in flight via `call_tool_stream`; the client
+  consumes them as an async `Stream`; the stream supplements the final
+  JSON-RPC response rather than replacing it, negotiated through the
+  `support_open_stream` capability tag (#97, #98)
+- CI: MSRV and feature-matrix checks (#75)
+- `examples/python/`: runnable Python examples using the UniFFI binding — an
+  offline install sanity check, server/tool discovery (mirrors `discovery.rs`),
+  and a client `tools/list` caller (mirrors `proxy.rs`).
 
 ### Changed
 
+- Upgraded `rmcp` from 0.16.0 to 1.8 to gain progress-aware request timeouts (#86)
+- Raised the minimum supported Rust version (MSRV) from 1.70 to 1.88
+- Added `sha2` and `hex` dependencies for CEP-22 payload digests
+- Enabled the `missing_docs` lint, closed rustdoc coverage gaps, and added SDK documentation links and a CEP-22 oversized-transfer guide (#67, #73)
 - Bumped `nostr-sdk` from `0.43` to `0.44` (pulls core `nostr` `0.44.3`). No source
   changes were required: the breaking removals in the unreleased 0.45 line
   (`NostrSigner`, `TagKind`, `EventBuilder::sign_with_keys`, `TagStandard`)
@@ -16,11 +37,10 @@
   `.github/workflows/ffi.yml` to install `uniffi-bindgen-cli` at tag `v0.31.2`
   and invoke it as `uniffi-bindgen-cli` (renamed from `uniffi-bindgen` in 0.30).
 
-### Added
+### Fixed
 
-- `examples/python/`: runnable Python examples using the UniFFI binding — an
-  offline install sanity check, server/tool discovery (mirrors `discovery.rs`),
-  and a client `tools/list` caller (mirrors `proxy.rs`).
+- `MockRelayPool` live broadcast now respects per-subscription filters instead of echoing every event to every subscriber (#90)
+- Made the oversized-transfer e2e timing tests deterministic with virtual paused time and the relay config hermetic, removing CI flakiness and a 30 s real-network discovery hang (#93, #94)
 
 ## [0.1.1] - 2026-05-08
 

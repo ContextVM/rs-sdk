@@ -99,15 +99,14 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let result = client
-        .call_tool(CallToolRequestParams {
-            name: "echo".into(),
-            arguments: serde_json::from_value(serde_json::json!({
-                "message": "hello from native contextvm client"
-            }))
-            .ok(),
-            meta: None,
-            task: None,
-        })
+        .call_tool(
+            CallToolRequestParams::new("echo").with_arguments(
+                serde_json::from_value(serde_json::json!({
+                    "message": "hello from native contextvm client"
+                }))
+                .unwrap(),
+            ),
+        )
         .await?;
 
     println!("Echo result: {}", first_text(&result));
@@ -151,10 +150,22 @@ Start with these fields in `NostrClientTransportConfig`:
 - `server_pubkey`: the target server's public key (hex, npub, or nprofile with relay hints)
 - `encryption_mode`: whether plaintext is allowed
 - `gift_wrap_mode`: whether to use persistent or ephemeral wrapping
+- `open_stream`: CEP-41 open-stream settings; disabled by default, opt in with `with_open_stream(OpenStreamConfig::enabled())`
 - `is_stateless`: whether initialize is emulated locally for stateless workflows
 - `timeout`: how long request correlation waits for a response
 - `discovery_relay_urls`: bootstrap relays for CEP-17 kind 10002 relay-list discovery (defaults to `DEFAULT_BOOTSTRAP_RELAY_URLS`)
 - `fallback_operational_relay_urls`: non-authoritative relays probed in parallel with CEP-17 discovery
+
+## Open-ended streaming (CEP-41)
+
+For tools that stream output while a call is in flight, use `call_tool_stream`
+with a `ClientOpenStreamHandle`. Capture the handle from the transport with
+`transport.open_stream_handle()` before `serve()` consumes the transport, then
+call `call_tool_stream(peer, &handle, params)` to receive a `ToolStreamCall`
+whose `stream` yields chunks and whose `result` resolves to the final
+`CallToolResult`. Open-stream is disabled by default; enable it with
+`with_open_stream(OpenStreamConfig::enabled())`. See
+[open-stream.md](open-stream.md).
 
 ## When to use this instead of the proxy
 
@@ -168,4 +179,4 @@ Use the proxy guide when you want a simpler message-oriented bridge and do not w
 - The initialize request is sent automatically as part of the running client startup sequence.
 - Stateless initialization behavior is covered by the conformance tests.
 - Capability learning and gift-wrap handling happen inside the client transport implementation.
-- When `relay_urls` is empty, `start()` runs 6-stage relay resolution before connecting: configured relays > nprofile hints > CEP-17 kind 10002 discovery > fallback probing > bootstrap defaults. Callers can set `server_pubkey` to an nprofile and omit `relay_urls` entirely.
+- When `relay_urls` is empty, `start()` runs 6-stage relay resolution before connecting: configured relays > nprofile hints > CEP-17 kind 10002 discovery > fallback probing > sequential fallback > bootstrap defaults. Callers can set `server_pubkey` to an nprofile and omit `relay_urls` entirely.
