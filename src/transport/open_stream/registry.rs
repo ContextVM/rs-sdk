@@ -23,7 +23,9 @@ use super::constants::{
 };
 use super::errors::OpenStreamError;
 use super::frame::OpenStreamFrame;
-use super::session::{FrameOutcome, OpenStreamSession, OpenStreamSessionOptions, PublishFrame};
+use super::session::{
+    FrameOutcome, KeepaliveAction, OpenStreamSession, OpenStreamSessionOptions, PublishFrame,
+};
 
 const LOG_TARGET: &str = "contextvm_sdk::transport::open_stream";
 
@@ -240,16 +242,75 @@ impl OpenStreamRegistry {
             Ok(other) => Ok(other),
             Err(error) => {
                 session.fail(error.clone());
-                self.run_abort(&progress_token, None).await;
+                // Forward the failure reason to the `on_abort` hook (TS passes
+                // `onAbort(error.message)`); the inbound-abort path already forwards
+                // the peer's reason — this covers the local processing-failure
+                // branch so deferral/metrics hooks see why.
+                self.run_abort(&progress_token, Some(error.to_string()))
+                    .await;
                 Err(error)
             }
         }
+    }
+
+    /// Drive the pure keepalive [`tick`](OpenStreamSession::tick) for every active
+    /// session, returning the `(progress_token, action)` pairs that need an
+    /// outbound send (`SendPing`) or signal a local abort (`Abort`). Sessions that
+    /// aborted on this tick are removed (their slot is freed); the transport sweep
+    /// performs the actual publish for each returned action.
+    pub fn tick_all(&mut self, now: Instant) -> Vec<(String, KeepaliveAction)> {
+        let mut actions = Vec::new();
+        let mut aborted = Vec::new();
+        for (token, entry) in self.sessions.iter() {
+            match entry.session.tick(now) {
+                KeepaliveAction::None => {}
+                action => {
+                    if matches!(action, KeepaliveAction::Abort(_)) {
+                        aborted.push(token.clone());
+                    }
+                    actions.push((token.clone(), action));
+                }
+            }
+        }
+        for token in aborted {
+            self.sessions.remove(&token);
+        }
+        actions
     }
 
     /// Dispose every session gracefully and drop them (runs no hooks).
     pub fn clear(&mut self) {
         for (_, entry) in self.sessions.drain() {
             entry.session.dispose();
+        }
+    }
+
+    /// Consumer-cancel cleanup: finalize the session locally, run its `on_abort`
+    /// hook, and **remove the entry** so the concurrency slot is freed.
+    ///
+    /// The session's `process_frame`/`tick` paths only remove an entry on an
+    /// *inbound* terminal frame; a consumer that cancels its own read
+    /// ([`OpenStreamSession::abort`]) finalizes + publishes an `abort` frame but
+    /// leaves the registry entry counting against `max_concurrent_streams`. The
+    /// transport calls this to close that gap when wiring cancel. The outbound
+    /// `abort` *frame* is published by the caller via
+    /// [`OpenStreamSession::abort`]; here `fail` only guarantees the local stream
+    /// is terminal (idempotent if already finalized).
+    pub async fn consumer_abort(&mut self, progress_token: &str, reason: Option<String>) {
+        if let Some(entry) = self.sessions.remove(progress_token) {
+            entry
+                .session
+                .fail(OpenStreamError::abort(progress_token, reason.clone()));
+            if let Some(hook) = entry.on_abort {
+                if let Err(error) = hook(reason).await {
+                    tracing::debug!(
+                        target: LOG_TARGET,
+                        token = %progress_token,
+                        %error,
+                        "open-stream on_abort hook errored during consumer abort"
+                    );
+                }
+            }
         }
     }
 
@@ -657,6 +718,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn consumer_abort_frees_slot_and_runs_hook() {
+        // A consumer cancel must remove the registry entry (freeing the
+        // concurrency slot) and run the `on_abort` hook, even though no inbound
+        // terminal frame ever arrives.
+        let mut registry = OpenStreamRegistry::with_policy(small_policy(1));
+        let fired = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let f = fired.clone();
+        let on_abort: RegistryAbortHook = Box::new(move |reason| {
+            let f = f.clone();
+            Box::pin(async move {
+                f.lock().unwrap().push(reason.unwrap_or_default());
+                Ok(())
+            })
+        });
+        let mut session = registry
+            .create_session_with(
+                "token-consumer-abort",
+                OpenStreamSessionInit {
+                    on_abort: Some(on_abort),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        // The slot is occupied: a second admission is rejected by the cap.
+        assert!(matches!(
+            registry.create_session("token-other").unwrap_err(),
+            OpenStreamError::Policy(_)
+        ));
+
+        registry
+            .consumer_abort("token-consumer-abort", Some("user cancelled".to_string()))
+            .await;
+
+        assert_eq!(registry.size(), 0);
+        assert!(registry.get_session("token-consumer-abort").is_none());
+        assert_eq!(*fired.lock().unwrap(), vec!["user cancelled".to_string()]);
+        // The local stream surfaces the abort error on its next poll.
+        match session.next().await {
+            Some(Err(OpenStreamError::Abort { reason, .. })) => {
+                assert_eq!(reason.as_deref(), Some("user cancelled"));
+            }
+            other => panic!("expected abort error on the stream, got {other:?}"),
+        }
+        // Slot reclaimed: a fresh admission now succeeds.
+        registry.create_session("token-other").unwrap();
+    }
+
+    #[tokio::test]
     async fn removes_session_even_when_on_abort_hook_errors() {
         let mut registry = OpenStreamRegistry::with_policy(small_policy(1));
         let on_abort: RegistryAbortHook = Box::new(|_reason| {
@@ -700,5 +809,102 @@ mod tests {
             }
             other => panic!("expected abort error on the stream, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn fires_only_on_close_on_graceful_close_and_only_on_abort_on_abort() {
+        use std::sync::{Arc as StdArc, Mutex as StdMutex};
+
+        // Build a (on_close, on_abort) pair that each record which hook fired,
+        // tagged by the session, into one shared log.
+        fn recording_hooks(
+            events: StdArc<StdMutex<Vec<String>>>,
+            token: &'static str,
+        ) -> (RegistryCloseHook, RegistryAbortHook) {
+            let close_events = events.clone();
+            let on_close: RegistryCloseHook = Box::new(move || {
+                Box::pin(async move {
+                    close_events.lock().unwrap().push(format!("close:{token}"));
+                    Ok(())
+                })
+            });
+            let on_abort: RegistryAbortHook = Box::new(move |_reason| {
+                Box::pin(async move {
+                    events.lock().unwrap().push(format!("abort:{token}"));
+                    Ok(())
+                })
+            });
+            (on_close, on_abort)
+        }
+
+        let events = StdArc::new(StdMutex::new(Vec::<String>::new()));
+        let mut registry = OpenStreamRegistry::with_policy(small_policy(4));
+
+        // (1) A graceful close fires only `on_close`.
+        let (on_close, on_abort) = recording_hooks(events.clone(), "graceful");
+        registry
+            .create_session_with(
+                "tok-graceful",
+                OpenStreamSessionInit {
+                    on_close: Some(on_close),
+                    on_abort: Some(on_abort),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        registry
+            .process_frame(now(), &notif("tok-graceful", 1, start()))
+            .await
+            .unwrap();
+        registry
+            .process_frame(
+                now(),
+                &notif(
+                    "tok-graceful",
+                    2,
+                    OpenStreamFrame::Close {
+                        last_chunk_index: None,
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+
+        // (2) An abort fires only `on_abort`.
+        let (on_close, on_abort) = recording_hooks(events.clone(), "aborted");
+        registry
+            .create_session_with(
+                "tok-aborted",
+                OpenStreamSessionInit {
+                    on_close: Some(on_close),
+                    on_abort: Some(on_abort),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        registry
+            .process_frame(now(), &notif("tok-aborted", 1, start()))
+            .await
+            .unwrap();
+        registry
+            .process_frame(
+                now(),
+                &notif(
+                    "tok-aborted",
+                    2,
+                    OpenStreamFrame::Abort {
+                        reason: Some("bye".to_string()),
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+
+        // Exactly one hook fired per session, the right one each time.
+        let fired = events.lock().unwrap().clone();
+        assert_eq!(
+            fired,
+            vec!["close:graceful".to_string(), "abort:aborted".to_string()]
+        );
     }
 }

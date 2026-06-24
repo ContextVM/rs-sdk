@@ -203,7 +203,7 @@ pub struct ClientSession {
     /// Learned from client discovery tags: peer supports CEP-22 oversized transfer.
     pub supports_oversized_transfer: bool,
     /// Learned from client discovery tags: peer supports CEP-41 open streams
-    /// (learned, gated by server config; data only until PR2 activation).
+    /// (learned, gated by the server's open-stream config).
     pub supports_open_stream: bool,
     /// Last activity timestamp.
     pub last_activity: Instant,

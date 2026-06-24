@@ -97,3 +97,9 @@ pub use rmcp_transport::progress::{
     progress_aware_options, PeerRequestOptionsExt, DEFAULT_OVERSIZED_IDLE_TIMEOUT,
     DEFAULT_OVERSIZED_MAX_TOTAL_TIMEOUT,
 };
+
+// ── CEP-41 open-stream consumer API ─────────────────────────────────
+#[cfg(feature = "rmcp")]
+pub use rmcp_transport::open_stream::{call_tool_stream, ToolStreamCall};
+#[cfg(feature = "rmcp")]
+pub use transport::client::ClientOpenStreamHandle;

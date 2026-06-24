@@ -24,3 +24,9 @@ pub const DEFAULT_OPEN_STREAM_PROBE_TIMEOUT_MS: u64 = 20_000;
 
 /// Default grace period after a `close` with unresolved gaps before aborting (milliseconds).
 pub const DEFAULT_OPEN_STREAM_CLOSE_GRACE_PERIOD_MS: u64 = 5_000;
+
+/// Maximum byte length of an inbound `ping` nonce a reader will echo in its
+/// `pong`. CEP-41 makes a local nonce-size cap a SHOULD; bounding it here keeps
+/// a peer from inducing an arbitrarily large reflected `pong`. Nonces this
+/// engine *mints* are `{token}:{n}` and stay well under the cap.
+pub const MAX_OPEN_STREAM_PING_NONCE_BYTES: usize = 64;

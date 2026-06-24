@@ -77,6 +77,14 @@ required-features = ["test-utils"]
 name = "oversized_timeout_e2e"
 required-features = ["rmcp", "test-utils"]
 
+[[test]]
+name = "open_stream_e2e"
+required-features = ["rmcp", "test-utils"]
+
+[[test]]
+name = "open_stream_timeout_e2e"
+required-features = ["rmcp", "test-utils"]
+
 [dev-dependencies]
 # `start_paused` deterministic-time tests (tokio's "full" does not include test-util).
 tokio = { version = "1", features = ["test-util"] }

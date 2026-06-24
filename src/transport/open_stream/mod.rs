@@ -31,9 +31,14 @@ pub use constants::*;
 pub use errors::OpenStreamError;
 pub use frame::{open_stream_frame_from_notification, OpenStreamFrame};
 pub use receiver::OpenStreamReceiver;
-pub use registry::{OpenStreamRegistry, OpenStreamRegistryPolicy};
-pub use session::{FrameOutcome, KeepaliveAction, OpenStreamSession, PublishFrame};
-pub use writer::OpenStreamWriter;
+pub use registry::{
+    OpenStreamRegistry, OpenStreamRegistryPolicy, OpenStreamSessionInit, RegistryAbortHook,
+    RegistryCloseHook,
+};
+pub use session::{
+    FrameOutcome, KeepaliveAction, OpenStreamSession, OpenStreamSessionOptions, PublishFrame,
+};
+pub use writer::{OnAbortHook, OnCloseHook, OpenStreamWriter, OpenStreamWriterOptions};
 
 /// CEP-41 open-stream configuration shared by both transports.
 ///
@@ -43,13 +48,14 @@ pub use writer::OpenStreamWriter;
 /// and [`NostrClientTransportConfig`](crate::transport::NostrClientTransportConfig)
 /// via their `with_open_stream` builders.
 ///
-/// **Disabled by default** (opt-in): the capability is neither advertised nor
-/// activated until a future default flip, so the field is inert data the event
-/// loops do not consult yet.
+/// **Enabled by default**: the capability is advertised and
+/// activated. Opt out with `with_enabled(false)`. It is safe for non-CEP-41
+/// peers — the server activates only for advertising clients, and a writer is
+/// injected only when a request carries a `progressToken`.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct OpenStreamConfig {
-    /// Master gate, `false` by default. When `false` the capability is neither
+    /// Master gate, `true` by default. When `false` the capability is neither
     /// advertised nor activated, and the server does not learn a client's flag.
     pub enabled: bool,
     /// Upper bound on concurrently active streams (per peer/registry).
@@ -75,7 +81,12 @@ pub struct OpenStreamConfig {
 impl Default for OpenStreamConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            // Open-stream is on by default. It stays safe for non-CEP-41 peers
+            // because the server only activates per advertising client and a writer
+            // is injected only when a request carries a `progressToken` (and is
+            // dropped unused if the tool never streams). Opt out with
+            // `with_enabled(false)`.
+            enabled: true,
             max_concurrent_streams: constants::DEFAULT_MAX_CONCURRENT_OPEN_STREAMS,
             max_buffered_chunks_per_stream: constants::DEFAULT_MAX_BUFFERED_CHUNKS_PER_STREAM,
             max_buffered_bytes_per_stream: constants::DEFAULT_MAX_BUFFERED_BYTES_PER_STREAM,
@@ -165,9 +176,12 @@ mod config_tests {
     use super::*;
 
     #[test]
-    fn default_is_disabled_with_ts_parity_knobs() {
+    fn default_is_enabled_with_ts_parity_knobs() {
         let config = OpenStreamConfig::default();
-        assert!(!config.enabled);
+        // Open-stream is on by default.
+        assert!(config.enabled);
+        // Opting out is still one call.
+        assert!(!OpenStreamConfig::default().with_enabled(false).enabled);
         assert_eq!(config.max_concurrent_streams, 64);
         assert_eq!(config.max_buffered_chunks_per_stream, 64);
         assert_eq!(config.max_buffered_bytes_per_stream, 512 * 1024);

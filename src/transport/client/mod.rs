@@ -10,15 +10,16 @@ pub mod server_relay_discovery;
 
 pub use correlation_store::ClientCorrelationStore;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use lru::LruCache;
 use nostr_sdk::prelude::*;
 use tokio::sync::oneshot;
+use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::core::constants::*;
@@ -30,7 +31,10 @@ use crate::encryption;
 use crate::relay::{RelayPool, RelayPoolTrait};
 use crate::transport::base::BaseTransport;
 use crate::transport::discovery_tags::{parse_discovered_peer_capabilities, PeerCapabilities};
-use crate::transport::open_stream::OpenStreamConfig;
+use crate::transport::open_stream::{
+    FrameOutcome, KeepaliveAction, OpenStreamConfig, OpenStreamFrame, OpenStreamReceiver,
+    OpenStreamRegistry, OpenStreamSession, OpenStreamSessionInit, PublishFrame,
+};
 use crate::transport::oversized_transfer::{
     build_oversized_frames, progress_token_string, resolve_safe_chunk_size,
     send_oversized_transfer, OversizedFrame, OversizedSenderOptions, OversizedTransferConfig,
@@ -69,10 +73,10 @@ pub struct NostrClientTransportConfig {
     pub fallback_operational_relay_urls: Option<Vec<String>>,
     /// CEP-22 oversized payload transfer configuration. Enabled by default.
     pub oversized_transfer: OversizedTransferConfig,
-    /// CEP-41 open-stream configuration. Disabled by default (opt-in).
+    /// CEP-41 open-stream configuration. Enabled by default.
     ///
-    /// **Data only in PR1** — the event loop does not consult it yet; activation
-    /// (capability advertisement, learning, `call_tool_stream`) lands in PR2.
+    /// Drives capability advertisement/learning, the inbound reader engine, the
+    /// keepalive sweep, and `call_tool_stream`. Opt out with `with_enabled(false)`.
     pub open_stream: OpenStreamConfig,
 }
 
@@ -144,9 +148,7 @@ impl NostrClientTransportConfig {
         self.oversized_transfer.enabled = enabled;
         self
     }
-    /// Set the full CEP-41 open-stream configuration.
-    ///
-    /// Data only in PR1: the event loop does not read this until PR2.
+    /// Set the full CEP-41 open-stream configuration (enabled by default).
     pub fn with_open_stream(mut self, config: OpenStreamConfig) -> Self {
         self.open_stream = config;
         self
@@ -193,6 +195,26 @@ pub struct NostrClientTransport {
     /// (`Number(5)` ≠ `String("5")`). LRU-bounded; entries are dropped when
     /// their transfer concludes and cleared on [`close`](Self::close).
     original_progress_tokens: Arc<Mutex<LruCache<String, serde_json::Value>>>,
+    /// CEP-41: inbound reader engine for server→client streams (single peer).
+    /// Outbound `call_tool_stream` sessions are created here too (each with a
+    /// publish closure for consumer abort). Disposed on [`close`](Self::close).
+    open_stream_registry: Arc<AsyncMutex<OpenStreamRegistry>>,
+    /// CEP-41: FIFO of `call_tool_stream` placeholders awaiting their SDK-stamped
+    /// progress token. [`send`](Self::send) binds the next one when a `tools/call`
+    /// carrying a token is published (mirrors TS `pendingOutboundOpenStreamResolvers`).
+    #[allow(clippy::type_complexity)]
+    pending_outbound_open_stream:
+        Arc<Mutex<VecDeque<oneshot::Sender<Result<(String, OpenStreamSession)>>>>>,
+    /// CEP-41: monotonic `progress` for client→server control frames (`ping`/`pong`
+    /// from the keepalive sweep / inbound handler). The server does not validate
+    /// these, so one shared counter suffices.
+    open_stream_control_progress: Arc<AtomicU64>,
+    /// CEP-41: serializes the placeholder push→bind window of `call_tool_stream`.
+    /// The placeholder FIFO is matched to a request by *order*, but rmcp stamps the
+    /// token (and the worker publishes) in its own order — so two concurrent
+    /// `call_tool_stream` calls could otherwise bind each other's tokens. Holding
+    /// this across one call's push→bind keeps at most one placeholder unbound.
+    open_stream_bind_lock: Arc<AsyncMutex<()>>,
     /// Channel for receiving processed MCP messages from the event loop.
     message_tx: Option<tokio::sync::mpsc::UnboundedSender<JsonRpcMessage>>,
     message_rx: Option<tokio::sync::mpsc::UnboundedReceiver<JsonRpcMessage>>,
@@ -200,6 +222,60 @@ pub struct NostrClientTransport {
     cancellation_token: CancellationToken,
     /// Handle for the spawned event loop task.
     event_loop_handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+/// CEP-41: a cheap, shareable handle to a client transport's open-stream state,
+/// passed to [`call_tool_stream`](crate::call_tool_stream).
+///
+/// Obtained via [`NostrClientTransport::open_stream_handle`] before the transport
+/// is moved into an rmcp service. It shares the transport's registry + placeholder
+/// `Arc`s, so the served transport's `send` binds the placeholders this handle
+/// pushes.
+#[derive(Clone)]
+pub struct ClientOpenStreamHandle {
+    registry: Arc<AsyncMutex<OpenStreamRegistry>>,
+    #[allow(clippy::type_complexity)]
+    pending: Arc<Mutex<VecDeque<oneshot::Sender<Result<(String, OpenStreamSession)>>>>>,
+    bind_lock: Arc<AsyncMutex<()>>,
+    config: OpenStreamConfig,
+}
+
+impl ClientOpenStreamHandle {
+    /// Register a placeholder for the next outbound `call_tool_stream` session
+    /// (resolved by the served transport's `send`).
+    pub(crate) fn prepare_outbound(
+        &self,
+    ) -> oneshot::Receiver<Result<(String, OpenStreamSession)>> {
+        let (tx, rx) = oneshot::channel();
+        let mut pending = match self.pending.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        pending.push_back(tx);
+        rx
+    }
+
+    /// Clone the reader-registry handle (for the consumer `abort` path).
+    pub(crate) fn registry(&self) -> Arc<AsyncMutex<OpenStreamRegistry>> {
+        self.registry.clone()
+    }
+
+    /// The placeholder push→bind serialization lock (see the transport field).
+    pub(crate) fn bind_lock(&self) -> &Arc<AsyncMutex<()>> {
+        &self.bind_lock
+    }
+
+    /// The open-stream config (for the request-timeout options).
+    pub(crate) fn config(&self) -> &OpenStreamConfig {
+        &self.config
+    }
+}
+
+impl std::fmt::Debug for ClientOpenStreamHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientOpenStreamHandle")
+            .finish_non_exhaustive()
+    }
 }
 
 impl NostrClientTransport {
@@ -258,6 +334,9 @@ impl NostrClientTransport {
         let original_progress_tokens = Arc::new(Mutex::new(LruCache::new(
             NonZeroUsize::new(DEFAULT_LRU_SIZE).expect("DEFAULT_LRU_SIZE must be non-zero"),
         )));
+        let open_stream_registry = Arc::new(AsyncMutex::new(OpenStreamRegistry::with_policy(
+            (&config.open_stream).into(),
+        )));
 
         Ok(Self {
             base: BaseTransport {
@@ -268,6 +347,10 @@ impl NostrClientTransport {
             oversized_receiver,
             accept_waiters,
             original_progress_tokens,
+            open_stream_registry,
+            pending_outbound_open_stream: Arc::new(Mutex::new(VecDeque::new())),
+            open_stream_control_progress: Arc::new(AtomicU64::new(0)),
+            open_stream_bind_lock: Arc::new(AsyncMutex::new(())),
             config,
             server_pubkey,
             hinted_relay_urls,
@@ -332,6 +415,9 @@ impl NostrClientTransport {
         let original_progress_tokens = Arc::new(Mutex::new(LruCache::new(
             NonZeroUsize::new(DEFAULT_LRU_SIZE).expect("DEFAULT_LRU_SIZE must be non-zero"),
         )));
+        let open_stream_registry = Arc::new(AsyncMutex::new(OpenStreamRegistry::with_policy(
+            (&config.open_stream).into(),
+        )));
 
         Ok(Self {
             base: BaseTransport {
@@ -342,6 +428,10 @@ impl NostrClientTransport {
             oversized_receiver,
             accept_waiters,
             original_progress_tokens,
+            open_stream_registry,
+            pending_outbound_open_stream: Arc::new(Mutex::new(VecDeque::new())),
+            open_stream_control_progress: Arc::new(AtomicU64::new(0)),
+            open_stream_bind_lock: Arc::new(AsyncMutex::new(())),
             config,
             server_pubkey,
             hinted_relay_urls,
@@ -435,6 +525,9 @@ impl NostrClientTransport {
         let accept_waiters = self.accept_waiters.clone();
         let original_progress_tokens = self.original_progress_tokens.clone();
         let oversized_enabled = self.config.oversized_transfer.enabled;
+        let open_stream_registry = self.open_stream_registry.clone();
+        let open_stream_control_progress = self.open_stream_control_progress.clone();
+        let open_stream_enabled = self.config.open_stream.enabled;
         let timeout = self.config.timeout;
         let token = self.cancellation_token.child_token();
 
@@ -454,6 +547,9 @@ impl NostrClientTransport {
                 accept_waiters,
                 original_progress_tokens,
                 oversized_enabled,
+                open_stream_registry,
+                open_stream_control_progress,
+                open_stream_enabled,
                 timeout,
                 token,
             )
@@ -499,6 +595,16 @@ impl NostrClientTransport {
             };
             originals.clear();
         }
+        // CEP-41: dispose reader sessions and drop any unbound `call_tool_stream`
+        // placeholders so their awaiters unblock (cancelled) instead of hanging.
+        self.open_stream_registry.lock().await.clear();
+        {
+            let mut pending = match self.pending_outbound_open_stream.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            pending.clear();
+        }
         self.base.disconnect().await
     }
 
@@ -520,6 +626,30 @@ impl NostrClientTransport {
         }
 
         let is_request = message.is_request();
+
+        // CEP-41: bind a pending `call_tool_stream` placeholder to this request's
+        // SDK-stamped progress token, synchronously before publish (mirrors TS), and
+        // record the token's original JSON type. Inbound stream progress is then
+        // forwarded with that type restored so rmcp's reset-on-progress watcher —
+        // keyed by the numeric token rmcp stamped — actually fires.
+        if is_request && self.config.open_stream.enabled {
+            if let JsonRpcMessage::Request(req) = message {
+                if req.method == "tools/call" {
+                    if let Some(original) = req
+                        .params
+                        .as_ref()
+                        .and_then(|p| p.get("_meta"))
+                        .and_then(|m| m.get("progressToken"))
+                    {
+                        if let Some(token) = progress_token_string(original) {
+                            self.bind_pending_outbound_open_stream(&token, original)
+                                .await;
+                        }
+                    }
+                }
+            }
+        }
+
         let base_tags = BaseTransport::create_recipient_tags(&self.server_pubkey);
         let discovery_tags = if is_request {
             self.get_pending_client_discovery_tags()
@@ -986,6 +1116,9 @@ impl NostrClientTransport {
         accept_waiters: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
         original_progress_tokens: Arc<Mutex<LruCache<String, serde_json::Value>>>,
         oversized_enabled: bool,
+        open_stream_registry: Arc<AsyncMutex<OpenStreamRegistry>>,
+        open_stream_control_progress: Arc<AtomicU64>,
+        open_stream_enabled: bool,
         timeout: Duration,
         cancel: CancellationToken,
     ) {
@@ -1031,6 +1164,9 @@ impl NostrClientTransport {
                         &oversized_receiver,
                         &accept_waiters,
                         &original_progress_tokens,
+                        &open_stream_registry,
+                        &open_stream_control_progress,
+                        open_stream_enabled,
                         &relay_pool,
                     )
                     .await;
@@ -1067,6 +1203,24 @@ impl NostrClientTransport {
                             );
                         }
                     }
+                    // CEP-41: drive the open-stream keepalive (idle → ping; probe /
+                    // close-grace deadline → abort) for every active reader session.
+                    if open_stream_enabled {
+                        let gift_wrap_kind = outbound_gift_wrap_kind(
+                            gift_wrap_mode,
+                            server_supports_ephemeral.load(Ordering::Relaxed),
+                        );
+                        Self::sweep_client_open_stream_sessions(
+                            &open_stream_registry,
+                            &open_stream_control_progress,
+                            &relay_pool,
+                            server_pubkey,
+                            encryption_mode,
+                            gift_wrap_kind,
+                            Instant::now(),
+                        )
+                        .await;
+                    }
                 }
             }
         }
@@ -1093,6 +1247,13 @@ impl NostrClientTransport {
         if self.config.oversized_transfer.enabled {
             tags.push(Tag::custom(
                 TagKind::Custom(tags::SUPPORT_OVERSIZED_TRANSFER.into()),
+                Vec::<String>::new(),
+            ));
+        }
+        // CEP-41: advertise open-stream support when enabled.
+        if self.config.open_stream.enabled {
+            tags.push(Tag::custom(
+                TagKind::Custom(tags::SUPPORT_OPEN_STREAM.into()),
                 Vec::<String>::new(),
             ));
         }
@@ -1129,6 +1290,8 @@ impl NostrClientTransport {
             caps.supports_ephemeral_encryption |=
                 discovered.capabilities.supports_ephemeral_encryption;
             caps.supports_oversized_transfer |= discovered.capabilities.supports_oversized_transfer;
+            // CEP-41: OR-learn the server's open-stream support (never downgrades).
+            caps.supports_open_stream |= discovered.capabilities.supports_open_stream;
         }
 
         let mut stored = match init_event.lock() {
@@ -1184,6 +1347,273 @@ impl NostrClientTransport {
         *guard
     }
 
+    // ── CEP-41 open-stream ────────────────────────────────────────
+
+    /// CEP-41: register a placeholder for the next outbound `call_tool_stream`
+    /// session. [`send`](Self::send) binds it to the paired `tools/call`'s
+    /// SDK-stamped progress token and resolves the returned receiver with
+    /// `(progress_token, OpenStreamSession)` (or an error on admission failure /
+    /// transport close).
+    pub fn prepare_outbound_open_stream_session(
+        &self,
+    ) -> oneshot::Receiver<Result<(String, OpenStreamSession)>> {
+        let (tx, rx) = oneshot::channel();
+        let mut pending = match self.pending_outbound_open_stream.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        pending.push_back(tx);
+        rx
+    }
+
+    /// CEP-41: bind the oldest pending placeholder to `token`, creating its reader
+    /// session. A no-op when no placeholder is waiting (an ordinary `tools/call`).
+    ///
+    /// The original token JSON value is recorded **only when a placeholder is
+    /// actually bound** (i.e. for a `call_tool_stream`), so the inbound handler can
+    /// restore the numeric type for rmcp's reset-on-progress watcher — an ordinary
+    /// `tools/call` (no outbound stream) records nothing.
+    async fn bind_pending_outbound_open_stream(&self, token: &str, original: &serde_json::Value) {
+        let waiter = {
+            let mut pending = match self.pending_outbound_open_stream.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            pending.pop_front()
+        };
+        if let Some(waiter) = waiter {
+            self.record_original_progress_token(token, original);
+            let result = self
+                .create_outbound_open_stream_session(token)
+                .await
+                .map(|session| (token.to_string(), session));
+            let _ = waiter.send(result);
+        }
+    }
+
+    /// CEP-41: get-or-create the reader session for `token`, injecting the publish
+    /// closure used by the consumer `abort` path.
+    async fn create_outbound_open_stream_session(&self, token: &str) -> Result<OpenStreamSession> {
+        let mut registry = self.open_stream_registry.lock().await;
+        if let Some(existing) = registry.get_session(token) {
+            return Ok(existing);
+        }
+        let init = OpenStreamSessionInit {
+            publish_frame: Some(self.open_stream_publish_closure()),
+            ..Default::default()
+        };
+        Ok(registry.create_session_with(token, init)?)
+    }
+
+    /// CEP-41: the reader session for `token`, if one exists.
+    pub async fn get_open_stream_session(&self, token: &str) -> Option<OpenStreamSession> {
+        self.open_stream_registry.lock().await.get_session(token)
+    }
+
+    /// CEP-41: a cheap, shareable handle to this transport's open-stream state for
+    /// [`call_tool_stream`](crate::call_tool_stream).
+    ///
+    /// Obtain it **before** moving the transport into an rmcp service (which
+    /// consumes it): the handle clones the registry + placeholder `Arc`s, so the
+    /// served transport's `send` still binds the placeholders the handle pushes.
+    pub fn open_stream_handle(&self) -> ClientOpenStreamHandle {
+        ClientOpenStreamHandle {
+            registry: self.open_stream_registry.clone(),
+            pending: self.pending_outbound_open_stream.clone(),
+            bind_lock: self.open_stream_bind_lock.clone(),
+            config: self.config.open_stream.clone(),
+        }
+    }
+
+    /// CEP-41: consumer cancel for an outbound stream — publish an `abort` frame to
+    /// the server (so its writer aborts), finalize the local stream, and free the
+    /// registry slot. Exposed to consumers via `ToolStreamCall::abort`.
+    pub async fn abort_open_stream(&self, token: &str, reason: Option<String>) {
+        let session = { self.open_stream_registry.lock().await.get_session(token) };
+        if let Some(session) = session {
+            // Publishes the `abort` frame to the server + finalizes locally.
+            session.abort(reason.clone()).await;
+        }
+        // Free the concurrency slot + run any hook (idempotent re-finalize).
+        self.open_stream_registry
+            .lock()
+            .await
+            .consumer_abort(token, reason)
+            .await;
+    }
+
+    /// CEP-41: build the outbound publish closure for an open-stream session —
+    /// publishes a `notifications/progress` frame to the server (recipient-tagged;
+    /// the server correlates by `progressToken`, so no `e` tag is needed).
+    fn open_stream_publish_closure(&self) -> PublishFrame {
+        let relay_pool = Arc::clone(&self.base.relay_pool);
+        let encryption_mode = self.config.encryption_mode;
+        let server_pubkey = self.server_pubkey;
+        let gift_wrap_kind = self.choose_outbound_gift_wrap_kind();
+        Arc::new(move |notification: JsonRpcNotification| {
+            let relay_pool = Arc::clone(&relay_pool);
+            Box::pin(async move {
+                let base = BaseTransport {
+                    relay_pool,
+                    encryption_mode,
+                    is_connected: true,
+                };
+                let tags = BaseTransport::create_recipient_tags(&server_pubkey);
+                base.send_mcp_message(
+                    &JsonRpcMessage::Notification(notification),
+                    &server_pubkey,
+                    CTXVM_MESSAGES_KIND,
+                    tags,
+                    None,
+                    Some(gift_wrap_kind),
+                )
+                .await
+            })
+        })
+    }
+
+    /// CEP-41 inbound interception (beside the oversized branch). Feeds the frame
+    /// to the reader engine, publishes a `pong` on `SendPong`, forwards a stripped
+    /// progress with the original token restored (resets rmcp's idle timer),
+    /// and keeps the request correlation alive via `pending.touch`.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_inbound_open_stream_frame(
+        open_stream_registry: &Arc<AsyncMutex<OpenStreamRegistry>>,
+        open_stream_control_progress: &Arc<AtomicU64>,
+        original_progress_tokens: &Mutex<LruCache<String, serde_json::Value>>,
+        pending: &ClientCorrelationStore,
+        relay_pool: &Arc<dyn RelayPoolTrait>,
+        server_pubkey: PublicKey,
+        encryption_mode: EncryptionMode,
+        gift_wrap_kind: u16,
+        tx: &tokio::sync::mpsc::UnboundedSender<JsonRpcMessage>,
+        notif: &JsonRpcNotification,
+        e_tag: Option<&str>,
+    ) {
+        let token = notif
+            .params
+            .as_ref()
+            .and_then(|p| p.get("progressToken"))
+            .and_then(progress_token_string);
+
+        // Keep the request correlation alive — chunks don't otherwise refresh it.
+        if let Some(correlated) = e_tag {
+            pending.touch(correlated).await;
+        }
+
+        // Feed the reader engine (delivers the chunk to the consumer's stream).
+        let outcome = {
+            open_stream_registry
+                .lock()
+                .await
+                .process_frame(Instant::now(), notif)
+                .await
+        };
+
+        // SendPong → answer the peer's keepalive ping.
+        if let Ok(FrameOutcome::SendPong(nonce)) = &outcome {
+            if let Some(token) = token.as_deref() {
+                let progress = open_stream_control_progress.fetch_add(1, Ordering::SeqCst) + 1;
+                if let Ok(frame) = (OpenStreamFrame::Pong {
+                    nonce: nonce.clone(),
+                })
+                .into_progress_notification(token, progress, None)
+                {
+                    let base = BaseTransport {
+                        relay_pool: Arc::clone(relay_pool),
+                        encryption_mode,
+                        is_connected: true,
+                    };
+                    let tags = BaseTransport::create_recipient_tags(&server_pubkey);
+                    let _ = base
+                        .send_mcp_message(
+                            &JsonRpcMessage::Notification(frame),
+                            &server_pubkey,
+                            CTXVM_MESSAGES_KIND,
+                            tags,
+                            None,
+                            Some(gift_wrap_kind),
+                        )
+                        .await;
+                }
+            }
+        }
+
+        // Reset rmcp's idle timer: forward a stripped progress carrying the ORIGINAL
+        // (numeric) token — the chunk itself already reached the consumer's stream.
+        // Done before the terminal cleanup so the token is still recorded.
+        if let Some(token) = token.as_deref() {
+            Self::forward_stripped_progress(notif, token, original_progress_tokens, tx);
+        }
+
+        // Drop the recorded original token once the stream is terminal.
+        if matches!(
+            &outcome,
+            Ok(FrameOutcome::Closed) | Ok(FrameOutcome::Aborted(_)) | Err(_)
+        ) {
+            Self::remove_original_progress_token(original_progress_tokens, token.as_deref());
+        }
+    }
+
+    /// CEP-41 client keepalive sweep: drive each reader session's pure `tick(now)`;
+    /// publish a `ping` on `SendPing` (an `Abort` already finalized + removed the
+    /// session — the consumer sees the terminal error on the stream). `now` is a
+    /// parameter so tests can drive idle→ping→probe deterministically.
+    async fn sweep_client_open_stream_sessions(
+        open_stream_registry: &Arc<AsyncMutex<OpenStreamRegistry>>,
+        open_stream_control_progress: &Arc<AtomicU64>,
+        relay_pool: &Arc<dyn RelayPoolTrait>,
+        server_pubkey: PublicKey,
+        encryption_mode: EncryptionMode,
+        gift_wrap_kind: u16,
+        now: Instant,
+    ) {
+        let actions = { open_stream_registry.lock().await.tick_all(now) };
+        for (token, action) in actions {
+            if let KeepaliveAction::SendPing(nonce) = action {
+                let progress = open_stream_control_progress.fetch_add(1, Ordering::SeqCst) + 1;
+                if let Ok(frame) = (OpenStreamFrame::Ping { nonce })
+                    .into_progress_notification(&token, progress, None)
+                {
+                    let base = BaseTransport {
+                        relay_pool: Arc::clone(relay_pool),
+                        encryption_mode,
+                        is_connected: true,
+                    };
+                    let tags = BaseTransport::create_recipient_tags(&server_pubkey);
+                    let _ = base
+                        .send_mcp_message(
+                            &JsonRpcMessage::Notification(frame),
+                            &server_pubkey,
+                            CTXVM_MESSAGES_KIND,
+                            tags,
+                            None,
+                            Some(gift_wrap_kind),
+                        )
+                        .await;
+                }
+            }
+        }
+    }
+
+    /// CEP-41: run one keepalive sweep at `now`. The event loop drives this on its
+    /// own timer with `Instant::now()`; it is also exposed so callers (and
+    /// deterministic tests) can drive idle→ping→probe→abort with an explicit
+    /// instant — the session clock is `std::time::Instant`, unaffected by
+    /// `tokio`'s `start_paused`.
+    pub async fn run_open_stream_keepalive_sweep(&self, now: Instant) {
+        Self::sweep_client_open_stream_sessions(
+            &self.open_stream_registry,
+            &self.open_stream_control_progress,
+            &self.base.relay_pool,
+            self.server_pubkey,
+            self.config.encryption_mode,
+            self.choose_outbound_gift_wrap_kind(),
+            now,
+        )
+        .await;
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn handle_notification(
         notification: &RelayPoolNotification,
@@ -1199,6 +1629,9 @@ impl NostrClientTransport {
         oversized_receiver: &Arc<Mutex<OversizedTransferReceiver>>,
         accept_waiters: &Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
         original_progress_tokens: &Arc<Mutex<LruCache<String, serde_json::Value>>>,
+        open_stream_registry: &Arc<AsyncMutex<OpenStreamRegistry>>,
+        open_stream_control_progress: &Arc<AtomicU64>,
+        open_stream_enabled: bool,
         relay_pool: &Arc<dyn RelayPoolTrait>,
     ) {
         let event = match notification {
@@ -1340,6 +1773,39 @@ impl NostrClientTransport {
             &verified_tags,
         ) {
             server_supports_ephemeral.store(true, Ordering::Relaxed);
+        }
+
+        // CEP-41: intercept open-stream frames before the correlation gate, beside
+        // the oversized branch. Type-disjoint (`is_open_stream_frame` vs
+        // `is_oversized_frame` claim distinct `cvm.type`s). The engine delivers
+        // chunks to the consumer's `OpenStreamSession`; here we also forward a
+        // stripped progress to reset rmcp's idle timer and keep correlation alive.
+        if open_stream_enabled {
+            if let Ok(notif) = serde_json::from_str::<JsonRpcNotification>(&actual_event_content) {
+                if notif.method == NOTIFICATIONS_PROGRESS_METHOD
+                    && OpenStreamReceiver::is_open_stream_frame(&notif)
+                {
+                    let gift_wrap_kind = outbound_gift_wrap_kind(
+                        gift_wrap_mode,
+                        server_supports_ephemeral.load(Ordering::Relaxed),
+                    );
+                    Self::handle_inbound_open_stream_frame(
+                        open_stream_registry,
+                        open_stream_control_progress,
+                        original_progress_tokens,
+                        pending,
+                        relay_pool,
+                        server_pubkey,
+                        encryption_mode,
+                        gift_wrap_kind,
+                        tx,
+                        &notif,
+                        e_tag.as_deref(),
+                    )
+                    .await;
+                    return;
+                }
+            }
         }
 
         // CEP-22: intercept oversized-transfer frames ABOVE the correlation gate
@@ -1520,17 +1986,10 @@ impl NostrClientTransport {
     }
 
     fn choose_outbound_gift_wrap_kind(&self) -> u16 {
-        match self.config.gift_wrap_mode {
-            GiftWrapMode::Persistent => GIFT_WRAP_KIND,
-            GiftWrapMode::Ephemeral => EPHEMERAL_GIFT_WRAP_KIND,
-            GiftWrapMode::Optional => {
-                if self.server_supports_ephemeral.load(Ordering::Relaxed) {
-                    EPHEMERAL_GIFT_WRAP_KIND
-                } else {
-                    GIFT_WRAP_KIND
-                }
-            }
-        }
+        outbound_gift_wrap_kind(
+            self.config.gift_wrap_mode,
+            self.server_supports_ephemeral.load(Ordering::Relaxed),
+        )
     }
 
     fn has_support_ephemeral_tag(tags: &Tags) -> bool {
@@ -1562,6 +2021,23 @@ impl NostrClientTransport {
 #[inline]
 fn is_gift_wrap_kind(kind: &Kind) -> bool {
     *kind == Kind::Custom(GIFT_WRAP_KIND) || *kind == Kind::Custom(EPHEMERAL_GIFT_WRAP_KIND)
+}
+
+/// CEP-19: the outbound gift-wrap kind for the client (free fn so the static
+/// event-loop / sweep contexts can resolve it without `&self`).
+#[inline]
+fn outbound_gift_wrap_kind(mode: GiftWrapMode, server_supports_ephemeral: bool) -> u16 {
+    match mode {
+        GiftWrapMode::Persistent => GIFT_WRAP_KIND,
+        GiftWrapMode::Ephemeral => EPHEMERAL_GIFT_WRAP_KIND,
+        GiftWrapMode::Optional => {
+            if server_supports_ephemeral {
+                EPHEMERAL_GIFT_WRAP_KIND
+            } else {
+                GIFT_WRAP_KIND
+            }
+        }
+    }
 }
 
 /// Returns `true` when the inbound event kind violates the configured encryption
@@ -1837,6 +2313,10 @@ mod tests {
             original_progress_tokens: Arc::new(Mutex::new(LruCache::new(
                 NonZeroUsize::new(10).unwrap(),
             ))),
+            open_stream_registry: Arc::new(AsyncMutex::new(OpenStreamRegistry::new())),
+            pending_outbound_open_stream: Arc::new(Mutex::new(VecDeque::new())),
+            open_stream_control_progress: Arc::new(AtomicU64::new(0)),
+            open_stream_bind_lock: Arc::new(AsyncMutex::new(())),
             message_tx: Some(tokio::sync::mpsc::unbounded_channel().0),
             message_rx: None,
             cancellation_token: CancellationToken::new(),
@@ -1859,13 +2339,14 @@ mod tests {
         let t = make_transport_for_tags(EncryptionMode::Optional, GiftWrapMode::Optional);
         let tags = t.get_client_capability_tags();
         let names = tag_names(&tags);
-        // The oversized tag (default-on) is pushed last.
+        // The oversized + open-stream tags (both default-on) are pushed last.
         assert_eq!(
             names,
             vec![
                 "support_encryption",
                 "support_encryption_ephemeral",
-                "support_oversized_transfer"
+                "support_oversized_transfer",
+                "support_open_stream"
             ]
         );
     }
@@ -1874,8 +2355,11 @@ mod tests {
     fn client_capability_tags_encryption_disabled() {
         let t = make_transport_for_tags(EncryptionMode::Disabled, GiftWrapMode::Optional);
         let tags = t.get_client_capability_tags();
-        // No encryption tags; the default-on oversized tag remains.
-        assert_eq!(tag_names(&tags), vec!["support_oversized_transfer"]);
+        // No encryption tags; the default-on oversized + open-stream tags remain.
+        assert_eq!(
+            tag_names(&tags),
+            vec!["support_oversized_transfer", "support_open_stream"]
+        );
     }
 
     #[test]
@@ -1885,7 +2369,11 @@ mod tests {
         let names = tag_names(&tags);
         assert_eq!(
             names,
-            vec!["support_encryption", "support_oversized_transfer"]
+            vec![
+                "support_encryption",
+                "support_oversized_transfer",
+                "support_open_stream"
+            ]
         );
     }
 
@@ -1929,7 +2417,37 @@ mod tests {
         let mut t = make_transport_for_tags(EncryptionMode::Disabled, GiftWrapMode::Optional);
         t.config.oversized_transfer.enabled = true;
         let names = tag_names(&t.get_client_capability_tags());
-        assert_eq!(names, vec!["support_oversized_transfer"]);
+        assert_eq!(
+            names,
+            vec!["support_oversized_transfer", "support_open_stream"]
+        );
+    }
+
+    #[test]
+    fn client_capability_tags_open_stream_gate() {
+        // Opting out suppresses the tag.
+        let mut t = make_transport_for_tags(EncryptionMode::Disabled, GiftWrapMode::Optional);
+        t.config.open_stream = OpenStreamConfig::default().with_enabled(false);
+        assert!(
+            !tag_names(&t.get_client_capability_tags())
+                .contains(&"support_open_stream".to_string()),
+            "open-stream tag must be absent when opted out"
+        );
+        // Enabled (the default) advertises the single-element tag.
+        t.config.open_stream = OpenStreamConfig::enabled();
+        assert!(
+            tag_names(&t.get_client_capability_tags()).contains(&"support_open_stream".to_string()),
+            "open-stream tag must be advertised when enabled"
+        );
+    }
+
+    #[test]
+    fn client_learn_server_discovery_learns_open_stream() {
+        let caps = Mutex::new(PeerCapabilities::default());
+        let init = Mutex::new(None);
+        let event = make_event_with_tags(&[&["support_open_stream"]]);
+        NostrClientTransport::learn_server_discovery(&caps, &init, &event);
+        assert!(caps.lock().unwrap().supports_open_stream);
     }
 
     #[test]

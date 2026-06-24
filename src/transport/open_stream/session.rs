@@ -27,6 +27,7 @@ use nostr_sdk::prelude::EventId;
 
 use crate::core::types::JsonRpcNotification;
 
+use super::constants::MAX_OPEN_STREAM_PING_NONCE_BYTES;
 use super::errors::OpenStreamError;
 use super::frame::OpenStreamFrame;
 
@@ -430,6 +431,12 @@ impl OpenStreamSession {
             OpenStreamFrame::Accept => Ok(FrameOutcome::None),
             OpenStreamFrame::Ping { nonce } => {
                 s.assert_started()?;
+                if nonce.len() > MAX_OPEN_STREAM_PING_NONCE_BYTES {
+                    return Err(OpenStreamError::Sequence(format!(
+                        "ping nonce exceeds {MAX_OPEN_STREAM_PING_NONCE_BYTES}-byte cap (got {} bytes)",
+                        nonce.len()
+                    )));
+                }
                 Ok(FrameOutcome::SendPong(nonce))
             }
             OpenStreamFrame::Pong { nonce } => {
@@ -1047,6 +1054,48 @@ mod tests {
             )
             .unwrap(),
             FrameOutcome::SendPong("nonce-1".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_ping_nonce_exceeding_64_bytes() {
+        let now = Instant::now();
+        let s = make_session("token-ping-cap", 8, 1024);
+        s.process_frame(now, 1, start()).unwrap();
+
+        // A 64-byte nonce is at the cap and is echoed.
+        let at_cap = "x".repeat(MAX_OPEN_STREAM_PING_NONCE_BYTES);
+        assert_eq!(at_cap.len(), 64);
+        assert_eq!(
+            s.process_frame(
+                now,
+                2,
+                OpenStreamFrame::Ping {
+                    nonce: at_cap.clone()
+                }
+            )
+            .unwrap(),
+            FrameOutcome::SendPong(at_cap)
+        );
+
+        // A 65-byte nonce exceeds the cap and is rejected (Sequence), without
+        // finalizing the stream.
+        let over_cap = "x".repeat(MAX_OPEN_STREAM_PING_NONCE_BYTES + 1);
+        assert!(matches!(
+            s.process_frame(now, 3, OpenStreamFrame::Ping { nonce: over_cap }),
+            Err(OpenStreamError::Sequence(_))
+        ));
+        // The stream stays active: a normal ping still earns a pong.
+        assert_eq!(
+            s.process_frame(
+                now,
+                4,
+                OpenStreamFrame::Ping {
+                    nonce: "ok".to_string()
+                }
+            )
+            .unwrap(),
+            FrameOutcome::SendPong("ok".to_string())
         );
     }
 

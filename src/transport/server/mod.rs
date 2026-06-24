@@ -10,12 +10,14 @@ pub mod session_store;
 
 pub use correlation_store::{RouteEntry, ServerEventRouteStore};
 pub use session_store::{SessionSnapshot, SessionStore};
+use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::RwLock;
 
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use lru::LruCache;
 use nostr_sdk::prelude::*;
@@ -29,7 +31,11 @@ use crate::encryption;
 use crate::relay::{RelayPool, RelayPoolTrait};
 use crate::transport::base::BaseTransport;
 use crate::transport::discovery_tags::learn_peer_capabilities;
-use crate::transport::open_stream::OpenStreamConfig;
+use crate::transport::open_stream::{
+    open_stream_frame_from_notification, FrameOutcome, KeepaliveAction, OnAbortHook, OnCloseHook,
+    OpenStreamConfig, OpenStreamFrame, OpenStreamReceiver, OpenStreamRegistryPolicy,
+    OpenStreamWriter, OpenStreamWriterOptions, PublishFrame,
+};
 use crate::transport::oversized_transfer::{
     build_oversized_frames, progress_token_string, resolve_safe_chunk_size, OversizedFrame,
     OversizedSenderOptions, OversizedTransferConfig, OversizedTransferReceiver, TransferPolicy,
@@ -51,6 +57,27 @@ fn oversized_support_tags(config: &NostrServerTransportConfig) -> Vec<Tag> {
     }
 }
 
+/// CEP-41: the `support_open_stream` capability tag to advertise, or empty when
+/// open-stream is disabled. Mirrors [`oversized_support_tags`].
+fn open_stream_support_tags(config: &OpenStreamConfig) -> Vec<Tag> {
+    if config.enabled {
+        vec![Tag::custom(
+            TagKind::Custom(tags::SUPPORT_OPEN_STREAM.into()),
+            Vec::<String>::new(),
+        )]
+    } else {
+        Vec::new()
+    }
+}
+
+/// CEP-22 + CEP-41: the internal capability tags advertised on announcements and
+/// replayed on the first response to each client.
+fn internal_common_capability_tags(config: &NostrServerTransportConfig) -> Vec<Tag> {
+    let mut tags = oversized_support_tags(config);
+    tags.extend(open_stream_support_tags(&config.open_stream));
+    tags
+}
+
 /// CEP-22: build the empty per-peer reassembly store, bounded to `max_sessions`
 /// peers (one [`OversizedTransferReceiver`] per client pubkey, inserted lazily by
 /// the inbound event loop).
@@ -60,6 +87,135 @@ fn new_oversized_receiver_store(
     Arc::new(RwLock::new(LruCache::new(
         NonZeroUsize::new(max_sessions).unwrap_or(NonZeroUsize::new(1).unwrap()),
     )))
+}
+
+/// CEP-41: build the empty per-peer open-stream reader store, bounded to
+/// `max_sessions` peers. Mirrors [`new_oversized_receiver_store`]; one
+/// [`OpenStreamReceiver`] per client pubkey is inserted lazily for inbound
+/// (client→server) streams.
+///
+/// Uses a [`tokio::sync::Mutex`] rather than an `RwLock`: the registry's
+/// `FnOnce` lifecycle hooks are `Send` but not `Sync`, so a shared-read lock
+/// could not be made `Sync`; the store is write-only anyway (`process_frame`
+/// needs `&mut`), so exclusive access loses nothing.
+fn new_open_stream_receiver_store(
+    max_sessions: usize,
+) -> Arc<AsyncMutex<LruCache<String, OpenStreamReceiver>>> {
+    Arc::new(AsyncMutex::new(LruCache::new(
+        NonZeroUsize::new(max_sessions).unwrap_or(NonZeroUsize::new(1).unwrap()),
+    )))
+}
+
+/// CEP-41: response-routing fields captured at writer creation, while the
+/// request's event route is fresh.
+///
+/// The deferred final response is delivered from this snapshot (via
+/// [`NostrServerTransport::send_open_stream_deferred_response`]) rather than from
+/// `event_routes`, so a stream that outlives `request_timeout` — after which the
+/// route is swept — still delivers its response. `mirrored_wrap_kind` mirrors
+/// the inbound gift-wrap kind for CEP-19, exactly as `send_response` does.
+#[derive(Clone)]
+struct RouteSnapshot {
+    client_pubkey: PublicKey,
+    original_request_id: serde_json::Value,
+    is_encrypted: bool,
+    mirrored_wrap_kind: Option<u16>,
+}
+
+/// CEP-41: the per-stream coordination slot for a server→client writer, keyed by
+/// request `event_id` in [`ServerOpenStreamState::slots`].
+///
+/// A single mutex over the whole map serializes the two writers of the deferred
+/// final response — `send_response` (the worker task) and the writer's
+/// close/abort hook (the tool task) — against the [`terminated`](Self::terminated)
+/// flag, so the response is never both stashed *and* dropped under a race.
+struct OpenStreamSlot {
+    writer: OpenStreamWriter,
+    snapshot: RouteSnapshot,
+    /// The final response, stashed by `send_response` when it arrives before the
+    /// stream closes (ordering A).
+    pending_response: Option<JsonRpcMessage>,
+    /// Set by the writer's close/abort hook once the stream is terminal. When
+    /// `send_response` arrives after this (ordering B), it delivers immediately.
+    terminated: bool,
+}
+
+/// CEP-41: the open-stream runtime state shared between the server transport and
+/// its spawned event loop. Bundled so the event-loop signature stays manageable.
+#[derive(Clone)]
+struct ServerOpenStreamState {
+    /// Master gate (`config.open_stream.enabled`).
+    enabled: bool,
+    /// Reader admission/buffering/keepalive policy projected from config.
+    policy: OpenStreamRegistryPolicy,
+    /// Per-peer reader engines for inbound (client→server) streams.
+    receiver: Arc<AsyncMutex<LruCache<String, OpenStreamReceiver>>>,
+    /// Per-stream writer + deferred-response slots, keyed by `event_id`.
+    slots: Arc<Mutex<HashMap<String, OpenStreamSlot>>>,
+    /// `progress_token → event_id`, so inbound control frames and the keepalive
+    /// sweep resolve the writer/route without consulting the route store.
+    token_to_event: Arc<Mutex<HashMap<String, String>>>,
+    /// Monotonic `progress` source for server-*as-reader* control frames
+    /// (`accept`/`pong`/`ping` on inbound client→server streams, where no writer
+    /// owns the counter). Per-token monotonicity holds even though it is shared.
+    control_progress: Arc<AtomicU64>,
+}
+
+impl ServerOpenStreamState {
+    fn new(config: &OpenStreamConfig, max_sessions: usize) -> Self {
+        Self {
+            enabled: config.enabled,
+            policy: config.into(),
+            receiver: new_open_stream_receiver_store(max_sessions),
+            slots: Arc::new(Mutex::new(HashMap::new())),
+            token_to_event: Arc::new(Mutex::new(HashMap::new())),
+            control_progress: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Next monotonic control-frame `progress` (1, 2, 3, …) for the reader path.
+    fn next_control_progress(&self) -> u64 {
+        self.control_progress.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// Lock-poison-tolerant access to the slots map.
+    fn lock_slots(&self) -> std::sync::MutexGuard<'_, HashMap<String, OpenStreamSlot>> {
+        match self.slots.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        }
+    }
+
+    fn lock_token_index(&self) -> std::sync::MutexGuard<'_, HashMap<String, String>> {
+        match self.token_to_event.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        }
+    }
+
+    /// Clone the active writer for `event_id`, if any (for inbound ping/abort
+    /// routing and the worker's extensions injection).
+    fn writer_for(&self, event_id: &str) -> Option<OpenStreamWriter> {
+        self.lock_slots().get(event_id).map(|s| s.writer.clone())
+    }
+
+    /// Resolve `progress_token → event_id`.
+    fn event_id_for_token(&self, token: &str) -> Option<String> {
+        self.lock_token_index().get(token).cloned()
+    }
+}
+
+/// CEP-41: the outcome of the response-deferral decision in `send_response`.
+enum OpenStreamDeferral {
+    /// The response was stashed; the writer's close/abort hook will flush it.
+    Deferred,
+    /// The stream is already terminal — deliver this response now from the snapshot.
+    SendNow {
+        snapshot: RouteSnapshot,
+        response: JsonRpcMessage,
+    },
+    /// No active stream for this event — send the response through the normal path.
+    Passthrough(JsonRpcMessage),
 }
 
 /// Configuration for the server transport.
@@ -107,11 +263,10 @@ pub struct NostrServerTransportConfig {
     pub profile_metadata: Option<ProfileMetadata>,
     /// CEP-22 oversized payload transfer configuration. Enabled by default.
     pub oversized_transfer: OversizedTransferConfig,
-    /// CEP-41 open-stream configuration. Disabled by default (opt-in).
+    /// CEP-41 open-stream configuration. Enabled by default.
     ///
-    /// **Data only in PR1** — the event loop does not consult it yet; activation
-    /// (capability advertisement, learning, response deferral, the keepalive
-    /// sweep) lands in PR2.
+    /// Drives capability advertisement/learning, server→client writers, response
+    /// deferral, and the keepalive sweep. Opt out with `with_enabled(false)`.
     pub open_stream: OpenStreamConfig,
 }
 
@@ -162,6 +317,10 @@ pub struct NostrServerTransport {
     /// enforces the configured per-peer admission policy. Populated by the inbound
     /// event loop; cleared on [`close`](Self::close).
     oversized_receiver: Arc<RwLock<LruCache<String, OversizedTransferReceiver>>>,
+    /// CEP-41: open-stream runtime state (writers, deferred responses, per-peer
+    /// reader engines, `progress_token → event_id` index). Inert when
+    /// `open_stream.enabled` is `false`.
+    open_stream: ServerOpenStreamState,
     /// Channel for incoming MCP messages (consumed by the MCP server).
     message_tx: Option<tokio::sync::mpsc::UnboundedSender<IncomingRequest>>,
     message_rx: Option<tokio::sync::mpsc::UnboundedReceiver<IncomingRequest>>,
@@ -257,9 +416,7 @@ impl NostrServerTransportConfig {
         self.oversized_transfer.enabled = enabled;
         self
     }
-    /// Set the full CEP-41 open-stream configuration.
-    ///
-    /// Data only in PR1: the event loop does not read this until PR2.
+    /// Set the full CEP-41 open-stream configuration (enabled by default).
     pub fn with_open_stream(mut self, config: OpenStreamConfig) -> Self {
         self.open_stream = config;
         self
@@ -320,8 +477,9 @@ impl NostrServerTransport {
             config.publish_relay_list,
             config.profile_metadata.clone(),
         );
-        // CEP-22: advertise oversized-transfer support in announcements + first responses.
-        announcement_manager.set_internal_common_tags(oversized_support_tags(&config));
+        // CEP-22 + CEP-41: advertise oversized-transfer and open-stream support in
+        // announcements + first responses (each gated by its own config flag).
+        announcement_manager.set_internal_common_tags(internal_common_capability_tags(&config));
         Ok(Self {
             announcement_manager,
             base: BaseTransport {
@@ -331,6 +489,7 @@ impl NostrServerTransport {
             },
             sessions: SessionStore::with_capacity(config.max_sessions),
             oversized_receiver: new_oversized_receiver_store(config.max_sessions),
+            open_stream: ServerOpenStreamState::new(&config.open_stream, config.max_sessions),
             config,
             event_routes: ServerEventRouteStore::new(),
             request_wrap_kinds: Arc::new(RwLock::new(HashMap::new())),
@@ -371,8 +530,9 @@ impl NostrServerTransport {
             config.publish_relay_list,
             config.profile_metadata.clone(),
         );
-        // CEP-22: advertise oversized-transfer support in announcements + first responses.
-        announcement_manager.set_internal_common_tags(oversized_support_tags(&config));
+        // CEP-22 + CEP-41: advertise oversized-transfer and open-stream support in
+        // announcements + first responses (each gated by its own config flag).
+        announcement_manager.set_internal_common_tags(internal_common_capability_tags(&config));
         Ok(Self {
             announcement_manager,
             base: BaseTransport {
@@ -382,6 +542,7 @@ impl NostrServerTransport {
             },
             sessions: SessionStore::with_capacity(config.max_sessions),
             oversized_receiver: new_oversized_receiver_store(config.max_sessions),
+            open_stream: ServerOpenStreamState::new(&config.open_stream, config.max_sessions),
             config,
             request_wrap_kinds: Arc::new(RwLock::new(HashMap::new())),
             event_routes: ServerEventRouteStore::new(),
@@ -454,6 +615,7 @@ impl NostrServerTransport {
         let transfer_policy: TransferPolicy = (&self.config.oversized_transfer).into();
         let common_tags_snapshot = self.announcement_manager.common_tags_snapshot();
         let seen_gift_wrap_ids = self.seen_gift_wrap_ids.clone();
+        let open_stream = self.open_stream.clone();
         let event_loop_token = self.cancellation_token.child_token();
 
         let event_loop_handle = tokio::spawn(async move {
@@ -473,6 +635,7 @@ impl NostrServerTransport {
                 transfer_policy,
                 common_tags_snapshot,
                 seen_gift_wrap_ids,
+                open_stream,
                 event_loop_token,
             )
             .await;
@@ -561,11 +724,40 @@ impl NostrServerTransport {
         self.sessions.clear().await;
         self.event_routes.clear().await;
         self.oversized_receiver.write().await.clear();
+        // CEP-41: dispose every inbound reader session and drop all writer /
+        // deferred-response state.
+        {
+            let mut receivers = self.open_stream.receiver.lock().await;
+            for (_, receiver) in receivers.iter_mut() {
+                receiver.clear();
+            }
+            receivers.clear();
+        }
+        self.open_stream.lock_slots().clear();
+        self.open_stream.lock_token_index().clear();
         Ok(())
     }
 
     /// Send a response back to the client that sent the original request.
     pub async fn send_response(&self, event_id: &str, mut response: JsonRpcMessage) -> Result<()> {
+        // CEP-41: response deferral. Decide BEFORE consuming the route — for a
+        // started stream the final response rides the captured snapshot, not the
+        // (possibly-swept) event route.
+        if self.open_stream.enabled {
+            match self.try_defer_open_stream_response(event_id, response) {
+                // Stashed (ordering A) — the close/abort hook flushes it later.
+                OpenStreamDeferral::Deferred => return Ok(()),
+                // Stream already closed (ordering B) — deliver from the snapshot now.
+                OpenStreamDeferral::SendNow { snapshot, response } => {
+                    return self
+                        .send_open_stream_deferred_response(event_id, &snapshot, response)
+                        .await;
+                }
+                // No active stream for this event — fall through to the normal path.
+                OpenStreamDeferral::Passthrough(returned) => response = returned,
+            }
+        }
+
         // Consume the route up-front so only one concurrent responder can proceed
         // for a given event_id.
         let route = self.event_routes.pop(event_id).await.ok_or_else(|| {
@@ -784,6 +976,169 @@ impl NostrServerTransport {
             "Sent server response and cleaned correlation state"
         );
         Ok(())
+    }
+
+    /// CEP-41: clone the active writer for `event_id` so the rmcp worker can inject
+    /// it into the request's `extensions` typemap before dispatch. Returns
+    /// `None` when open-stream is disabled or no writer exists for this request.
+    #[cfg_attr(not(feature = "rmcp"), allow(dead_code))]
+    pub(crate) fn get_open_stream_writer(&self, event_id: &str) -> Option<OpenStreamWriter> {
+        if !self.open_stream.enabled {
+            return None;
+        }
+        self.open_stream.writer_for(event_id)
+    }
+
+    /// CEP-41: decide how `send_response` should handle the final response for a
+    /// (possibly) streaming request. Run under the slots lock so the stash/flush
+    /// decision is consistent against the close/abort hook's `terminated` flag.
+    fn try_defer_open_stream_response(
+        &self,
+        event_id: &str,
+        response: JsonRpcMessage,
+    ) -> OpenStreamDeferral {
+        let mut slots = self.open_stream.lock_slots();
+        let Some(slot) = slots.get_mut(event_id) else {
+            return OpenStreamDeferral::Passthrough(response);
+        };
+
+        if !slot.writer.has_started() {
+            // The request carried a progressToken but the tool never streamed.
+            // Drop the writer and send normally (progress-token-conflict guard —
+            // a deferred-but-never-closed stream would otherwise hang the response).
+            let token = slot.writer.progress_token().to_string();
+            slots.remove(event_id);
+            drop(slots);
+            self.open_stream.lock_token_index().remove(&token);
+            return OpenStreamDeferral::Passthrough(response);
+        }
+
+        if slot.terminated {
+            // Ordering B (the common case): the stream already closed/aborted —
+            // deliver now from the captured snapshot (the route may be swept).
+            let snapshot = slot.snapshot.clone();
+            let token = slot.writer.progress_token().to_string();
+            slots.remove(event_id);
+            drop(slots);
+            self.open_stream.lock_token_index().remove(&token);
+            OpenStreamDeferral::SendNow { snapshot, response }
+        } else {
+            // Ordering A: the stream is still open — hold the response; the
+            // close/abort hook flushes it from the snapshot when the stream ends.
+            slot.pending_response = Some(response);
+            OpenStreamDeferral::Deferred
+        }
+    }
+
+    /// CEP-41: deliver a deferred final response from a captured [`RouteSnapshot`],
+    /// never consulting `event_routes` (route-lifetime-independent; the route may already be gone).
+    async fn send_open_stream_deferred_response(
+        &self,
+        event_id: &str,
+        snapshot: &RouteSnapshot,
+        response: JsonRpcMessage,
+    ) -> Result<()> {
+        Self::publish_open_stream_deferred_response(
+            &self.base,
+            self.config.gift_wrap_mode,
+            event_id,
+            snapshot,
+            response,
+        )
+        .await
+    }
+
+    /// CEP-41 (static): the actual deferred-response publish, callable from both the
+    /// `&self` path and the writer's close/abort hook (which has no `self`).
+    async fn publish_open_stream_deferred_response(
+        base: &BaseTransport,
+        gift_wrap_mode: GiftWrapMode,
+        event_id: &str,
+        snapshot: &RouteSnapshot,
+        mut response: JsonRpcMessage,
+    ) -> Result<()> {
+        // Restore the original request id (the normal path restores it from the
+        // popped route; here it comes from the snapshot).
+        match &mut response {
+            JsonRpcMessage::Response(r) => r.id = snapshot.original_request_id.clone(),
+            JsonRpcMessage::ErrorResponse(r) => r.id = snapshot.original_request_id.clone(),
+            _ => {}
+        }
+        let event_id_parsed = EventId::from_hex(event_id).map_err(|error| {
+            Error::Other(format!("Invalid event id for deferred response: {error}"))
+        })?;
+        // Correlate via the `e` tag exactly like a normal response so the client's
+        // correlation gate accepts it.
+        let tags = BaseTransport::create_response_tags(&snapshot.client_pubkey, &event_id_parsed);
+        let gift_wrap_kind = Self::select_outbound_gift_wrap_kind(
+            gift_wrap_mode,
+            snapshot.is_encrypted,
+            snapshot.mirrored_wrap_kind,
+        );
+        base.send_mcp_message(
+            &response,
+            &snapshot.client_pubkey,
+            CTXVM_MESSAGES_KIND,
+            tags,
+            Some(snapshot.is_encrypted),
+            gift_wrap_kind,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// CEP-41 (static): the writer's close/abort hook. Marks the stream terminal
+    /// and, when the response already arrived (ordering A), flushes it from the
+    /// snapshot. Ordering B leaves the terminal slot for `send_response`.
+    async fn flush_open_stream_response(
+        state: &ServerOpenStreamState,
+        base: &BaseTransport,
+        gift_wrap_mode: GiftWrapMode,
+        event_id: &str,
+    ) {
+        let ready = {
+            let mut slots = state.lock_slots();
+            match slots.get_mut(event_id) {
+                Some(slot) => {
+                    slot.terminated = true;
+                    slot.pending_response.take().map(|response| {
+                        (
+                            slot.snapshot.clone(),
+                            slot.writer.progress_token().to_string(),
+                            response,
+                        )
+                    })
+                }
+                None => None,
+            }
+        };
+
+        let Some((snapshot, token, response)) = ready else {
+            // Ordering B: the response has not arrived yet. Leave the terminal slot
+            // in place; `send_response` will deliver it from the snapshot.
+            return;
+        };
+
+        // Ordering A: the response was stashed before the stream closed — remove
+        // the slot and deliver it now.
+        state.lock_slots().remove(event_id);
+        state.lock_token_index().remove(&token);
+        if let Err(error) = Self::publish_open_stream_deferred_response(
+            base,
+            gift_wrap_mode,
+            event_id,
+            &snapshot,
+            response,
+        )
+        .await
+        {
+            tracing::error!(
+                target: LOG_TARGET,
+                error = %error,
+                event_id = %event_id,
+                "Failed to flush deferred open-stream response"
+            );
+        }
     }
 
     /// CEP-22: publish a response as an ordered oversized-transfer frame sequence.
@@ -1146,6 +1501,7 @@ impl NostrServerTransport {
         transfer_policy: TransferPolicy,
         common_tags_snapshot: announcement_manager::CommonTagsSnapshot,
         seen_gift_wrap_ids: Arc<Mutex<LruCache<EventId, ()>>>,
+        open_stream: ServerOpenStreamState,
         cancel: CancellationToken,
     ) {
         let mut notifications = relay_pool.notifications();
@@ -1159,6 +1515,19 @@ impl NostrServerTransport {
         let mut sweep_timer =
             tokio::time::interval_at(tokio::time::Instant::now() + sweep_interval, sweep_interval);
 
+        // CEP-41: keepalive sweep for server-as-reader sessions. Cadence = half the
+        // idle timeout, clamped to [1s, 30s] (the idle→probe→abort machine only
+        // needs sub-idle granularity). Armed only when open-stream is enabled.
+        let open_stream_sweep_enabled =
+            open_stream.enabled && open_stream.policy.idle_timeout_ms != 0;
+        let open_stream_sweep_interval =
+            (Duration::from_millis(open_stream.policy.idle_timeout_ms) / 2)
+                .clamp(Duration::from_secs(1), Duration::from_secs(30));
+        let mut open_stream_sweep_timer = tokio::time::interval_at(
+            tokio::time::Instant::now() + open_stream_sweep_interval,
+            open_stream_sweep_interval,
+        );
+
         loop {
             let notification = tokio::select! {
                 _ = cancel.cancelled() => {
@@ -1170,6 +1539,16 @@ impl NostrServerTransport {
                 }
                 _ = sweep_timer.tick(), if watchdog_enabled => {
                     Self::sweep_oversized_receivers(&oversized_receiver).await;
+                    continue;
+                }
+                _ = open_stream_sweep_timer.tick(), if open_stream_sweep_enabled => {
+                    Self::sweep_open_stream_sessions(
+                        &open_stream,
+                        &relay_pool,
+                        encryption_mode,
+                        gift_wrap_mode,
+                    )
+                    .await;
                     continue;
                 }
                 result = notifications.recv() => {
@@ -1445,6 +1824,12 @@ impl NostrServerTransport {
                 // CEP-22: only learn oversized support if it is enabled on this server.
                 session.supports_oversized_transfer |=
                     oversized_enabled && discovered.supports_oversized_transfer;
+                // CEP-41: learn the client's open-stream support (gated on enabled).
+                // Captured AFTER the OR-learn so the very `start` frame that carries
+                // the support tag still elicits an `accept`.
+                session.supports_open_stream |=
+                    open_stream.enabled && discovered.supports_open_stream;
+                let client_supports_open_stream = session.supports_open_stream;
 
                 // CEP-22: intercept oversized-transfer frames before request
                 // correlation/dispatch. A disabled server forwards raw progress
@@ -1469,6 +1854,34 @@ impl NostrServerTransport {
                                 &event_routes,
                                 &request_wrap_kinds,
                                 &tx,
+                                &open_stream,
+                            )
+                            .await;
+                            continue;
+                        }
+                    }
+                }
+
+                // CEP-41: intercept open-stream frames beside the oversized branch.
+                // Type-disjoint from oversized (`is_open_stream_frame` vs
+                // `is_oversized_frame` claim distinct `cvm.type`s), so order is
+                // irrelevant. A disabled server forwards the raw notification.
+                if open_stream.enabled {
+                    if let JsonRpcMessage::Notification(ref n) = mcp_msg {
+                        if OpenStreamReceiver::is_open_stream_frame(n) {
+                            drop(sessions_w);
+                            Self::handle_open_stream_frame(
+                                &open_stream,
+                                &relay_pool,
+                                encryption_mode,
+                                gift_wrap_mode,
+                                n,
+                                &sender_pubkey,
+                                &event_id,
+                                is_encrypted,
+                                is_gift_wrap,
+                                outer_kind,
+                                client_supports_open_stream,
                             )
                             .await;
                             continue;
@@ -1517,6 +1930,11 @@ impl NostrServerTransport {
                         );
                     }
 
+                    // CEP-41: capture the route fields for the writer's snapshot
+                    // BEFORE they are moved into the route store.
+                    let writer_request_id = original_id.clone();
+                    let writer_token = progress_token.clone();
+
                     event_routes
                         .register(
                             event_id.clone(),
@@ -1525,6 +1943,27 @@ impl NostrServerTransport {
                             progress_token,
                         )
                         .await;
+
+                    // CEP-41: a `tools/call` carrying a progressToken gets a
+                    // server→client writer, captured with a route snapshot (so the
+                    // deferred response survives a route sweep) and injected into
+                    // the tool via the rmcp request extensions.
+                    if open_stream.enabled && req.method == "tools/call" {
+                        if let Some(token) = writer_token {
+                            Self::create_open_stream_writer(
+                                &open_stream,
+                                &relay_pool,
+                                encryption_mode,
+                                gift_wrap_mode,
+                                &event_id,
+                                &sender_pubkey,
+                                &token,
+                                writer_request_id,
+                                is_encrypted,
+                                if is_gift_wrap { Some(outer_kind) } else { None },
+                            );
+                        }
+                    }
                 } else {
                     drop(sessions_w);
                 }
@@ -1574,6 +2013,7 @@ impl NostrServerTransport {
         event_routes: &ServerEventRouteStore,
         request_wrap_kinds: &Arc<RwLock<HashMap<String, Option<u16>>>>,
         tx: &tokio::sync::mpsc::UnboundedSender<IncomingRequest>,
+        open_stream: &ServerOpenStreamState,
     ) {
         // The outer progressToken keys the transfer (needed for accept + route).
         // String or number — defensive only: every known sender stringifies
@@ -1646,6 +2086,20 @@ impl NostrServerTransport {
             // The `end` frame: reassembled request ready to dispatch.
             Ok(Some(message)) => {
                 let original_id = message.id().cloned().unwrap_or(serde_json::Value::Null);
+                // CEP-41: extract the writer info from the reassembled `tools/call`
+                // before `message` is moved. The oversized reassembly path bypasses
+                // the regular request path, so the writer must be created HERE too
+                // (mirrors TS `handleIncomingRequest`, which oversized re-enters).
+                let writer_token = match &message {
+                    JsonRpcMessage::Request(req) if req.method == "tools/call" => req
+                        .params
+                        .as_ref()
+                        .and_then(|p| p.get("_meta"))
+                        .and_then(|m| m.get("progressToken"))
+                        .and_then(progress_token_string),
+                    _ => None,
+                };
+                let writer_request_id = original_id.clone();
                 // Mirror the incoming wrap kind for the eventual response (CEP-19).
                 {
                     let mut kinds_w = request_wrap_kinds.write().await;
@@ -1662,6 +2116,22 @@ impl NostrServerTransport {
                         token,
                     )
                     .await;
+                if open_stream.enabled {
+                    if let Some(progress_token) = writer_token {
+                        Self::create_open_stream_writer(
+                            open_stream,
+                            relay_pool,
+                            encryption_mode,
+                            gift_wrap_mode,
+                            event_id,
+                            sender_pubkey,
+                            &progress_token,
+                            writer_request_id,
+                            is_encrypted,
+                            if is_gift_wrap { Some(outer_kind) } else { None },
+                        );
+                    }
+                }
                 let _ = tx.send(IncomingRequest {
                     message,
                     client_pubkey: sender_pubkey.to_string(),
@@ -1743,6 +2213,440 @@ impl NostrServerTransport {
                 sender_pubkey = %sender_pubkey,
                 "Failed to send oversized-transfer accept frame"
             );
+        }
+    }
+
+    /// CEP-41: create a server→client [`OpenStreamWriter`] for a `tools/call`
+    /// carrying a `progressToken`, capture its [`RouteSnapshot`], register the
+    /// `progress_token → event_id` index, and store the slot. The writer is later
+    /// injected into the tool via the rmcp request `extensions`; its
+    /// close/abort hooks flush the deferred final response from the snapshot.
+    #[allow(clippy::too_many_arguments)]
+    fn create_open_stream_writer(
+        state: &ServerOpenStreamState,
+        relay_pool: &Arc<dyn RelayPoolTrait>,
+        encryption_mode: EncryptionMode,
+        gift_wrap_mode: GiftWrapMode,
+        event_id: &str,
+        client_pubkey_hex: &str,
+        progress_token: &str,
+        original_request_id: serde_json::Value,
+        is_encrypted: bool,
+        mirrored_wrap_kind: Option<u16>,
+    ) {
+        let client_pubkey = match PublicKey::from_hex(client_pubkey_hex) {
+            Ok(pk) => pk,
+            Err(_) => return,
+        };
+        let event_id_parsed = match EventId::from_hex(event_id) {
+            Ok(id) => id,
+            Err(_) => return,
+        };
+        let gift_wrap_kind =
+            Self::select_outbound_gift_wrap_kind(gift_wrap_mode, is_encrypted, mirrored_wrap_kind);
+
+        // Publish closure: every frame is e-tagged to the request event (so the
+        // client can keep its pending correlation alive) and mirrors the inbound
+        // gift-wrap kind (CEP-19). `send_notification`'s one-shot discovery tags
+        // are not replayed — they already rode the initialize response / stream
+        // start by the time a tool streams.
+        let publish_relay_pool = Arc::clone(relay_pool);
+        let publish_frame: PublishFrame = Arc::new(move |notification: JsonRpcNotification| {
+            let relay_pool = Arc::clone(&publish_relay_pool);
+            Box::pin(async move {
+                let base = BaseTransport {
+                    relay_pool,
+                    encryption_mode,
+                    is_connected: true,
+                };
+                let tags = BaseTransport::create_response_tags(&client_pubkey, &event_id_parsed);
+                let message = JsonRpcMessage::Notification(notification);
+                base.send_mcp_message(
+                    &message,
+                    &client_pubkey,
+                    CTXVM_MESSAGES_KIND,
+                    tags,
+                    Some(is_encrypted),
+                    gift_wrap_kind,
+                )
+                .await
+            })
+        });
+
+        // Terminal hooks flush any deferred final response from the snapshot.
+        let on_close: OnCloseHook = {
+            let state = state.clone();
+            let relay_pool = Arc::clone(relay_pool);
+            let event_id = event_id.to_string();
+            Arc::new(move || {
+                let state = state.clone();
+                let relay_pool = Arc::clone(&relay_pool);
+                let event_id = event_id.clone();
+                Box::pin(async move {
+                    let base = BaseTransport {
+                        relay_pool,
+                        encryption_mode,
+                        is_connected: true,
+                    };
+                    Self::flush_open_stream_response(&state, &base, gift_wrap_mode, &event_id)
+                        .await;
+                })
+            })
+        };
+        let on_abort: OnAbortHook = {
+            let state = state.clone();
+            let relay_pool = Arc::clone(relay_pool);
+            let event_id = event_id.to_string();
+            Arc::new(move |_reason| {
+                let state = state.clone();
+                let relay_pool = Arc::clone(&relay_pool);
+                let event_id = event_id.clone();
+                Box::pin(async move {
+                    let base = BaseTransport {
+                        relay_pool,
+                        encryption_mode,
+                        is_connected: true,
+                    };
+                    Self::flush_open_stream_response(&state, &base, gift_wrap_mode, &event_id)
+                        .await;
+                })
+            })
+        };
+
+        let writer = OpenStreamWriter::new(OpenStreamWriterOptions {
+            progress_token: progress_token.to_string(),
+            publish_frame,
+            content_type: None,
+            on_close: Some(on_close),
+            on_abort: Some(on_abort),
+        });
+        let snapshot = RouteSnapshot {
+            client_pubkey,
+            original_request_id,
+            is_encrypted,
+            mirrored_wrap_kind,
+        };
+        state.lock_slots().insert(
+            event_id.to_string(),
+            OpenStreamSlot {
+                writer,
+                snapshot,
+                pending_response: None,
+                terminated: false,
+            },
+        );
+        state
+            .lock_token_index()
+            .insert(progress_token.to_string(), event_id.to_string());
+    }
+
+    /// CEP-41 inbound interception (beside the oversized branch). Routes control
+    /// frames to the active writer (`ping → pong`, `abort → abort`) and otherwise
+    /// drives the server-as-reader engine (`start`/`pong`/`chunk`/`close`).
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_open_stream_frame(
+        state: &ServerOpenStreamState,
+        relay_pool: &Arc<dyn RelayPoolTrait>,
+        encryption_mode: EncryptionMode,
+        gift_wrap_mode: GiftWrapMode,
+        notification: &JsonRpcNotification,
+        sender_pubkey: &str,
+        event_id: &str,
+        is_encrypted: bool,
+        is_gift_wrap: bool,
+        outer_kind: u16,
+        client_supports_open_stream: bool,
+    ) {
+        let token = notification
+            .params
+            .as_ref()
+            .and_then(|p| p.get("progressToken"))
+            .and_then(progress_token_string);
+        // An active server→client writer owns this token's control frames.
+        let writer = token
+            .as_deref()
+            .and_then(|t| state.event_id_for_token(t))
+            .and_then(|eid| state.writer_for(&eid));
+
+        match open_stream_frame_from_notification(notification) {
+            Some(OpenStreamFrame::Ping { nonce }) => {
+                if let Some(writer) = writer {
+                    let _ = writer.pong(nonce).await;
+                } else {
+                    Self::feed_open_stream_reader(
+                        state,
+                        relay_pool,
+                        encryption_mode,
+                        gift_wrap_mode,
+                        notification,
+                        sender_pubkey,
+                        event_id,
+                        is_encrypted,
+                        is_gift_wrap,
+                        outer_kind,
+                    )
+                    .await;
+                }
+            }
+            Some(OpenStreamFrame::Abort { reason }) => {
+                if let Some(writer) = writer {
+                    let _ = writer.abort(reason).await;
+                } else {
+                    Self::feed_open_stream_reader(
+                        state,
+                        relay_pool,
+                        encryption_mode,
+                        gift_wrap_mode,
+                        notification,
+                        sender_pubkey,
+                        event_id,
+                        is_encrypted,
+                        is_gift_wrap,
+                        outer_kind,
+                    )
+                    .await;
+                }
+            }
+            Some(OpenStreamFrame::Start { .. }) => {
+                Self::feed_open_stream_reader(
+                    state,
+                    relay_pool,
+                    encryption_mode,
+                    gift_wrap_mode,
+                    notification,
+                    sender_pubkey,
+                    event_id,
+                    is_encrypted,
+                    is_gift_wrap,
+                    outer_kind,
+                )
+                .await;
+                // Stateless accept: only for clients that advertised support.
+                if client_supports_open_stream {
+                    if let Some(token) = token.as_deref() {
+                        Self::publish_open_stream_control_frame(
+                            state,
+                            relay_pool,
+                            encryption_mode,
+                            gift_wrap_mode,
+                            OpenStreamFrame::Accept,
+                            token,
+                            sender_pubkey,
+                            event_id,
+                            is_encrypted,
+                            is_gift_wrap,
+                            outer_kind,
+                        )
+                        .await;
+                    }
+                }
+            }
+            // pong / chunk / close / accept → server-as-reader engine.
+            _ => {
+                Self::feed_open_stream_reader(
+                    state,
+                    relay_pool,
+                    encryption_mode,
+                    gift_wrap_mode,
+                    notification,
+                    sender_pubkey,
+                    event_id,
+                    is_encrypted,
+                    is_gift_wrap,
+                    outer_kind,
+                )
+                .await;
+            }
+        }
+    }
+
+    /// CEP-41 server-as-reader: feed an inbound frame to this peer's reader engine
+    /// (created on demand) and publish a `pong` if its session asks for one.
+    #[allow(clippy::too_many_arguments)]
+    async fn feed_open_stream_reader(
+        state: &ServerOpenStreamState,
+        relay_pool: &Arc<dyn RelayPoolTrait>,
+        encryption_mode: EncryptionMode,
+        gift_wrap_mode: GiftWrapMode,
+        notification: &JsonRpcNotification,
+        sender_pubkey: &str,
+        event_id: &str,
+        is_encrypted: bool,
+        is_gift_wrap: bool,
+        outer_kind: u16,
+    ) {
+        let outcome = {
+            let mut store = state.receiver.lock().await;
+            if !store.contains(sender_pubkey) {
+                store.put(
+                    sender_pubkey.to_string(),
+                    OpenStreamReceiver::with_policy(state.policy),
+                );
+            }
+            let receiver = store
+                .get_mut(sender_pubkey)
+                .expect("open-stream receiver present after insert");
+            receiver.process_frame(notification).await
+        };
+        match outcome {
+            Ok(FrameOutcome::SendPong(nonce)) => {
+                if let Some(token) = notification
+                    .params
+                    .as_ref()
+                    .and_then(|p| p.get("progressToken"))
+                    .and_then(progress_token_string)
+                {
+                    Self::publish_open_stream_control_frame(
+                        state,
+                        relay_pool,
+                        encryption_mode,
+                        gift_wrap_mode,
+                        OpenStreamFrame::Pong { nonce },
+                        &token,
+                        sender_pubkey,
+                        event_id,
+                        is_encrypted,
+                        is_gift_wrap,
+                        outer_kind,
+                    )
+                    .await;
+                }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(
+                    target: LOG_TARGET,
+                    error = %error,
+                    sender_pubkey = %sender_pubkey,
+                    "Inbound open-stream frame rejected by server reader engine"
+                );
+            }
+        }
+    }
+
+    /// CEP-41: publish one server→client control frame (`accept`/`pong`/`ping`) on
+    /// the server-as-reader path, e-tagged to `correlated_event_id` and mirroring
+    /// the inbound gift-wrap kind.
+    #[allow(clippy::too_many_arguments)]
+    async fn publish_open_stream_control_frame(
+        state: &ServerOpenStreamState,
+        relay_pool: &Arc<dyn RelayPoolTrait>,
+        encryption_mode: EncryptionMode,
+        gift_wrap_mode: GiftWrapMode,
+        frame: OpenStreamFrame,
+        token: &str,
+        recipient_pubkey: &str,
+        correlated_event_id: &str,
+        is_encrypted: bool,
+        is_gift_wrap: bool,
+        outer_kind: u16,
+    ) {
+        let recipient = match PublicKey::from_hex(recipient_pubkey) {
+            Ok(pk) => pk,
+            Err(_) => return,
+        };
+        let progress = state.next_control_progress();
+        let notification = match frame.into_progress_notification(token, progress, None) {
+            Ok(n) => n,
+            Err(error) => {
+                tracing::error!(
+                    target: LOG_TARGET,
+                    error = %error,
+                    "Failed to build open-stream control frame"
+                );
+                return;
+            }
+        };
+        let mut tags = BaseTransport::create_recipient_tags(&recipient);
+        if let Ok(eid) = EventId::from_hex(correlated_event_id) {
+            tags.push(Tag::event(eid));
+        }
+        let base = BaseTransport {
+            relay_pool: Arc::clone(relay_pool),
+            encryption_mode,
+            is_connected: true,
+        };
+        let gift_wrap_kind = Self::select_outbound_gift_wrap_kind(
+            gift_wrap_mode,
+            is_encrypted,
+            if is_gift_wrap { Some(outer_kind) } else { None },
+        );
+        if let Err(error) = base
+            .send_mcp_message(
+                &JsonRpcMessage::Notification(notification),
+                &recipient,
+                CTXVM_MESSAGES_KIND,
+                tags,
+                Some(is_encrypted),
+                gift_wrap_kind,
+            )
+            .await
+        {
+            tracing::warn!(
+                target: LOG_TARGET,
+                error = %error,
+                "Failed to publish open-stream control frame"
+            );
+        }
+    }
+
+    /// CEP-41: one keepalive sweep over the server-as-reader sessions (mirrors
+    /// [`sweep_oversized_receivers`]). Drives each session's pure `tick`: idle →
+    /// publish `ping`; probe/grace deadline → the reader aborted, so abort the
+    /// paired writer too if one exists. Drops now-empty peer receivers.
+    async fn sweep_open_stream_sessions(
+        state: &ServerOpenStreamState,
+        relay_pool: &Arc<dyn RelayPoolTrait>,
+        encryption_mode: EncryptionMode,
+        gift_wrap_mode: GiftWrapMode,
+    ) {
+        let now = Instant::now();
+        let mut actions: Vec<(String, String, KeepaliveAction)> = Vec::new();
+        {
+            let mut store = state.receiver.lock().await;
+            let mut empty_peers = Vec::new();
+            for (peer, receiver) in store.iter_mut() {
+                for (token, action) in receiver.registry_mut().tick_all(now) {
+                    actions.push((peer.clone(), token, action));
+                }
+                if receiver.active_stream_count() == 0 {
+                    empty_peers.push(peer.clone());
+                }
+            }
+            for peer in empty_peers {
+                store.pop(&peer);
+            }
+        }
+
+        let probe_is_encrypted = encryption_mode != EncryptionMode::Disabled;
+        for (peer, token, action) in actions {
+            match action {
+                KeepaliveAction::SendPing(nonce) => {
+                    let correlated = state.event_id_for_token(&token).unwrap_or_default();
+                    Self::publish_open_stream_control_frame(
+                        state,
+                        relay_pool,
+                        encryption_mode,
+                        gift_wrap_mode,
+                        OpenStreamFrame::Ping { nonce },
+                        &token,
+                        &peer,
+                        &correlated,
+                        probe_is_encrypted,
+                        false,
+                        0,
+                    )
+                    .await;
+                }
+                KeepaliveAction::Abort(reason) => {
+                    if let Some(eid) = state.event_id_for_token(&token) {
+                        if let Some(writer) = state.writer_for(&eid) {
+                            let _ = writer.abort(Some(reason)).await;
+                        }
+                    }
+                }
+                KeepaliveAction::None => {}
+            }
         }
     }
 
@@ -2483,5 +3387,235 @@ mod tests {
         session.supports_oversized_transfer |=
             oversized_enabled && discovered.supports_oversized_transfer;
         assert!(session.supports_oversized_transfer);
+    }
+
+    // ── CEP-41 open-stream capability advertisement ─────────────
+
+    #[test]
+    fn test_open_stream_support_tags_helper() {
+        // Opted out → no tag; enabled (the default) → the single-element tag.
+        assert!(
+            open_stream_support_tags(&OpenStreamConfig::default().with_enabled(false)).is_empty()
+        );
+        let names = first_tag_values(&open_stream_support_tags(&OpenStreamConfig::enabled()));
+        assert_eq!(names, vec!["support_open_stream"]);
+    }
+
+    #[test]
+    fn test_internal_common_capability_tags_merges_both() {
+        let config = NostrServerTransportConfig::default()
+            .with_oversized_enabled(true)
+            .with_open_stream(OpenStreamConfig::enabled());
+        let names = first_tag_values(&internal_common_capability_tags(&config));
+        assert!(names.contains(&"support_oversized_transfer".to_string()));
+        assert!(names.contains(&"support_open_stream".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_announcement_includes_open_stream_tag_when_enabled() {
+        let config = NostrServerTransportConfig {
+            open_stream: OpenStreamConfig::enabled(),
+            ..Default::default()
+        };
+        let pool: Arc<dyn RelayPoolTrait> = Arc::new(crate::relay::mock::MockRelayPool::new());
+        let server = NostrServerTransport::with_relay_pool(config, pool)
+            .await
+            .expect("server transport construction");
+        let names = first_tag_values(&server.announcement_manager.get_common_tags());
+        assert!(
+            names.contains(&"support_open_stream".to_string()),
+            "announcement must advertise open-stream support when enabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_announcement_omits_open_stream_tag_when_disabled() {
+        // Explicitly opt out (the default is now enabled).
+        let config = NostrServerTransportConfig::default()
+            .with_open_stream(OpenStreamConfig::default().with_enabled(false));
+        let pool: Arc<dyn RelayPoolTrait> = Arc::new(crate::relay::mock::MockRelayPool::new());
+        let server = NostrServerTransport::with_relay_pool(config, pool)
+            .await
+            .expect("server transport construction");
+        let names = first_tag_values(&server.announcement_manager.get_common_tags());
+        assert!(!names.contains(&"support_open_stream".to_string()));
+    }
+
+    #[test]
+    fn test_server_learns_client_open_stream_only_when_enabled() {
+        let open_stream_tag = Tag::custom(
+            TagKind::Custom(tags::SUPPORT_OPEN_STREAM.into()),
+            Vec::<String>::new(),
+        );
+        let discovered = learn_peer_capabilities(&[open_stream_tag]);
+        assert!(discovered.supports_open_stream);
+
+        // Disabled server: the client flag is ignored.
+        let mut session = ClientSession::new(false);
+        let open_stream_enabled = false;
+        session.supports_open_stream |= open_stream_enabled && discovered.supports_open_stream;
+        assert!(!session.supports_open_stream);
+
+        // Enabled server: the client flag is learned.
+        let open_stream_enabled = true;
+        session.supports_open_stream |= open_stream_enabled && discovered.supports_open_stream;
+        assert!(session.supports_open_stream);
+    }
+
+    // ── CEP-41 response deferral (try_defer_open_stream_response) ───────
+
+    /// A no-op writer (publishes nothing) for exercising the deferral decision.
+    fn deferral_test_writer(token: &str) -> OpenStreamWriter {
+        let publish_frame: PublishFrame = Arc::new(|_frame: JsonRpcNotification| {
+            Box::pin(async move { Ok(EventId::all_zeros()) })
+        });
+        OpenStreamWriter::new(OpenStreamWriterOptions {
+            progress_token: token.to_string(),
+            publish_frame,
+            content_type: None,
+            on_close: None,
+            on_abort: None,
+        })
+    }
+
+    /// Install a writer slot + `token → event_id` index entry, mirroring
+    /// `create_open_stream_writer`.
+    fn install_slot(
+        state: &ServerOpenStreamState,
+        event_id: &str,
+        writer: OpenStreamWriter,
+        terminated: bool,
+    ) {
+        let token = writer.progress_token().to_string();
+        let snapshot = RouteSnapshot {
+            client_pubkey: Keys::generate().public_key(),
+            original_request_id: serde_json::json!(1),
+            is_encrypted: false,
+            mirrored_wrap_kind: None,
+        };
+        state.lock_slots().insert(
+            event_id.to_string(),
+            OpenStreamSlot {
+                writer,
+                snapshot,
+                pending_response: None,
+                terminated,
+            },
+        );
+        state.lock_token_index().insert(token, event_id.to_string());
+    }
+
+    fn dummy_response() -> JsonRpcMessage {
+        JsonRpcMessage::Response(JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: serde_json::json!(1),
+            result: serde_json::json!({ "ok": true }),
+        })
+    }
+
+    #[tokio::test]
+    async fn try_defer_open_stream_response_branch_coverage() {
+        let config = NostrServerTransportConfig::default()
+            .with_open_stream(OpenStreamConfig::default().with_enabled(true));
+        let pool: Arc<dyn RelayPoolTrait> = Arc::new(MockRelayPool::new());
+        let transport = NostrServerTransport::with_relay_pool(config, pool)
+            .await
+            .expect("server transport");
+
+        // No slot for the event (`slots.get_mut` is None) → Passthrough.
+        assert!(matches!(
+            transport.try_defer_open_stream_response("evt-none", dummy_response()),
+            OpenStreamDeferral::Passthrough(_)
+        ));
+
+        // `!writer.has_started()` — writer created (progressToken present) but the
+        // tool never streamed → drop the writer and Passthrough. The slot AND the
+        // token index entry must both be removed so the unused writer cannot leak.
+        install_slot(
+            &transport.open_stream,
+            "evt-unstarted",
+            deferral_test_writer("tok-unstarted"),
+            false,
+        );
+        assert!(matches!(
+            transport.try_defer_open_stream_response("evt-unstarted", dummy_response()),
+            OpenStreamDeferral::Passthrough(_)
+        ));
+        assert!(
+            transport
+                .open_stream
+                .lock_slots()
+                .get("evt-unstarted")
+                .is_none(),
+            "unstarted writer slot must be removed (no leak)"
+        );
+        assert!(
+            transport
+                .open_stream
+                .lock_token_index()
+                .get("tok-unstarted")
+                .is_none(),
+            "unstarted writer token index must be removed (no leak)"
+        );
+
+        // `slot.terminated` (the function's "Ordering B") — started writer whose
+        // stream already closed/aborted → deliver now from the snapshot (SendNow);
+        // the slot + token index are freed.
+        let terminal = deferral_test_writer("tok-terminal");
+        terminal.start().await.expect("start");
+        install_slot(&transport.open_stream, "evt-terminal", terminal, true);
+        assert!(matches!(
+            transport.try_defer_open_stream_response("evt-terminal", dummy_response()),
+            OpenStreamDeferral::SendNow { .. }
+        ));
+        assert!(transport
+            .open_stream
+            .lock_slots()
+            .get("evt-terminal")
+            .is_none());
+        assert!(transport
+            .open_stream
+            .lock_token_index()
+            .get("tok-terminal")
+            .is_none());
+
+        // `else` of `slot.terminated` (the function's "Ordering A") — started
+        // writer, stream still open → Deferred. The response is stashed and the
+        // slot retained for the close/abort hook to flush.
+        let open = deferral_test_writer("tok-open");
+        open.start().await.expect("start");
+        install_slot(&transport.open_stream, "evt-open", open, false);
+        assert!(matches!(
+            transport.try_defer_open_stream_response("evt-open", dummy_response()),
+            OpenStreamDeferral::Deferred
+        ));
+        {
+            let slots = transport.open_stream.lock_slots();
+            let slot = slots.get("evt-open").expect("deferred slot retained");
+            assert!(
+                slot.pending_response.is_some(),
+                "the deferred response must be stashed for the hook to flush"
+            );
+        }
+
+        // Disabled gate — a server with open-stream disabled never exposes a
+        // writer, so `send_response` never reaches the deferral decision at all.
+        let disabled = NostrServerTransport::with_relay_pool(
+            NostrServerTransportConfig::default()
+                .with_open_stream(OpenStreamConfig::default().with_enabled(false)),
+            Arc::new(MockRelayPool::new()) as Arc<dyn RelayPoolTrait>,
+        )
+        .await
+        .expect("disabled server transport");
+        install_slot(
+            &disabled.open_stream,
+            "evt-disabled",
+            deferral_test_writer("tok-disabled"),
+            false,
+        );
+        assert!(
+            disabled.get_open_stream_writer("evt-disabled").is_none(),
+            "a disabled server must not expose writers (deferral never attempted)"
+        );
     }
 }

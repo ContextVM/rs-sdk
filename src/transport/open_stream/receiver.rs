@@ -143,4 +143,39 @@ mod tests {
         receiver.process_frame(&close).await.unwrap();
         assert_eq!(receiver.active_stream_count(), 0);
     }
+
+    #[tokio::test]
+    async fn non_open_stream_progress_notification_is_not_intercepted() {
+        let mut receiver = OpenStreamReceiver::new();
+
+        // A CEP-22 oversized-transfer frame and a plain progress notification are
+        // both NOT open-stream frames — the two receivers are type-disjoint.
+        let oversized = JsonRpcNotification {
+            jsonrpc: "2.0".to_string(),
+            method: "notifications/progress".to_string(),
+            params: Some(json!({
+                "progressToken": "tok",
+                "progress": 1,
+                "cvm": { "type": "oversized-transfer", "frameType": "end" }
+            })),
+        };
+        let plain = JsonRpcNotification {
+            jsonrpc: "2.0".to_string(),
+            method: "notifications/progress".to_string(),
+            params: Some(json!({ "progressToken": "tok", "progress": 1 })),
+        };
+
+        for notification in [&oversized, &plain] {
+            assert!(!OpenStreamReceiver::is_open_stream_frame(notification));
+            // The dispatcher only feeds the registry when the predicate is true.
+            // Mirror that gate: a non-open-stream frame must never be processed.
+            if OpenStreamReceiver::is_open_stream_frame(notification) {
+                receiver.process_frame(notification).await.unwrap();
+            }
+        }
+
+        // Neither frame reached the registry — no session was created/tracked.
+        assert_eq!(receiver.active_stream_count(), 0);
+        assert!(receiver.get_session("tok").is_none());
+    }
 }

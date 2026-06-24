@@ -8,6 +8,7 @@ use crate::core::error::Result;
 use crate::core::types::{JsonRpcMessage, JsonRpcNotification, JsonRpcRequest};
 use crate::transport::client::{NostrClientTransport, NostrClientTransportConfig};
 use crate::transport::server::{NostrServerTransport, NostrServerTransportConfig};
+use rmcp::model::GetExtensions;
 use rmcp::transport::worker::{Worker, WorkerContext, WorkerQuitReason};
 use std::collections::HashSet;
 
@@ -204,7 +205,20 @@ impl Worker for NostrServerWorker {
                         }
                     }
 
-                    if let Some(rmcp_msg) = internal_to_rmcp_server_rx(&message) {
+                    if let Some(mut rmcp_msg) = internal_to_rmcp_server_rx(&message) {
+                        // CEP-41: inject the open-stream writer into the
+                        // request's `extensions` typemap so the tool handler can
+                        // reach it via `ctx.extensions.get::<OpenStreamWriter>()`.
+                        // The rmcp service loop swaps these extensions straight into
+                        // the handler's `RequestContext` before dispatch. No-op when
+                        // open-stream is disabled or the request has no writer.
+                        if let rmcp::model::JsonRpcMessage::Request(ref mut jr) = rmcp_msg {
+                            if let Some(writer) =
+                                self.transport.get_open_stream_writer(&event_id)
+                            {
+                                jr.request.extensions_mut().insert(writer);
+                            }
+                        }
                         if let Err(reason) = context.send_to_handler(rmcp_msg).await {
                             break reason;
                         }
