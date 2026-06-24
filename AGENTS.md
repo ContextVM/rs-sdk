@@ -199,8 +199,15 @@ These are part of the public ABI; **never** change them in a patch release:
 # Build the bindings library
 cargo build --release -p contextvm-ffi
 
-# Generate UniFFI language bindings (needs uniffi-bindgen-cli 0.29)
-uniffi-bindgen generate target/debug/libcontextvm_ffi.so \
+# Generate UniFFI language bindings. The CLI is `publish = false` in Mozilla's
+# repo, so install from git at the tag matching the runtime `uniffi` version in
+# contextvm-ffi/Cargo.toml. As of uniffi 0.30 the binary is `uniffi-bindgen-cli`
+# (it was `uniffi-bindgen` in 0.29). The generated file MUST be paired with a
+# library built from the same release: UniFFI embeds a contract version +
+# per-function checksums checked at import time.
+cargo install --git https://github.com/mozilla/uniffi-rs \
+    --tag v0.31.2 uniffi-bindgen-cli --locked
+uniffi-bindgen-cli generate target/debug/libcontextvm_ffi.so \
   --library --language python --out-dir python/   # or kotlin / swift
 
 # C test suite — verifies the hand-written header matches Rust signatures

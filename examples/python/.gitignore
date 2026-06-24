@@ -1,0 +1,8 @@
+# Native library and generated binding are release artifacts, not source.
+# Obtain them per README.md and drop them in this directory to run the examples.
+/libcontextvm_ffi.so
+/libcontextvm_ffi.dylib
+/contextvm_ffi.dll
+/contextvm_ffi.py
+__pycache__/
+*.pyc

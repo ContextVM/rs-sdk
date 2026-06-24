@@ -26,20 +26,29 @@ Outputs:
 ## Generate UniFFI Bindings
 
 Build the shared library first, then generate bindings from the compiled
-library metadata using `uniffi-bindgen` 0.29.x:
+library metadata. The bindgen version **must match** the runtime `uniffi`
+version in `Cargo.toml` — UniFFI embeds a contract version and per-function
+checksums into both the library and the generated file, and a mismatch aborts
+at import time (`UniFFI ... mismatch`).
+
+The bindgen CLI is not published to crates.io; install it from git, pinned to
+the tag matching your runtime version (`0.31.x` here):
 
 ```bash
 cd contextvm-ffi
 cargo build
 
-uniffi-bindgen generate target/debug/libcontextvm_ffi.so \
+cargo install --git https://github.com/mozilla/uniffi-rs --tag v0.31.2 uniffi-bindgen-cli --locked
+
+uniffi-bindgen-cli generate target/debug/libcontextvm_ffi.so \
   --library \
-  --crate contextvm_ffi \
   --language python \
   --out-dir python/
 ```
 
 Use `--language kotlin` or `--language swift` for the other supported targets.
+The generated Python file expects the native library (`libcontextvm_ffi.so` /
+`.dylib` / `contextvm_ffi.dll`) to sit **next to it** at import time.
 
 ## C API
 

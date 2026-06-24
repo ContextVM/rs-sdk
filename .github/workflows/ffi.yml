@@ -144,18 +144,23 @@ jobs:
           key: ffi-bindings
       - name: Build FFI library (for embedded metadata)
         run: cargo build -p contextvm-ffi
-      # UniFFI 0.29.x never published the bindgen CLI to crates.io (the crate
-      # is `publish = false` in the Mozilla repo). Install from git, pinned to
-      # the tag that matches the runtime `uniffi = "0.29"` metadata format.
-      # Produces a binary named `uniffi-bindgen`.
-      - name: Install uniffi-bindgen
-        run: cargo install --git https://github.com/mozilla/uniffi-rs --tag v0.29.5 uniffi-bindgen-cli --locked
+      # The bindgen CLI is `publish = false` in Mozilla's repo, so it is not
+      # on crates.io for any 0.2x/0.3x release. Install from git, pinned to the
+      # tag that matches the runtime `uniffi` dependency in
+      # contextvm-ffi/Cargo.toml. The two MUST stay in lockstep: UniFFI embeds a
+      # contract version + per-function checksums into both the compiled library
+      # and the generated language file, and a mismatch aborts at import time
+      # (`InternalError("UniFFI ... mismatch")`). As of 0.30 the example app
+      # installs a binary named `uniffi-bindgen-cli` (it was `uniffi-bindgen`
+      # in 0.29).
+      - name: Install uniffi-bindgen-cli
+        run: cargo install --git https://github.com/mozilla/uniffi-rs --tag v0.31.2 uniffi-bindgen-cli --locked
       - name: Generate bindings
         run: |
           set -euo pipefail
           LIB=target/debug/libcontextvm_ffi.so
           for lang in python swift kotlin; do
-            uniffi-bindgen generate "$LIB" --library \
+            uniffi-bindgen-cli generate "$LIB" --library \
               --language "$lang" --out-dir "bindings/$lang"
           done
       - uses: actions/upload-artifact@v4
