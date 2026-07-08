@@ -12,7 +12,9 @@ use std::time::Duration;
 use contextvm_sdk::core::types::EncryptionMode;
 use contextvm_sdk::relay::mock::MockRelayPool;
 use contextvm_sdk::transport::client::{NostrClientTransport, NostrClientTransportConfig};
-use contextvm_sdk::transport::server::{NostrServerTransport, NostrServerTransportConfig};
+use contextvm_sdk::transport::server::{
+    ClientPubkey, NostrServerTransport, NostrServerTransportConfig,
+};
 use contextvm_sdk::RelayPoolTrait;
 
 use rmcp::{
@@ -78,6 +80,18 @@ impl DemoServer {
         Ok(CallToolResult::success(vec![Content::text(format!(
             "Total echo calls: {n}"
         ))]))
+    }
+
+    /// Self-check for caller-identity injection: returns the `ClientPubkey` the
+    /// rmcp worker places in request extensions, or `"none"` if absent.
+    #[tool(description = "Return the caller's Nostr pubkey from request extensions")]
+    async fn whoami(&self, ctx: RequestContext<RoleServer>) -> Result<CallToolResult, ErrorData> {
+        let pk = ctx
+            .extensions
+            .get::<ClientPubkey>()
+            .map(|c| c.0.clone())
+            .unwrap_or_else(|| "none".to_string());
+        Ok(CallToolResult::success(vec![Content::text(pk)]))
     }
 }
 
@@ -159,8 +173,9 @@ fn call_params(name: &'static str, args: Option<serde_json::Value>) -> CallToolR
 async fn run_e2e_scenario(mode: EncryptionMode) {
     let (client_pool, server_pool) = MockRelayPool::create_pair();
 
-    // Extract server pubkey before as_pool() takes ownership
+    // Extract pubkeys before as_pool() takes ownership
     let server_pubkey_hex = server_pool.mock_public_key().to_hex();
+    let client_pubkey_hex = client_pool.mock_public_key().to_hex();
 
     let server_transport = NostrServerTransport::with_relay_pool(
         NostrServerTransportConfig::default().with_encryption_mode(mode),
@@ -207,13 +222,25 @@ async fn run_e2e_scenario(mode: EncryptionMode) {
     );
 
     let tools = client.list_all_tools().await.expect("list_all_tools");
-    assert_eq!(tools.len(), 3, "expected 3 tools");
+    assert_eq!(tools.len(), 4, "expected 4 tools");
     let tool_names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
     assert!(tool_names.contains(&"echo"), "missing echo tool");
     assert!(tool_names.contains(&"add"), "missing add tool");
     assert!(
         tool_names.contains(&"get_echo_count"),
         "missing get_echo_count tool"
+    );
+    assert!(tool_names.contains(&"whoami"), "missing whoami tool");
+
+    // ClientPubkey injection: the worker puts the caller's pubkey in extensions.
+    let whoami = client
+        .call_tool(call_params("whoami", None))
+        .await
+        .expect("whoami call");
+    assert_eq!(
+        first_text(&whoami),
+        client_pubkey_hex,
+        "whoami should return the caller's pubkey from request extensions"
     );
 
     let echo1 = client

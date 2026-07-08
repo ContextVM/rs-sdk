@@ -1,5 +1,17 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- `ClientPubkey`: the rmcp server worker now injects the caller's Nostr public
+  key (hex) into every inbound request's `extensions` typemap, so tool/resource/
+  prompt handlers can identify their caller via `ctx.extensions.get::<ClientPubkey>()`.
+  This closes the parity gap with the TS adapter's `extra._meta.clientPubkey`, but
+  uses rmcp's typed extensions (local-only, never on the wire) instead of the
+  `_meta` field, so it is always on rather than opt-in. The inbound event id is
+  already reachable as the rmcp request id (`ctx.id`).
+
 ## [0.2.0] - 2026-06-24
 
 ### Added

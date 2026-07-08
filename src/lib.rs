@@ -83,7 +83,7 @@ pub use transport::discovery_tags::{DiscoveredPeerCapabilities, PeerCapabilities
 
 // ── Transport (server) ──────────────────────────────────────────────
 pub use transport::server::{
-    IncomingRequest, NostrServerTransport, NostrServerTransportConfig, RouteEntry,
+    ClientPubkey, IncomingRequest, NostrServerTransport, NostrServerTransportConfig, RouteEntry,
     ServerEventRouteStore, SessionSnapshot, SessionStore,
 };
 

@@ -166,6 +166,36 @@ after the stream closes. Open-stream is disabled by default; enable it with
 `with_open_stream(OpenStreamConfig::enabled())`. See
 [open-stream.md](open-stream.md) for a full example.
 
+## Identifying the calling client
+
+Every inbound request carries its caller's Nostr public key. The rmcp worker
+injects it into the request `extensions`, so a tool, resource, or prompt handler
+reads it from `ctx.extensions`:
+
+```rust
+use contextvm_sdk::transport::server::ClientPubkey;
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::{CallToolResult, Content, ErrorData};
+use rmcp::service::RequestContext;
+use rmcp::{tool, RoleServer};
+
+#[tool(description = "Echo the caller's pubkey")]
+async fn whoami(
+    &self,
+    ctx: RequestContext<RoleServer>,
+) -> Result<CallToolResult, ErrorData> {
+    let pk = ctx.extensions.get::<ClientPubkey>().map(|c| c.0.clone());
+    Ok(CallToolResult::success(vec![Content::text(pk.unwrap_or_default())]))
+}
+```
+
+`ClientPubkey` lives in `contextvm_sdk::transport::server` (also re-exported at
+the crate root). It is present on every real inbound request, so retrieving it
+never returns `None` for a genuine client call. This mirrors the TS adapter's
+`extra._meta.clientPubkey`, but via rmcp's typed extensions instead of the
+on-wire `_meta` field. The inbound Nostr event id is available separately as
+`ctx.id` (the worker rewrites the request id to the event id).
+
 ## When to use this instead of the gateway
 
 Use this page's approach when you are writing a new Rust MCP server.

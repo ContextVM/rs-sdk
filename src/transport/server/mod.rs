@@ -439,6 +439,29 @@ pub struct IncomingRequest {
     pub is_encrypted: bool,
 }
 
+/// The Nostr public key (hex) of the client that issued the current request.
+///
+/// [`NostrServerWorker`](crate::rmcp_transport::NostrServerWorker) injects this
+/// into every inbound request's rmcp `extensions` typemap, so a tool, resource,
+/// or prompt handler can identify its caller:
+///
+/// ```ignore
+/// use contextvm_sdk::transport::server::ClientPubkey;
+/// use rmcp::service::RequestContext;
+/// use rmcp::RoleServer;
+///
+/// let caller = ctx.extensions.get::<ClientPubkey>().map(|c| c.0.clone());
+/// ```
+///
+/// The value is the raw hex pubkey (the same string as
+/// [`IncomingRequest::client_pubkey`]). It is present on every real inbound
+/// request, unlike `OpenStreamWriter`, which is injected only for open-stream
+/// `tools/call` calls. This is purely a local affordance — it is never
+/// serialized onto the wire. The inbound Nostr event id is available separately
+/// as the rmcp request id (`ctx.id`), which the worker rewrites to the event id.
+#[derive(Debug, Clone)]
+pub struct ClientPubkey(pub String);
+
 impl NostrServerTransport {
     /// Create a new server transport.
     pub async fn new<T>(signer: T, config: NostrServerTransportConfig) -> Result<Self>
