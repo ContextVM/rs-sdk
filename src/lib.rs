@@ -83,8 +83,8 @@ pub use transport::discovery_tags::{DiscoveredPeerCapabilities, PeerCapabilities
 
 // ── Transport (server) ──────────────────────────────────────────────
 pub use transport::server::{
-    ClientPubkey, IncomingRequest, NostrServerTransport, NostrServerTransportConfig, RouteEntry,
-    ServerEventRouteStore, SessionSnapshot, SessionStore,
+    ClientPubkey, InboundEvent, IncomingRequest, NostrServerTransport, NostrServerTransportConfig,
+    RouteEntry, ServerEventRouteStore, SessionSnapshot, SessionStore,
 };
 
 // ── rmcp re-export ──────────────────────────────────────────────────

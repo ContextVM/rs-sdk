@@ -196,6 +196,47 @@ never returns `None` for a genuine client call. This mirrors the TS adapter's
 on-wire `_meta` field. The inbound Nostr event id is available separately as
 `ctx.id` (the worker rewrites the request id to the event id).
 
+## The inbound Nostr event
+
+When a handler needs the **full** client-signed request event — not just the
+pubkey — the worker also injects an `InboundEvent` into `extensions`. This
+exposes the event's `id`, `pubkey`, `sig`, `tags`, …, which matters when a
+handler must bind a tool call to the publishing event, store it for later
+return, or audit it. `sig` in particular is the client's Schnorr signature and
+cannot be reconstructed by the server (it does not hold the client's private
+key), so it has to be threaded through from ingest.
+
+```rust
+use contextvm_sdk::transport::server::InboundEvent;
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::{CallToolResult, Content, ErrorData};
+use rmcp::service::RequestContext;
+use rmcp::{tool, RoleServer};
+
+#[tool(description = "Return the inbound event's id + sig")]
+async fn audit(
+    &self,
+    ctx: RequestContext<RoleServer>,
+) -> Result<CallToolResult, ErrorData> {
+    match ctx.extensions.get::<InboundEvent>() {
+        Some(ev) => Ok(CallToolResult::success(vec![Content::text(format!(
+            "id={} sig={}",
+            ev.0.id.to_hex(),
+            ev.0.sig // Display renders hex
+        ))])),
+        None => Err(ErrorData::invalid_params("no inbound event", None)),
+    }
+}
+```
+
+For gift-wrapped requests this is the **inner**, signature-verified event (the
+same one whose `pubkey` is surfaced as `ClientPubkey`, so `ev.0.pubkey` and
+`ClientPubkey` agree by construction); for plaintext requests it is the outer
+request event. It is injected only for real client requests — synthetic
+transport-internal requests (announcement / initialization drives, CEP-22
+oversized reassembly) carry no event, so `get::<InboundEvent>()` returns `None`
+for them. Like `ClientPubkey`, this is local-only and never touches the wire.
+
 ## When to use this instead of the gateway
 
 Use this page's approach when you are writing a new Rust MCP server.

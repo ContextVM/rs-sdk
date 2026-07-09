@@ -437,6 +437,15 @@ pub struct IncomingRequest {
     pub event_id: String,
     /// Whether the original message was encrypted.
     pub is_encrypted: bool,
+    /// The inbound (client-signed) Nostr event, if this request carried one.
+    ///
+    /// `Some` for real client requests — the inner, signature-verified gift-wrap
+    /// event for encrypted requests, or the outer event for plaintext. `None`
+    /// for requests the transport synthesizes itself (announcement /
+    /// initialization drives, CEP-22 oversized reassembly), which carry no real
+    /// Nostr event. Handlers reach it via [`InboundEvent`] in request
+    /// `extensions`; see that type's docs.
+    pub event: Option<Event>,
 }
 
 /// The Nostr public key (hex) of the client that issued the current request.
@@ -461,6 +470,37 @@ pub struct IncomingRequest {
 /// as the rmcp request id (`ctx.id`), which the worker rewrites to the event id.
 #[derive(Debug, Clone)]
 pub struct ClientPubkey(pub String);
+
+/// The inbound (client-signed) Nostr event for the current request.
+///
+/// Injected into a request's rmcp `extensions` typemap by
+/// [`NostrServerWorker`](crate::rmcp_transport::NostrServerWorker) alongside
+/// [`ClientPubkey`], so a tool, resource, or prompt handler can read the full
+/// signed event — its `id`, `pubkey`, `sig`, … — to bind a tool call to the
+/// publishing event, store it for later return, or audit it:
+///
+/// ```ignore
+/// use contextvm_sdk::transport::server::InboundEvent;
+/// use rmcp::service::RequestContext;
+/// use rmcp::RoleServer;
+///
+/// if let Some(ev) = ctx.extensions.get::<InboundEvent>() {
+///     let sig_hex = ev.0.sig.to_string(); // Schnorr signature, hex
+///     // …
+/// }
+/// ```
+///
+/// For gift-wrapped requests this is the **inner**, signature-verified event
+/// (the same one whose `pubkey` is surfaced as [`ClientPubkey`], so `ev.0.pubkey`
+/// and `ClientPubkey` agree by construction). For plaintext requests it is the
+/// outer request event. It is injected only for real client requests; synthetic
+/// transport-internal requests carry no event, so `extensions.get::<InboundEvent>()`
+/// returns `None` for them. This is purely a local affordance — it is never
+/// serialized onto the wire. The event id is also reachable as the rmcp request
+/// id (`ctx.id`); this type additionally exposes `sig`, which the server cannot
+/// reconstruct without the client's private key.
+#[derive(Debug, Clone)]
+pub struct InboundEvent(pub Event);
 
 impl NostrServerTransport {
     /// Create a new server transport.
@@ -1608,107 +1648,112 @@ impl NostrServerTransport {
                     continue;
                 }
 
-                let (content, sender_pubkey, event_id, is_encrypted, inner_tags) = if is_gift_wrap {
-                    if encryption_mode == EncryptionMode::Disabled {
-                        tracing::warn!(
-                            target: LOG_TARGET,
-                            event_id = %event.id.to_hex(),
-                            sender_pubkey = %event.pubkey.to_hex(),
-                            "Received encrypted message but encryption is disabled"
-                        );
-                        continue;
-                    }
-                    {
-                        let guard = match seen_gift_wrap_ids.lock() {
-                            Ok(g) => g,
-                            Err(poisoned) => poisoned.into_inner(),
-                        };
-                        if guard.contains(&event.id) {
-                            tracing::debug!(
+                let (content, sender_pubkey, event_id, is_encrypted, inner_tags, inbound_event) =
+                    if is_gift_wrap {
+                        if encryption_mode == EncryptionMode::Disabled {
+                            tracing::warn!(
                                 target: LOG_TARGET,
                                 event_id = %event.id.to_hex(),
-                                "Skipping duplicate gift-wrap (outer id)"
+                                sender_pubkey = %event.pubkey.to_hex(),
+                                "Received encrypted message but encryption is disabled"
                             );
                             continue;
                         }
-                    }
-                    // Single-layer NIP-44 decrypt (matches JS/TS SDK)
-                    let signer = match relay_pool.signer().await {
-                        Ok(s) => s,
-                        Err(error) => {
-                            tracing::error!(
-                                target: LOG_TARGET,
-                                error = %error,
-                                "Failed to get signer"
-                            );
-                            continue;
+                        {
+                            let guard = match seen_gift_wrap_ids.lock() {
+                                Ok(g) => g,
+                                Err(poisoned) => poisoned.into_inner(),
+                            };
+                            if guard.contains(&event.id) {
+                                tracing::debug!(
+                                    target: LOG_TARGET,
+                                    event_id = %event.id.to_hex(),
+                                    "Skipping duplicate gift-wrap (outer id)"
+                                );
+                                continue;
+                            }
                         }
-                    };
-                    match encryption::decrypt_gift_wrap_single_layer(&signer, &event).await {
-                        Ok(decrypted_json) => {
-                            // The decrypted content is JSON of the inner signed event.
-                            // Use the INNER event's ID for correlation — the client
-                            // registers the inner event ID in its correlation store.
-                            match serde_json::from_str::<Event>(&decrypted_json) {
-                                Ok(inner) => {
-                                    if let Err(e) = inner.verify() {
-                                        tracing::warn!(
-                                            "Inner event signature verification failed: {e}"
+                        // Single-layer NIP-44 decrypt (matches JS/TS SDK)
+                        let signer = match relay_pool.signer().await {
+                            Ok(s) => s,
+                            Err(error) => {
+                                tracing::error!(
+                                    target: LOG_TARGET,
+                                    error = %error,
+                                    "Failed to get signer"
+                                );
+                                continue;
+                            }
+                        };
+                        match encryption::decrypt_gift_wrap_single_layer(&signer, &event).await {
+                            Ok(decrypted_json) => {
+                                // The decrypted content is JSON of the inner signed event.
+                                // Use the INNER event's ID for correlation — the client
+                                // registers the inner event ID in its correlation store.
+                                match serde_json::from_str::<Event>(&decrypted_json) {
+                                    Ok(inner) => {
+                                        if let Err(e) = inner.verify() {
+                                            tracing::warn!(
+                                                "Inner event signature verification failed: {e}"
+                                            );
+                                            continue;
+                                        }
+                                        {
+                                            let mut guard = match seen_gift_wrap_ids.lock() {
+                                                Ok(g) => g,
+                                                Err(poisoned) => poisoned.into_inner(),
+                                            };
+                                            guard.put(event.id, ());
+                                        }
+                                        let inbound = inner.clone();
+                                        let inner_tags: Vec<Tag> = inner.tags.to_vec();
+                                        (
+                                            inner.content,
+                                            inner.pubkey.to_hex(),
+                                            inner.id.to_hex(),
+                                            true,
+                                            inner_tags,
+                                            Some(inbound),
+                                        )
+                                    }
+                                    Err(error) => {
+                                        tracing::error!(
+                                            target: LOG_TARGET,
+                                            error = %error,
+                                            "Failed to parse inner event"
                                         );
                                         continue;
                                     }
-                                    {
-                                        let mut guard = match seen_gift_wrap_ids.lock() {
-                                            Ok(g) => g,
-                                            Err(poisoned) => poisoned.into_inner(),
-                                        };
-                                        guard.put(event.id, ());
-                                    }
-                                    let inner_tags: Vec<Tag> = inner.tags.to_vec();
-                                    (
-                                        inner.content,
-                                        inner.pubkey.to_hex(),
-                                        inner.id.to_hex(),
-                                        true,
-                                        inner_tags,
-                                    )
-                                }
-                                Err(error) => {
-                                    tracing::error!(
-                                        target: LOG_TARGET,
-                                        error = %error,
-                                        "Failed to parse inner event"
-                                    );
-                                    continue;
                                 }
                             }
+                            Err(error) => {
+                                tracing::error!(
+                                    target: LOG_TARGET,
+                                    error = %error,
+                                    "Failed to decrypt"
+                                );
+                                continue;
+                            }
                         }
-                        Err(error) => {
-                            tracing::error!(
+                    } else {
+                        if encryption_mode == EncryptionMode::Required {
+                            tracing::warn!(
                                 target: LOG_TARGET,
-                                error = %error,
-                                "Failed to decrypt"
+                                sender_pubkey = %event.pubkey.to_hex(),
+                                "Received unencrypted message but encryption is required"
                             );
                             continue;
                         }
-                    }
-                } else {
-                    if encryption_mode == EncryptionMode::Required {
-                        tracing::warn!(
-                            target: LOG_TARGET,
-                            sender_pubkey = %event.pubkey.to_hex(),
-                            "Received unencrypted message but encryption is required"
-                        );
-                        continue;
-                    }
-                    (
-                        event.content.clone(),
-                        event.pubkey.to_hex(),
-                        event.id.to_hex(),
-                        false,
-                        event.tags.to_vec(),
-                    )
-                };
+                        let inbound = (*event).clone();
+                        (
+                            event.content.clone(),
+                            event.pubkey.to_hex(),
+                            event.id.to_hex(),
+                            false,
+                            event.tags.to_vec(),
+                            Some(inbound),
+                        )
+                    };
 
                 // Parse MCP message
                 let mcp_msg = match validation::validate_and_parse(&content) {
@@ -2009,6 +2054,7 @@ impl NostrServerTransport {
                     client_pubkey: sender_pubkey,
                     event_id,
                     is_encrypted,
+                    event: inbound_event,
                 });
             }
         }
@@ -2162,6 +2208,7 @@ impl NostrServerTransport {
                     client_pubkey: sender_pubkey.to_string(),
                     event_id: event_id.to_string(),
                     is_encrypted,
+                    event: None,
                 });
             }
             // Clean up locally, let the peer's own timeout fire.

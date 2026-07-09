@@ -53,6 +53,13 @@ pub struct JsonRpcMessage {
 }
 
 /// An incoming MCP request (server-side).
+///
+/// NOTE: the SDK's `contextvm_sdk::IncomingRequest` also carries an
+/// `event: Option<nostr_sdk::Event>` field (the full client-signed event). It
+/// is intentionally NOT mirrored here: no FFI consumer needs the raw Nostr
+/// event today, and `nostr_sdk::Event` (with its `Tags` collection) is
+/// non-trivial to expose across the C ABI + UniFFI. Add an `Event` mirror and a
+/// field here when a foreign consumer needs `sig` / event binding.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct IncomingRequest {
     pub message: JsonRpcMessage,
@@ -231,6 +238,8 @@ fn incoming_to_uniffi(req: &contextvm_sdk::IncomingRequest) -> IncomingRequest {
         client_pubkey: req.client_pubkey.clone(),
         event_id: req.event_id.clone(),
         is_encrypted: req.is_encrypted,
+        // req.event (the full client-signed Nostr event) is deliberately not
+        // forwarded — see the note on `IncomingRequest` above.
     }
 }
 

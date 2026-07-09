@@ -11,6 +11,22 @@
   uses rmcp's typed extensions (local-only, never on the wire) instead of the
   `_meta` field, so it is always on rather than opt-in. The inbound event id is
   already reachable as the rmcp request id (`ctx.id`).
+- `InboundEvent`: the rmcp server worker now also injects the **full**
+  client-signed Nostr request event into `extensions`, reachable via
+  `ctx.extensions.get::<InboundEvent>()`. For gift-wrapped requests this is the
+  inner, signature-verified event (its `pubkey` matches `ClientPubkey` by
+  construction); for plaintext requests it is the outer event. This exposes
+  `id`, `pubkey`, `sig`, `tags`, … — notably `sig`, which the server cannot
+  reconstruct without the client's private key. Handlers that must bind a tool
+  call to / store / audit the publishing event (e.g. an MLS key-package
+  coordinator returning the publication event) no longer have to fabricate a
+  synthetic event. Injected only for real client requests; synthetic
+  transport-internal requests carry none (`get` returns `None`).
+- `IncomingRequest` gained an `event: Option<nostr_sdk::Event>` field carrying
+  the same event through the channel seam. The FFI mirrors (`FfiIncomingRequest`,
+  the UniFFI `IncomingRequest`) intentionally do not surface it yet (no FFI
+  consumer needs the raw event; mirroring `nostr_sdk::Event` + `Tags` is
+  non-trivial) — the omission is documented in place.
 
 ## [0.2.0] - 2026-06-24
 

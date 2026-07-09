@@ -7,7 +7,9 @@ use crate::core::constants::ANNOUNCEMENT_REQUEST_ID;
 use crate::core::error::Result;
 use crate::core::types::{JsonRpcMessage, JsonRpcNotification, JsonRpcRequest};
 use crate::transport::client::{NostrClientTransport, NostrClientTransportConfig};
-use crate::transport::server::{ClientPubkey, NostrServerTransport, NostrServerTransportConfig};
+use crate::transport::server::{
+    ClientPubkey, InboundEvent, NostrServerTransport, NostrServerTransportConfig,
+};
 use rmcp::model::GetExtensions;
 use rmcp::transport::worker::{Worker, WorkerContext, WorkerQuitReason};
 use std::collections::HashSet;
@@ -148,6 +150,7 @@ impl Worker for NostrServerWorker {
                         mut message,
                         event_id,
                         client_pubkey,
+                        event,
                         ..
                     } = incoming;
 
@@ -221,6 +224,14 @@ impl Worker for NostrServerWorker {
                             jr.request
                                 .extensions_mut()
                                 .insert(ClientPubkey(client_pubkey.clone()));
+                            // Full inbound event (id + sig + pubkey + …) for
+                            // handlers that must bind to / store / audit the
+                            // publishing event. Only real client requests carry
+                            // one; synthetic transport requests have none, so
+                            // handlers see `None` via get() for those.
+                            if let Some(ev) = event {
+                                jr.request.extensions_mut().insert(InboundEvent(ev));
+                            }
                             // CEP-41: no-op when open-stream is disabled or the
                             // request has no writer.
                             if let Some(writer) =
