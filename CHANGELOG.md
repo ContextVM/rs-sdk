@@ -28,6 +28,27 @@
   consumer needs the raw event; mirroring `nostr_sdk::Event` + `Tags` is
   non-trivial) — the omission is documented in place.
 
+### Fixed
+
+- fix(open-stream): abort server writers on silent client disconnect (CEP-41).
+  Server→client `OpenStreamWriter`s leaked when a client silently disappeared
+  (crash/sleep/network drop) without sending `abort`. CEP-41 mandates each peer
+  maintain an idle timeout and probe the other with `ping`/`pong`, but only the
+  reader session ran keepalive timers; a pure producer stream (e.g. a
+  subscription-style tool streaming to a client) was never probed, so a dead
+  client left the writer — and any upstream producer keyed on `is_active()` —
+  alive indefinitely. The writer now arms an idle window once it starts
+  streaming, the server keepalive sweep probes it (mirroring the existing reader
+  sweep, driven by `OpenStreamWriter::tick`), an inbound `pong` for the stream is
+  routed to the writer to clear the probe (`ack_probe`), and a missing `pong`
+  aborts with `"Probe timeout"` (flushing any deferred final response via the
+  existing `on_abort` hook) **and evicts the dead client's session** (CEP-41
+  "release local state", mirroring the TS `handleProbeTimeout`, firing the
+  `SessionStore` eviction callback). Per CEP-41 only inbound frames reset the idle
+  window — a successful `write()` against the relay is not liveness. Reuses the
+  reader `idle_timeout_ms` / `probe_timeout_ms` knobs (one idle/probe pair per
+  stream). This is the rs-sdk port of the TS SDK 0.13.8 fix.
+
 ## [0.2.0] - 2026-06-24
 
 ### Added

@@ -798,7 +798,9 @@ impl NostrServerTransport {
             }
             receivers.clear();
         }
-        self.open_stream.lock_slots().clear();
+        for (_, slot) in self.open_stream.lock_slots().drain() {
+            slot.writer.dispose();
+        }
         self.open_stream.lock_token_index().clear();
         Ok(())
     }
@@ -1612,6 +1614,7 @@ impl NostrServerTransport {
                         &relay_pool,
                         encryption_mode,
                         gift_wrap_mode,
+                        &sessions,
                     )
                     .await;
                     continue;
@@ -2391,6 +2394,13 @@ impl NostrServerTransport {
             content_type: None,
             on_close: Some(on_close),
             on_abort: Some(on_abort),
+            // CEP-41 sender-side keepalive: reuse the reader idle/probe knobs (one
+            // idle/probe pair per stream, per spec). `None` when idle is disabled,
+            // keeping the writer keepalive in lockstep with the sweep gate
+            // (`open_stream_sweep_enabled` is false when `idle_timeout_ms == 0`).
+            idle_timeout: (state.policy.idle_timeout_ms != 0)
+                .then(|| Duration::from_millis(state.policy.idle_timeout_ms)),
+            probe_timeout: Duration::from_millis(state.policy.probe_timeout_ms),
         });
         let snapshot = RouteSnapshot {
             client_pubkey,
@@ -2463,6 +2473,29 @@ impl NostrServerTransport {
             Some(OpenStreamFrame::Abort { reason }) => {
                 if let Some(writer) = writer {
                     let _ = writer.abort(reason).await;
+                } else {
+                    Self::feed_open_stream_reader(
+                        state,
+                        relay_pool,
+                        encryption_mode,
+                        gift_wrap_mode,
+                        notification,
+                        sender_pubkey,
+                        event_id,
+                        is_encrypted,
+                        is_gift_wrap,
+                        outer_kind,
+                    )
+                    .await;
+                }
+            }
+            Some(OpenStreamFrame::Pong { nonce }) => {
+                // CEP-41: a `pong` for a stream the server is *writing* (server→client)
+                // acknowledges our keepalive probe (completing the round trip the reader
+                // sweep opened). Only intercept when a writer owns the token;
+                // client→server streams fall through to the reader engine below.
+                if let Some(writer) = writer {
+                    writer.ack_probe(&nonce);
                 } else {
                     Self::feed_open_stream_reader(
                         state,
@@ -2674,6 +2707,7 @@ impl NostrServerTransport {
         relay_pool: &Arc<dyn RelayPoolTrait>,
         encryption_mode: EncryptionMode,
         gift_wrap_mode: GiftWrapMode,
+        sessions: &SessionStore,
     ) {
         let now = Instant::now();
         let mut actions: Vec<(String, String, KeepaliveAction)> = Vec::new();
@@ -2721,6 +2755,68 @@ impl NostrServerTransport {
                     if let Some(eid) = state.event_id_for_token(&token) {
                         if let Some(writer) = state.writer_for(&eid) {
                             let _ = writer.abort(Some(reason)).await;
+                        }
+                    }
+                }
+                KeepaliveAction::None => {}
+            }
+        }
+
+        // CEP-41: writer (server→client) keepalive — each producer stream MUST
+        // maintain an idle timeout (CEP-41 §Timeout and Keepalive). A client that
+        // vanishes without `abort` is probed here and aborted on a missing `pong`;
+        // the writer's `on_abort` hook then flushes any deferred final response.
+        // This is the mirror of the reader sweep above for sender-side streams.
+        // The client pubkey is captured up front: the slot may be removed by the
+        // time we act on an `Abort` (the writer's on_abort flush drops it), and we
+        // need it to release the dead client's session.
+        let writer_actions: Vec<(String, PublicKey, KeepaliveAction)> = state
+            .lock_slots()
+            .iter()
+            .map(|(event_id, slot)| {
+                (
+                    event_id.clone(),
+                    slot.snapshot.client_pubkey,
+                    slot.writer.tick(now),
+                )
+            })
+            .filter(|(.., action)| !matches!(action, KeepaliveAction::None))
+            .collect();
+        for (event_id, client_pubkey, action) in writer_actions {
+            let Some(writer) = state.writer_for(&event_id) else {
+                continue;
+            };
+            match action {
+                KeepaliveAction::SendPing(nonce) => {
+                    if let Err(error) = writer.send_probe(nonce).await {
+                        tracing::warn!(
+                            target: LOG_TARGET,
+                            error = %error,
+                            event_id = %event_id,
+                            "Failed to publish open-stream keepalive ping"
+                        );
+                    }
+                }
+                KeepaliveAction::Abort(reason) => {
+                    if let Err(error) = writer.abort(Some(reason)).await {
+                        tracing::warn!(
+                            target: LOG_TARGET,
+                            error = %error,
+                            event_id = %event_id,
+                            "Failed to abort open-stream writer on probe timeout"
+                        );
+                    }
+                    // CEP-41: a probe timeout means the client is gone — release
+                    // its session too ("release local state"), mirroring the TS
+                    // `handleProbeTimeout`. Done after the abort so the abort frame
+                    // is published first; eviction is independent of the
+                    // snapshot-backed deferred-response flush. Only the sweep
+                    // produces a writer `Abort`, so this path is probe-timeout only
+                    // (a tool-initiated `close`/`abort` does not evict the session).
+                    let pubkey_hex = client_pubkey.to_hex();
+                    if sessions.remove_session(&pubkey_hex).await {
+                        if let Some(cb) = sessions.eviction_callback() {
+                            cb(pubkey_hex);
                         }
                     }
                 }
@@ -3551,6 +3647,8 @@ mod tests {
             content_type: None,
             on_close: None,
             on_abort: None,
+            idle_timeout: None,
+            probe_timeout: Duration::from_millis(20_000),
         })
     }
 
@@ -3692,6 +3790,119 @@ mod tests {
         assert!(
             disabled.get_open_stream_writer("evt-disabled").is_none(),
             "a disabled server must not expose writers (deferral never attempted)"
+        );
+    }
+
+    // ── CEP-41 writer keepalive sweep (server→client, silent-client abort) ──
+
+    /// A keepalive-armed writer whose publish closure is a no-op. The sweep
+    /// drives `tick`; a missing `pong` aborts it on the probe deadline.
+    fn keepalive_test_writer(token: &str, idle_ms: u64, probe_ms: u64) -> OpenStreamWriter {
+        let publish_frame: PublishFrame = Arc::new(|_frame: JsonRpcNotification| {
+            Box::pin(async move { Ok(EventId::all_zeros()) })
+        });
+        OpenStreamWriter::new(OpenStreamWriterOptions {
+            progress_token: token.to_string(),
+            publish_frame,
+            content_type: None,
+            on_close: None,
+            on_abort: None,
+            idle_timeout: Some(Duration::from_millis(idle_ms)),
+            probe_timeout: Duration::from_millis(probe_ms),
+        })
+    }
+
+    /// Regression: a client that silently disappears (sends no `pong`, no
+    /// `abort`) is detected by the server-writer keepalive sweep — the writer is
+    /// probed after the idle window and aborted once the probe times out, and the
+    /// dead client's session is evicted (CEP-41 "release local state", mirroring
+    /// the TS `handleProbeTimeout`). This is the rs-sdk port of the TS 0.13.8 fix;
+    /// without it the writer (and any upstream producer keyed on `is_active`)
+    /// leaks indefinitely. `tokio::time::sleep` guarantees *at least* the requested
+    /// duration, so the idle/probe margins are deterministic, not flaky.
+    #[tokio::test]
+    async fn sweep_aborts_writer_and_evicts_session_when_client_goes_silent() {
+        let config = NostrServerTransportConfig::default()
+            .with_open_stream(OpenStreamConfig::default().with_enabled(true));
+        let pool: Arc<dyn RelayPoolTrait> = Arc::new(MockRelayPool::new());
+        let mut transport = NostrServerTransport::with_relay_pool(config, pool)
+            .await
+            .expect("server transport");
+
+        let writer = keepalive_test_writer("tok-silent", 40, 60);
+        writer.start().await.expect("start the stream");
+        install_slot(&transport.open_stream, "evt-silent", writer.clone(), false);
+        assert!(writer.is_active(), "writer starts active");
+
+        // Install a session for the slot's client and arm the eviction callback.
+        let pubkey_hex = transport
+            .open_stream
+            .lock_slots()
+            .get("evt-silent")
+            .expect("slot")
+            .snapshot
+            .client_pubkey
+            .to_hex();
+        let evicted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let evicted_cb = evicted.clone();
+        transport.sessions.set_eviction_callback(Arc::new(move |_| {
+            evicted_cb.store(true, std::sync::atomic::Ordering::SeqCst);
+        }));
+        transport
+            .sessions
+            .get_or_create_session(&pubkey_hex, false, &transport.event_routes)
+            .await;
+        assert!(
+            transport.sessions.get_session(&pubkey_hex).await.is_some(),
+            "session present before the sweep"
+        );
+
+        let relay_pool = Arc::clone(&transport.base.relay_pool);
+        let encryption_mode = transport.config.encryption_mode;
+        let gift_wrap_mode = transport.config.gift_wrap_mode;
+
+        // Past the idle window: the sweep probes (idle → SendPing). The writer is
+        // NOT aborted yet — it is waiting for a `pong` the silent client never sends.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        NostrServerTransport::sweep_open_stream_sessions(
+            &transport.open_stream,
+            &relay_pool,
+            encryption_mode,
+            gift_wrap_mode,
+            &transport.sessions,
+        )
+        .await;
+        assert!(
+            writer.is_active(),
+            "writer must remain active while a probe is in flight"
+        );
+        assert!(
+            transport.sessions.get_session(&pubkey_hex).await.is_some(),
+            "session must survive a mere probe (client not yet declared dead)"
+        );
+
+        // Past the probe timeout: the sweep aborts (probe deadline → Abort) and
+        // evicts the dead client's session.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        NostrServerTransport::sweep_open_stream_sessions(
+            &transport.open_stream,
+            &relay_pool,
+            encryption_mode,
+            gift_wrap_mode,
+            &transport.sessions,
+        )
+        .await;
+        assert!(
+            !writer.is_active(),
+            "writer must abort after a silent client misses the probe deadline"
+        );
+        assert!(
+            transport.sessions.get_session(&pubkey_hex).await.is_none(),
+            "dead client's session must be evicted on probe timeout"
+        );
+        assert!(
+            evicted.load(std::sync::atomic::Ordering::SeqCst),
+            "eviction callback must fire on probe-timeout session release"
         );
     }
 }
