@@ -62,7 +62,7 @@ Or pin a published release from crates.io:
 
 ```toml
 [dependencies]
-contextvm-sdk = "0.2.0"
+contextvm-sdk = "0.2.1"
 ```
 
 ## Quick Start

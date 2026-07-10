@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-07-10
+
 ### Added
 
 - `ClientPubkey`: the rmcp server worker now injects the caller's Nostr public
