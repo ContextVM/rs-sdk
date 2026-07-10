@@ -439,11 +439,12 @@ pub struct IncomingRequest {
     pub is_encrypted: bool,
     /// The inbound (client-signed) Nostr event, if this request carried one.
     ///
-    /// `Some` for real client requests — the inner, signature-verified gift-wrap
-    /// event for encrypted requests, or the outer event for plaintext. `None`
-    /// for requests the transport synthesizes itself (announcement /
-    /// initialization drives, CEP-22 oversized reassembly), which carry no real
-    /// Nostr event. Handlers reach it via [`InboundEvent`] in request
+    /// `Some` for real client requests: the inner, signature-verified gift-wrap
+    /// event for encrypted requests, the outer event for plaintext, or the
+    /// carrying frame event for CEP-22 oversized reassembly. `None` only for
+    /// requests the transport synthesizes itself (announcement /
+    /// initialization drives), which carry no real Nostr event. Handlers reach
+    /// it via [`InboundEvent`] in request
     /// `extensions`; see that type's docs.
     pub event: Option<Event>,
 }
@@ -493,9 +494,13 @@ pub struct ClientPubkey(pub String);
 /// For gift-wrapped requests this is the **inner**, signature-verified event
 /// (the same one whose `pubkey` is surfaced as [`ClientPubkey`], so `ev.0.pubkey`
 /// and `ClientPubkey` agree by construction). For plaintext requests it is the
-/// outer request event. It is injected only for real client requests; synthetic
-/// transport-internal requests carry no event, so `extensions.get::<InboundEvent>()`
-/// returns `None` for them. This is purely a local affordance — it is never
+/// outer request event. For CEP-22 oversized requests it is the carrying `end`
+/// frame's event (a `notifications/progress` event signed by the client whose
+/// `id` is the correlation id) — the request was chunked, so no single dedicated
+/// request event exists. It is injected only for real client requests; synthetic
+/// transport-internal requests (announcement / initialization drives) carry no
+/// event, so `extensions.get::<InboundEvent>()` returns `None` for them. This is
+/// purely a local affordance — it is never
 /// serialized onto the wire. The event id is also reachable as the rmcp request
 /// id (`ctx.id`); this type additionally exposes `sig`, which the server cannot
 /// reconstruct without the client's private key.
@@ -1747,6 +1752,18 @@ impl NostrServerTransport {
                             );
                             continue;
                         }
+                        // Verify the signature (and that `id` matches content) before
+                        // trusting `pubkey`/`id` for handler identity + correlation.
+                        // Redundant against the default RelayPool (it verifies inbound
+                        // signatures), but keeps caller identity independent of the
+                        // pool impl — a custom RelayPoolTrait may skip verification.
+                        if let Err(e) = event.verify() {
+                            tracing::warn!(
+                                target: LOG_TARGET,
+                                "Plaintext event signature verification failed: {e}"
+                            );
+                            continue;
+                        }
                         let inbound = (*event).clone();
                         (
                             event.content.clone(),
@@ -1928,6 +1945,7 @@ impl NostrServerTransport {
                                 &request_wrap_kinds,
                                 &tx,
                                 &open_stream,
+                                inbound_event,
                             )
                             .await;
                             continue;
@@ -2088,6 +2106,7 @@ impl NostrServerTransport {
         request_wrap_kinds: &Arc<RwLock<HashMap<String, Option<u16>>>>,
         tx: &tokio::sync::mpsc::UnboundedSender<IncomingRequest>,
         open_stream: &ServerOpenStreamState,
+        inbound_event: Option<Event>,
     ) {
         // The outer progressToken keys the transfer (needed for accept + route).
         // String or number — defensive only: every known sender stringifies
@@ -2211,7 +2230,7 @@ impl NostrServerTransport {
                     client_pubkey: sender_pubkey.to_string(),
                     event_id: event_id.to_string(),
                     is_encrypted,
-                    event: None,
+                    event: inbound_event,
                 });
             }
             // Clean up locally, let the peer's own timeout fire.

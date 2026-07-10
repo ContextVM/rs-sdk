@@ -5,8 +5,13 @@
 ### Added
 
 - `ClientPubkey`: the rmcp server worker now injects the caller's Nostr public
-  key (hex) into every inbound request's `extensions` typemap, so tool/resource/
-  prompt handlers can identify their caller via `ctx.extensions.get::<ClientPubkey>()`.
+  key (hex) into every **real** inbound request's `extensions` typemap, so
+  tool/resource/prompt handlers can identify their caller via
+  `ctx.extensions.get::<ClientPubkey>()`. It is not injected for the transport's
+  own synthetic announcement/initialization drives (which carry the
+  `ANNOUNCEMENT_REQUEST_ID` sentinel as their pubkey), so handlers never observe
+  a bogus caller; oversized (CEP-22) requests carry a real pubkey and are
+  injected as usual.
   This closes the parity gap with the TS adapter's `extra._meta.clientPubkey`, but
   uses rmcp's typed extensions (local-only, never on the wire) instead of the
   `_meta` field, so it is always on rather than opt-in. The inbound event id is
@@ -15,7 +20,8 @@
   client-signed Nostr request event into `extensions`, reachable via
   `ctx.extensions.get::<InboundEvent>()`. For gift-wrapped requests this is the
   inner, signature-verified event (its `pubkey` matches `ClientPubkey` by
-  construction); for plaintext requests it is the outer event. This exposes
+  construction); for plaintext requests it is the outer event; for CEP-22
+  oversized requests it is the carrying `end` frame's event. This exposes
   `id`, `pubkey`, `sig`, `tags`, … — notably `sig`, which the server cannot
   reconstruct without the client's private key. Handlers that must bind a tool
   call to / store / audit the publishing event (e.g. an MLS key-package
@@ -48,6 +54,13 @@
   window — a successful `write()` against the relay is not liveness. Reuses the
   reader `idle_timeout_ms` / `probe_timeout_ms` knobs (one idle/probe pair per
   stream). This is the rs-sdk port of the TS SDK 0.13.8 fix.
+- fix(server): verify plaintext event signatures before trusting `event.pubkey`
+  for handler identity, the auth allowlist, and request correlation, mirroring
+  the gift-wrap arm. The default `RelayPool` verifies inbound signatures itself,
+  but `RelayPoolTrait` is public, so a custom pool that skips verification
+  (e.g. `MockRelayPool`) left caller identity dependent on an undocumented pool
+  assumption — and a forged pubkey could bypass the auth allowlist. This is the
+  rs-sdk half of the TS identity-forgery fix (ContextVM/sdk#64, #69).
 
 ## [0.2.0] - 2026-06-24
 

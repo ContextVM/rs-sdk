@@ -215,15 +215,21 @@ impl Worker for NostrServerWorker {
                         // loop swaps these extensions straight into the handler's
                         // `RequestContext` before dispatch.
                         if let rmcp::model::JsonRpcMessage::Request(ref mut jr) = rmcp_msg {
-                            // Caller pubkey is relevant to every request (auth,
-                            // payments, logging) and extensions are local-only, so
-                            // inject it unconditionally. This mirrors the TS adapter's
-                            // `extra._meta.clientPubkey`, but via rmcp's typed
-                            // extensions rather than the on-wire `_meta` field (which
-                            // is why the TS knob is opt-in but this is not).
-                            jr.request
-                                .extensions_mut()
-                                .insert(ClientPubkey(client_pubkey.clone()));
+                            // Caller pubkey is relevant to every real request (auth,
+                            // payments, logging) and extensions are local-only. Skip
+                            // the transport's own announcement/init drives, whose
+                            // "pubkey" is the `ANNOUNCEMENT_REQUEST_ID` sentinel —
+                            // injecting it would hand handlers a bogus caller. This
+                            // mirrors the TS adapter's `extra._meta.clientPubkey`,
+                            // but via rmcp's typed extensions rather than the on-wire
+                            // `_meta` field (which is why the TS knob is opt-in but
+                            // this is not). Gate on the sentinel, not on `event`:
+                            // oversized requests carry a real pubkey with no event.
+                            if client_pubkey != ANNOUNCEMENT_REQUEST_ID {
+                                jr.request
+                                    .extensions_mut()
+                                    .insert(ClientPubkey(client_pubkey.clone()));
+                            }
                             // Full inbound event (id + sig + pubkey + …) for
                             // handlers that must bind to / store / audit the
                             // publishing event. Only real client requests carry
