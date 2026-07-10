@@ -1,5 +1,67 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- `ClientPubkey`: the rmcp server worker now injects the caller's Nostr public
+  key (hex) into every **real** inbound request's `extensions` typemap, so
+  tool/resource/prompt handlers can identify their caller via
+  `ctx.extensions.get::<ClientPubkey>()`. It is not injected for the transport's
+  own synthetic announcement/initialization drives (which carry the
+  `ANNOUNCEMENT_REQUEST_ID` sentinel as their pubkey), so handlers never observe
+  a bogus caller; oversized (CEP-22) requests carry a real pubkey and are
+  injected as usual.
+  This closes the parity gap with the TS adapter's `extra._meta.clientPubkey`, but
+  uses rmcp's typed extensions (local-only, never on the wire) instead of the
+  `_meta` field, so it is always on rather than opt-in. The inbound event id is
+  already reachable as the rmcp request id (`ctx.id`).
+- `InboundEvent`: the rmcp server worker now also injects the **full**
+  client-signed Nostr request event into `extensions`, reachable via
+  `ctx.extensions.get::<InboundEvent>()`. For gift-wrapped requests this is the
+  inner, signature-verified event (its `pubkey` matches `ClientPubkey` by
+  construction); for plaintext requests it is the outer event; for CEP-22
+  oversized requests it is the carrying `end` frame's event. This exposes
+  `id`, `pubkey`, `sig`, `tags`, … — notably `sig`, which the server cannot
+  reconstruct without the client's private key. Handlers that must bind a tool
+  call to / store / audit the publishing event (e.g. an MLS key-package
+  coordinator returning the publication event) no longer have to fabricate a
+  synthetic event. Injected only for real client requests; synthetic
+  transport-internal requests carry none (`get` returns `None`).
+- `IncomingRequest` gained an `event: Option<nostr_sdk::Event>` field carrying
+  the same event through the channel seam. The FFI mirrors (`FfiIncomingRequest`,
+  the UniFFI `IncomingRequest`) intentionally do not surface it yet (no FFI
+  consumer needs the raw event; mirroring `nostr_sdk::Event` + `Tags` is
+  non-trivial) — the omission is documented in place.
+
+### Fixed
+
+- fix(open-stream): abort server writers on silent client disconnect (CEP-41).
+  Server→client `OpenStreamWriter`s leaked when a client silently disappeared
+  (crash/sleep/network drop) without sending `abort`. CEP-41 mandates each peer
+  maintain an idle timeout and probe the other with `ping`/`pong`, but only the
+  reader session ran keepalive timers; a pure producer stream (e.g. a
+  subscription-style tool streaming to a client) was never probed, so a dead
+  client left the writer — and any upstream producer keyed on `is_active()` —
+  alive indefinitely. The writer now arms an idle window once it starts
+  streaming, the server keepalive sweep probes it (mirroring the existing reader
+  sweep, driven by `OpenStreamWriter::tick`), an inbound `pong` for the stream is
+  routed to the writer to clear the probe (`ack_probe`), and a missing `pong`
+  aborts with `"Probe timeout"` (flushing any deferred final response via the
+  existing `on_abort` hook) **and evicts the dead client's session** (CEP-41
+  "release local state", mirroring the TS `handleProbeTimeout`, firing the
+  `SessionStore` eviction callback). Per CEP-41 only inbound frames reset the idle
+  window — a successful `write()` against the relay is not liveness. Reuses the
+  reader `idle_timeout_ms` / `probe_timeout_ms` knobs (one idle/probe pair per
+  stream). This is the rs-sdk port of the TS SDK 0.13.8 fix.
+- fix(server): verify plaintext event signatures before trusting `event.pubkey`
+  for handler identity, the auth allowlist, and request correlation, mirroring
+  the gift-wrap arm. The default `RelayPool` verifies inbound signatures itself,
+  but `RelayPoolTrait` is public, so a custom pool that skips verification
+  (e.g. `MockRelayPool`) left caller identity dependent on an undocumented pool
+  assumption — and a forged pubkey could bypass the auth allowlist. This is the
+  rs-sdk half of the TS identity-forgery fix (ContextVM/sdk#64, #69).
+
 ## [0.2.0] - 2026-06-24
 
 ### Added

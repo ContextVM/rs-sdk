@@ -744,6 +744,7 @@ impl AnnouncementManager {
                         client_pubkey: ANNOUNCEMENT_REQUEST_ID.to_string(),
                         event_id: ANNOUNCEMENT_REQUEST_ID.to_string(),
                         is_encrypted: false,
+                        event: None,
                     });
                 }
 
@@ -815,6 +816,7 @@ async fn publish_public_announcements(
             client_pubkey: ANNOUNCEMENT_REQUEST_ID.to_string(),
             event_id: ANNOUNCEMENT_REQUEST_ID.to_string(),
             is_encrypted: false,
+            event: None,
         })
         .is_err()
     {
@@ -865,6 +867,7 @@ async fn publish_public_announcements(
             client_pubkey: ANNOUNCEMENT_REQUEST_ID.to_string(),
             event_id: ANNOUNCEMENT_REQUEST_ID.to_string(),
             is_encrypted: false,
+            event: None,
         });
     }
 

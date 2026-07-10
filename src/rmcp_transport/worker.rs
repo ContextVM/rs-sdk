@@ -7,7 +7,9 @@ use crate::core::constants::ANNOUNCEMENT_REQUEST_ID;
 use crate::core::error::Result;
 use crate::core::types::{JsonRpcMessage, JsonRpcNotification, JsonRpcRequest};
 use crate::transport::client::{NostrClientTransport, NostrClientTransportConfig};
-use crate::transport::server::{NostrServerTransport, NostrServerTransportConfig};
+use crate::transport::server::{
+    ClientPubkey, InboundEvent, NostrServerTransport, NostrServerTransportConfig,
+};
 use rmcp::model::GetExtensions;
 use rmcp::transport::worker::{Worker, WorkerContext, WorkerQuitReason};
 use std::collections::HashSet;
@@ -148,6 +150,7 @@ impl Worker for NostrServerWorker {
                         mut message,
                         event_id,
                         client_pubkey,
+                        event,
                         ..
                     } = incoming;
 
@@ -206,13 +209,37 @@ impl Worker for NostrServerWorker {
                     }
 
                     if let Some(mut rmcp_msg) = internal_to_rmcp_server_rx(&message) {
-                        // CEP-41: inject the open-stream writer into the
-                        // request's `extensions` typemap so the tool handler can
-                        // reach it via `ctx.extensions.get::<OpenStreamWriter>()`.
-                        // The rmcp service loop swaps these extensions straight into
-                        // the handler's `RequestContext` before dispatch. No-op when
-                        // open-stream is disabled or the request has no writer.
+                        // Inject caller identity + (CEP-41) the open-stream writer
+                        // into the request's `extensions` typemap so the handler can
+                        // reach them via `ctx.extensions.get::<T>()`. The rmcp service
+                        // loop swaps these extensions straight into the handler's
+                        // `RequestContext` before dispatch.
                         if let rmcp::model::JsonRpcMessage::Request(ref mut jr) = rmcp_msg {
+                            // Caller pubkey is relevant to every real request (auth,
+                            // payments, logging) and extensions are local-only. Skip
+                            // the transport's own announcement/init drives, whose
+                            // "pubkey" is the `ANNOUNCEMENT_REQUEST_ID` sentinel —
+                            // injecting it would hand handlers a bogus caller. This
+                            // mirrors the TS adapter's `extra._meta.clientPubkey`,
+                            // but via rmcp's typed extensions rather than the on-wire
+                            // `_meta` field (which is why the TS knob is opt-in but
+                            // this is not). Gate on the sentinel, not on `event`:
+                            // oversized requests carry a real pubkey with no event.
+                            if client_pubkey != ANNOUNCEMENT_REQUEST_ID {
+                                jr.request
+                                    .extensions_mut()
+                                    .insert(ClientPubkey(client_pubkey.clone()));
+                            }
+                            // Full inbound event (id + sig + pubkey + …) for
+                            // handlers that must bind to / store / audit the
+                            // publishing event. Only real client requests carry
+                            // one; synthetic transport requests have none, so
+                            // handlers see `None` via get() for those.
+                            if let Some(ev) = event {
+                                jr.request.extensions_mut().insert(InboundEvent(ev));
+                            }
+                            // CEP-41: no-op when open-stream is disabled or the
+                            // request has no writer.
                             if let Some(writer) =
                                 self.transport.get_open_stream_writer(&event_id)
                             {

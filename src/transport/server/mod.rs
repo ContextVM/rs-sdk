@@ -437,7 +437,75 @@ pub struct IncomingRequest {
     pub event_id: String,
     /// Whether the original message was encrypted.
     pub is_encrypted: bool,
+    /// The inbound (client-signed) Nostr event, if this request carried one.
+    ///
+    /// `Some` for real client requests: the inner, signature-verified gift-wrap
+    /// event for encrypted requests, the outer event for plaintext, or the
+    /// carrying frame event for CEP-22 oversized reassembly. `None` only for
+    /// requests the transport synthesizes itself (announcement /
+    /// initialization drives), which carry no real Nostr event. Handlers reach
+    /// it via [`InboundEvent`] in request
+    /// `extensions`; see that type's docs.
+    pub event: Option<Event>,
 }
+
+/// The Nostr public key (hex) of the client that issued the current request.
+///
+/// [`NostrServerWorker`](crate::rmcp_transport::NostrServerWorker) injects this
+/// into every inbound request's rmcp `extensions` typemap, so a tool, resource,
+/// or prompt handler can identify its caller:
+///
+/// ```ignore
+/// use contextvm_sdk::transport::server::ClientPubkey;
+/// use rmcp::service::RequestContext;
+/// use rmcp::RoleServer;
+///
+/// let caller = ctx.extensions.get::<ClientPubkey>().map(|c| c.0.clone());
+/// ```
+///
+/// The value is the raw hex pubkey (the same string as
+/// [`IncomingRequest::client_pubkey`]). It is present on every real inbound
+/// request, unlike `OpenStreamWriter`, which is injected only for open-stream
+/// `tools/call` calls. This is purely a local affordance — it is never
+/// serialized onto the wire. The inbound Nostr event id is available separately
+/// as the rmcp request id (`ctx.id`), which the worker rewrites to the event id.
+#[derive(Debug, Clone)]
+pub struct ClientPubkey(pub String);
+
+/// The inbound (client-signed) Nostr event for the current request.
+///
+/// Injected into a request's rmcp `extensions` typemap by
+/// [`NostrServerWorker`](crate::rmcp_transport::NostrServerWorker) alongside
+/// [`ClientPubkey`], so a tool, resource, or prompt handler can read the full
+/// signed event — its `id`, `pubkey`, `sig`, … — to bind a tool call to the
+/// publishing event, store it for later return, or audit it:
+///
+/// ```ignore
+/// use contextvm_sdk::transport::server::InboundEvent;
+/// use rmcp::service::RequestContext;
+/// use rmcp::RoleServer;
+///
+/// if let Some(ev) = ctx.extensions.get::<InboundEvent>() {
+///     let sig_hex = ev.0.sig.to_string(); // Schnorr signature, hex
+///     // …
+/// }
+/// ```
+///
+/// For gift-wrapped requests this is the **inner**, signature-verified event
+/// (the same one whose `pubkey` is surfaced as [`ClientPubkey`], so `ev.0.pubkey`
+/// and `ClientPubkey` agree by construction). For plaintext requests it is the
+/// outer request event. For CEP-22 oversized requests it is the carrying `end`
+/// frame's event (a `notifications/progress` event signed by the client whose
+/// `id` is the correlation id) — the request was chunked, so no single dedicated
+/// request event exists. It is injected only for real client requests; synthetic
+/// transport-internal requests (announcement / initialization drives) carry no
+/// event, so `extensions.get::<InboundEvent>()` returns `None` for them. This is
+/// purely a local affordance — it is never
+/// serialized onto the wire. The event id is also reachable as the rmcp request
+/// id (`ctx.id`); this type additionally exposes `sig`, which the server cannot
+/// reconstruct without the client's private key.
+#[derive(Debug, Clone)]
+pub struct InboundEvent(pub Event);
 
 impl NostrServerTransport {
     /// Create a new server transport.
@@ -735,7 +803,9 @@ impl NostrServerTransport {
             }
             receivers.clear();
         }
-        self.open_stream.lock_slots().clear();
+        for (_, slot) in self.open_stream.lock_slots().drain() {
+            slot.writer.dispose();
+        }
         self.open_stream.lock_token_index().clear();
         Ok(())
     }
@@ -1549,6 +1619,7 @@ impl NostrServerTransport {
                         &relay_pool,
                         encryption_mode,
                         gift_wrap_mode,
+                        &sessions,
                     )
                     .await;
                     continue;
@@ -1585,107 +1656,124 @@ impl NostrServerTransport {
                     continue;
                 }
 
-                let (content, sender_pubkey, event_id, is_encrypted, inner_tags) = if is_gift_wrap {
-                    if encryption_mode == EncryptionMode::Disabled {
-                        tracing::warn!(
-                            target: LOG_TARGET,
-                            event_id = %event.id.to_hex(),
-                            sender_pubkey = %event.pubkey.to_hex(),
-                            "Received encrypted message but encryption is disabled"
-                        );
-                        continue;
-                    }
-                    {
-                        let guard = match seen_gift_wrap_ids.lock() {
-                            Ok(g) => g,
-                            Err(poisoned) => poisoned.into_inner(),
-                        };
-                        if guard.contains(&event.id) {
-                            tracing::debug!(
+                let (content, sender_pubkey, event_id, is_encrypted, inner_tags, inbound_event) =
+                    if is_gift_wrap {
+                        if encryption_mode == EncryptionMode::Disabled {
+                            tracing::warn!(
                                 target: LOG_TARGET,
                                 event_id = %event.id.to_hex(),
-                                "Skipping duplicate gift-wrap (outer id)"
+                                sender_pubkey = %event.pubkey.to_hex(),
+                                "Received encrypted message but encryption is disabled"
                             );
                             continue;
                         }
-                    }
-                    // Single-layer NIP-44 decrypt (matches JS/TS SDK)
-                    let signer = match relay_pool.signer().await {
-                        Ok(s) => s,
-                        Err(error) => {
-                            tracing::error!(
-                                target: LOG_TARGET,
-                                error = %error,
-                                "Failed to get signer"
-                            );
-                            continue;
+                        {
+                            let guard = match seen_gift_wrap_ids.lock() {
+                                Ok(g) => g,
+                                Err(poisoned) => poisoned.into_inner(),
+                            };
+                            if guard.contains(&event.id) {
+                                tracing::debug!(
+                                    target: LOG_TARGET,
+                                    event_id = %event.id.to_hex(),
+                                    "Skipping duplicate gift-wrap (outer id)"
+                                );
+                                continue;
+                            }
                         }
-                    };
-                    match encryption::decrypt_gift_wrap_single_layer(&signer, &event).await {
-                        Ok(decrypted_json) => {
-                            // The decrypted content is JSON of the inner signed event.
-                            // Use the INNER event's ID for correlation — the client
-                            // registers the inner event ID in its correlation store.
-                            match serde_json::from_str::<Event>(&decrypted_json) {
-                                Ok(inner) => {
-                                    if let Err(e) = inner.verify() {
-                                        tracing::warn!(
-                                            "Inner event signature verification failed: {e}"
+                        // Single-layer NIP-44 decrypt (matches JS/TS SDK)
+                        let signer = match relay_pool.signer().await {
+                            Ok(s) => s,
+                            Err(error) => {
+                                tracing::error!(
+                                    target: LOG_TARGET,
+                                    error = %error,
+                                    "Failed to get signer"
+                                );
+                                continue;
+                            }
+                        };
+                        match encryption::decrypt_gift_wrap_single_layer(&signer, &event).await {
+                            Ok(decrypted_json) => {
+                                // The decrypted content is JSON of the inner signed event.
+                                // Use the INNER event's ID for correlation — the client
+                                // registers the inner event ID in its correlation store.
+                                match serde_json::from_str::<Event>(&decrypted_json) {
+                                    Ok(inner) => {
+                                        if let Err(e) = inner.verify() {
+                                            tracing::warn!(
+                                                "Inner event signature verification failed: {e}"
+                                            );
+                                            continue;
+                                        }
+                                        {
+                                            let mut guard = match seen_gift_wrap_ids.lock() {
+                                                Ok(g) => g,
+                                                Err(poisoned) => poisoned.into_inner(),
+                                            };
+                                            guard.put(event.id, ());
+                                        }
+                                        let inbound = inner.clone();
+                                        let inner_tags: Vec<Tag> = inner.tags.to_vec();
+                                        (
+                                            inner.content,
+                                            inner.pubkey.to_hex(),
+                                            inner.id.to_hex(),
+                                            true,
+                                            inner_tags,
+                                            Some(inbound),
+                                        )
+                                    }
+                                    Err(error) => {
+                                        tracing::error!(
+                                            target: LOG_TARGET,
+                                            error = %error,
+                                            "Failed to parse inner event"
                                         );
                                         continue;
                                     }
-                                    {
-                                        let mut guard = match seen_gift_wrap_ids.lock() {
-                                            Ok(g) => g,
-                                            Err(poisoned) => poisoned.into_inner(),
-                                        };
-                                        guard.put(event.id, ());
-                                    }
-                                    let inner_tags: Vec<Tag> = inner.tags.to_vec();
-                                    (
-                                        inner.content,
-                                        inner.pubkey.to_hex(),
-                                        inner.id.to_hex(),
-                                        true,
-                                        inner_tags,
-                                    )
-                                }
-                                Err(error) => {
-                                    tracing::error!(
-                                        target: LOG_TARGET,
-                                        error = %error,
-                                        "Failed to parse inner event"
-                                    );
-                                    continue;
                                 }
                             }
+                            Err(error) => {
+                                tracing::error!(
+                                    target: LOG_TARGET,
+                                    error = %error,
+                                    "Failed to decrypt"
+                                );
+                                continue;
+                            }
                         }
-                        Err(error) => {
-                            tracing::error!(
+                    } else {
+                        if encryption_mode == EncryptionMode::Required {
+                            tracing::warn!(
                                 target: LOG_TARGET,
-                                error = %error,
-                                "Failed to decrypt"
+                                sender_pubkey = %event.pubkey.to_hex(),
+                                "Received unencrypted message but encryption is required"
                             );
                             continue;
                         }
-                    }
-                } else {
-                    if encryption_mode == EncryptionMode::Required {
-                        tracing::warn!(
-                            target: LOG_TARGET,
-                            sender_pubkey = %event.pubkey.to_hex(),
-                            "Received unencrypted message but encryption is required"
-                        );
-                        continue;
-                    }
-                    (
-                        event.content.clone(),
-                        event.pubkey.to_hex(),
-                        event.id.to_hex(),
-                        false,
-                        event.tags.to_vec(),
-                    )
-                };
+                        // Verify the signature (and that `id` matches content) before
+                        // trusting `pubkey`/`id` for handler identity + correlation.
+                        // Redundant against the default RelayPool (it verifies inbound
+                        // signatures), but keeps caller identity independent of the
+                        // pool impl — a custom RelayPoolTrait may skip verification.
+                        if let Err(e) = event.verify() {
+                            tracing::warn!(
+                                target: LOG_TARGET,
+                                "Plaintext event signature verification failed: {e}"
+                            );
+                            continue;
+                        }
+                        let inbound = (*event).clone();
+                        (
+                            event.content.clone(),
+                            event.pubkey.to_hex(),
+                            event.id.to_hex(),
+                            false,
+                            event.tags.to_vec(),
+                            Some(inbound),
+                        )
+                    };
 
                 // Parse MCP message
                 let mcp_msg = match validation::validate_and_parse(&content) {
@@ -1857,6 +1945,7 @@ impl NostrServerTransport {
                                 &request_wrap_kinds,
                                 &tx,
                                 &open_stream,
+                                inbound_event,
                             )
                             .await;
                             continue;
@@ -1986,6 +2075,7 @@ impl NostrServerTransport {
                     client_pubkey: sender_pubkey,
                     event_id,
                     is_encrypted,
+                    event: inbound_event,
                 });
             }
         }
@@ -2016,6 +2106,7 @@ impl NostrServerTransport {
         request_wrap_kinds: &Arc<RwLock<HashMap<String, Option<u16>>>>,
         tx: &tokio::sync::mpsc::UnboundedSender<IncomingRequest>,
         open_stream: &ServerOpenStreamState,
+        inbound_event: Option<Event>,
     ) {
         // The outer progressToken keys the transfer (needed for accept + route).
         // String or number — defensive only: every known sender stringifies
@@ -2139,6 +2230,7 @@ impl NostrServerTransport {
                     client_pubkey: sender_pubkey.to_string(),
                     event_id: event_id.to_string(),
                     is_encrypted,
+                    event: inbound_event,
                 });
             }
             // Clean up locally, let the peer's own timeout fire.
@@ -2321,6 +2413,13 @@ impl NostrServerTransport {
             content_type: None,
             on_close: Some(on_close),
             on_abort: Some(on_abort),
+            // CEP-41 sender-side keepalive: reuse the reader idle/probe knobs (one
+            // idle/probe pair per stream, per spec). `None` when idle is disabled,
+            // keeping the writer keepalive in lockstep with the sweep gate
+            // (`open_stream_sweep_enabled` is false when `idle_timeout_ms == 0`).
+            idle_timeout: (state.policy.idle_timeout_ms != 0)
+                .then(|| Duration::from_millis(state.policy.idle_timeout_ms)),
+            probe_timeout: Duration::from_millis(state.policy.probe_timeout_ms),
         });
         let snapshot = RouteSnapshot {
             client_pubkey,
@@ -2393,6 +2492,29 @@ impl NostrServerTransport {
             Some(OpenStreamFrame::Abort { reason }) => {
                 if let Some(writer) = writer {
                     let _ = writer.abort(reason).await;
+                } else {
+                    Self::feed_open_stream_reader(
+                        state,
+                        relay_pool,
+                        encryption_mode,
+                        gift_wrap_mode,
+                        notification,
+                        sender_pubkey,
+                        event_id,
+                        is_encrypted,
+                        is_gift_wrap,
+                        outer_kind,
+                    )
+                    .await;
+                }
+            }
+            Some(OpenStreamFrame::Pong { nonce }) => {
+                // CEP-41: a `pong` for a stream the server is *writing* (server→client)
+                // acknowledges our keepalive probe (completing the round trip the reader
+                // sweep opened). Only intercept when a writer owns the token;
+                // client→server streams fall through to the reader engine below.
+                if let Some(writer) = writer {
+                    writer.ack_probe(&nonce);
                 } else {
                     Self::feed_open_stream_reader(
                         state,
@@ -2604,6 +2726,7 @@ impl NostrServerTransport {
         relay_pool: &Arc<dyn RelayPoolTrait>,
         encryption_mode: EncryptionMode,
         gift_wrap_mode: GiftWrapMode,
+        sessions: &SessionStore,
     ) {
         let now = Instant::now();
         let mut actions: Vec<(String, String, KeepaliveAction)> = Vec::new();
@@ -2651,6 +2774,68 @@ impl NostrServerTransport {
                     if let Some(eid) = state.event_id_for_token(&token) {
                         if let Some(writer) = state.writer_for(&eid) {
                             let _ = writer.abort(Some(reason)).await;
+                        }
+                    }
+                }
+                KeepaliveAction::None => {}
+            }
+        }
+
+        // CEP-41: writer (server→client) keepalive — each producer stream MUST
+        // maintain an idle timeout (CEP-41 §Timeout and Keepalive). A client that
+        // vanishes without `abort` is probed here and aborted on a missing `pong`;
+        // the writer's `on_abort` hook then flushes any deferred final response.
+        // This is the mirror of the reader sweep above for sender-side streams.
+        // The client pubkey is captured up front: the slot may be removed by the
+        // time we act on an `Abort` (the writer's on_abort flush drops it), and we
+        // need it to release the dead client's session.
+        let writer_actions: Vec<(String, PublicKey, KeepaliveAction)> = state
+            .lock_slots()
+            .iter()
+            .map(|(event_id, slot)| {
+                (
+                    event_id.clone(),
+                    slot.snapshot.client_pubkey,
+                    slot.writer.tick(now),
+                )
+            })
+            .filter(|(.., action)| !matches!(action, KeepaliveAction::None))
+            .collect();
+        for (event_id, client_pubkey, action) in writer_actions {
+            let Some(writer) = state.writer_for(&event_id) else {
+                continue;
+            };
+            match action {
+                KeepaliveAction::SendPing(nonce) => {
+                    if let Err(error) = writer.send_probe(nonce).await {
+                        tracing::warn!(
+                            target: LOG_TARGET,
+                            error = %error,
+                            event_id = %event_id,
+                            "Failed to publish open-stream keepalive ping"
+                        );
+                    }
+                }
+                KeepaliveAction::Abort(reason) => {
+                    if let Err(error) = writer.abort(Some(reason)).await {
+                        tracing::warn!(
+                            target: LOG_TARGET,
+                            error = %error,
+                            event_id = %event_id,
+                            "Failed to abort open-stream writer on probe timeout"
+                        );
+                    }
+                    // CEP-41: a probe timeout means the client is gone — release
+                    // its session too ("release local state"), mirroring the TS
+                    // `handleProbeTimeout`. Done after the abort so the abort frame
+                    // is published first; eviction is independent of the
+                    // snapshot-backed deferred-response flush. Only the sweep
+                    // produces a writer `Abort`, so this path is probe-timeout only
+                    // (a tool-initiated `close`/`abort` does not evict the session).
+                    let pubkey_hex = client_pubkey.to_hex();
+                    if sessions.remove_session(&pubkey_hex).await {
+                        if let Some(cb) = sessions.eviction_callback() {
+                            cb(pubkey_hex);
                         }
                     }
                 }
@@ -3481,6 +3666,8 @@ mod tests {
             content_type: None,
             on_close: None,
             on_abort: None,
+            idle_timeout: None,
+            probe_timeout: Duration::from_millis(20_000),
         })
     }
 
@@ -3622,6 +3809,119 @@ mod tests {
         assert!(
             disabled.get_open_stream_writer("evt-disabled").is_none(),
             "a disabled server must not expose writers (deferral never attempted)"
+        );
+    }
+
+    // ── CEP-41 writer keepalive sweep (server→client, silent-client abort) ──
+
+    /// A keepalive-armed writer whose publish closure is a no-op. The sweep
+    /// drives `tick`; a missing `pong` aborts it on the probe deadline.
+    fn keepalive_test_writer(token: &str, idle_ms: u64, probe_ms: u64) -> OpenStreamWriter {
+        let publish_frame: PublishFrame = Arc::new(|_frame: JsonRpcNotification| {
+            Box::pin(async move { Ok(EventId::all_zeros()) })
+        });
+        OpenStreamWriter::new(OpenStreamWriterOptions {
+            progress_token: token.to_string(),
+            publish_frame,
+            content_type: None,
+            on_close: None,
+            on_abort: None,
+            idle_timeout: Some(Duration::from_millis(idle_ms)),
+            probe_timeout: Duration::from_millis(probe_ms),
+        })
+    }
+
+    /// Regression: a client that silently disappears (sends no `pong`, no
+    /// `abort`) is detected by the server-writer keepalive sweep — the writer is
+    /// probed after the idle window and aborted once the probe times out, and the
+    /// dead client's session is evicted (CEP-41 "release local state", mirroring
+    /// the TS `handleProbeTimeout`). This is the rs-sdk port of the TS 0.13.8 fix;
+    /// without it the writer (and any upstream producer keyed on `is_active`)
+    /// leaks indefinitely. `tokio::time::sleep` guarantees *at least* the requested
+    /// duration, so the idle/probe margins are deterministic, not flaky.
+    #[tokio::test]
+    async fn sweep_aborts_writer_and_evicts_session_when_client_goes_silent() {
+        let config = NostrServerTransportConfig::default()
+            .with_open_stream(OpenStreamConfig::default().with_enabled(true));
+        let pool: Arc<dyn RelayPoolTrait> = Arc::new(MockRelayPool::new());
+        let mut transport = NostrServerTransport::with_relay_pool(config, pool)
+            .await
+            .expect("server transport");
+
+        let writer = keepalive_test_writer("tok-silent", 40, 60);
+        writer.start().await.expect("start the stream");
+        install_slot(&transport.open_stream, "evt-silent", writer.clone(), false);
+        assert!(writer.is_active(), "writer starts active");
+
+        // Install a session for the slot's client and arm the eviction callback.
+        let pubkey_hex = transport
+            .open_stream
+            .lock_slots()
+            .get("evt-silent")
+            .expect("slot")
+            .snapshot
+            .client_pubkey
+            .to_hex();
+        let evicted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let evicted_cb = evicted.clone();
+        transport.sessions.set_eviction_callback(Arc::new(move |_| {
+            evicted_cb.store(true, std::sync::atomic::Ordering::SeqCst);
+        }));
+        transport
+            .sessions
+            .get_or_create_session(&pubkey_hex, false, &transport.event_routes)
+            .await;
+        assert!(
+            transport.sessions.get_session(&pubkey_hex).await.is_some(),
+            "session present before the sweep"
+        );
+
+        let relay_pool = Arc::clone(&transport.base.relay_pool);
+        let encryption_mode = transport.config.encryption_mode;
+        let gift_wrap_mode = transport.config.gift_wrap_mode;
+
+        // Past the idle window: the sweep probes (idle → SendPing). The writer is
+        // NOT aborted yet — it is waiting for a `pong` the silent client never sends.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        NostrServerTransport::sweep_open_stream_sessions(
+            &transport.open_stream,
+            &relay_pool,
+            encryption_mode,
+            gift_wrap_mode,
+            &transport.sessions,
+        )
+        .await;
+        assert!(
+            writer.is_active(),
+            "writer must remain active while a probe is in flight"
+        );
+        assert!(
+            transport.sessions.get_session(&pubkey_hex).await.is_some(),
+            "session must survive a mere probe (client not yet declared dead)"
+        );
+
+        // Past the probe timeout: the sweep aborts (probe deadline → Abort) and
+        // evicts the dead client's session.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        NostrServerTransport::sweep_open_stream_sessions(
+            &transport.open_stream,
+            &relay_pool,
+            encryption_mode,
+            gift_wrap_mode,
+            &transport.sessions,
+        )
+        .await;
+        assert!(
+            !writer.is_active(),
+            "writer must abort after a silent client misses the probe deadline"
+        );
+        assert!(
+            transport.sessions.get_session(&pubkey_hex).await.is_none(),
+            "dead client's session must be evicted on probe timeout"
+        );
+        assert!(
+            evicted.load(std::sync::atomic::Ordering::SeqCst),
+            "eviction callback must fire on probe-timeout session release"
         );
     }
 }

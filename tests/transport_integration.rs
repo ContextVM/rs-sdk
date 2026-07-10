@@ -389,6 +389,74 @@ async fn auth_allowlist_blocks_disallowed_pubkey() {
     );
 }
 
+// ── 4b. Plaintext signature verify blocks a forged (allowlisted) pubkey ─────
+//
+// A custom RelayPoolTrait that does NOT signature-verify inbound events (our
+// own MockRelayPool, or any third-party pool) lets a client put any pubkey in a
+// plaintext event. Without an in-app `verify()` that forgery bypasses the auth
+// allowlist — the gap TS fixed in ContextVM/sdk#64/#69. The plaintext arm must
+// verify the signature (and that id matches content) before trusting
+// `event.pubkey` for identity or correlation.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plaintext_forged_pubkey_is_rejected_by_signature_verify() {
+    let (_client_pool, server_pool) = MockRelayPool::create_pair();
+    let server_pubkey = server_pool.mock_public_key();
+    let server_pool = Arc::new(server_pool);
+
+    // The "victim" pubkey the attacker forges — it IS on the allowlist.
+    let victim_keys = Keys::generate();
+    // The attacker's real key, which actually signs the event.
+    let attacker_keys = Keys::generate();
+
+    let mut server = NostrServerTransport::with_relay_pool(
+        NostrServerTransportConfig::default()
+            .with_encryption_mode(EncryptionMode::Disabled)
+            .with_allowed_public_keys(vec![victim_keys.public_key().to_hex()]),
+        Arc::clone(&server_pool) as Arc<dyn RelayPoolTrait>,
+    )
+    .await
+    .expect("create server transport");
+
+    let mut server_rx = server
+        .take_message_receiver()
+        .expect("server message receiver");
+    server.start().await.expect("server start");
+    let_event_loops_start().await;
+
+    // Build a valid plaintext tools/list request addressed to the server,
+    // signed by the attacker, then forge the author pubkey to the victim's.
+    let request = JsonRpcMessage::Request(JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: serde_json::json!("forge-1"),
+        method: "tools/list".to_string(),
+        params: None,
+    });
+    let mut event = contextvm_sdk::core::serializers::mcp_to_nostr_event(
+        &request,
+        CTXVM_MESSAGES_KIND,
+        BaseTransport::create_recipient_tags(&server_pubkey),
+    )
+    .expect("serialize request")
+    .sign_with_keys(&attacker_keys)
+    .expect("sign event");
+    // The forgery: claim to be the allowlisted victim. The signature was made by
+    // the attacker, so an in-app `verify()` must reject this before the allowlist
+    // ever sees the (allowlisted) victim pubkey.
+    event.pubkey = victim_keys.public_key();
+    server_pool
+        .publish_event(&event)
+        .await
+        .expect("deliver forged event");
+
+    // The forged request must NOT reach the handler.
+    let result = tokio::time::timeout(Duration::from_millis(500), server_rx.recv()).await;
+    assert!(
+        result.is_err(),
+        "forged-pubkey plaintext event must be rejected by signature verification"
+    );
+}
+
 // ── 5. Encryption mode Required drops plaintext ─────────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3660,6 +3728,7 @@ async fn server_close_stops_event_loop() {
 async fn oversized_request_roundtrip_client_to_server() {
     let (client_pool, server_pool) = MockRelayPool::create_pair();
     let server_pubkey = server_pool.mock_public_key();
+    let client_pubkey_hex = client_pool.mock_public_key().to_hex();
     let server_pool = Arc::new(server_pool);
 
     let oversized = OversizedTransferConfig::enabled()
@@ -3722,6 +3791,18 @@ async fn oversized_request_roundtrip_client_to_server() {
         .expect("server channel closed");
     assert_eq!(incoming.message.method(), Some("tools/call"));
     assert_eq!(incoming.message.id(), Some(&serde_json::json!("big-1")));
+
+    // CEP-22 reassembly surfaces the carrying event (parity with TS), so a
+    // handler can bind to / audit the chunked request rather than seeing `None`.
+    assert!(
+        incoming.event.is_some(),
+        "oversized request must carry its event"
+    );
+    assert_eq!(
+        incoming.event.as_ref().unwrap().pubkey.to_hex(),
+        client_pubkey_hex,
+        "carrying event pubkey must be the client's"
+    );
 
     // No second message should surface.
     let second = tokio::time::timeout(Duration::from_millis(100), server_rx.recv()).await;

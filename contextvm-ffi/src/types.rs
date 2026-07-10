@@ -45,6 +45,10 @@ pub struct FfiJsonRpcMessage {
 }
 
 /// An FFI-safe incoming request (server-side).
+///
+/// NOTE: the SDK's `IncomingRequest` also carries an `event:
+/// Option<nostr_sdk::Event>` (the full client-signed event), intentionally not
+/// mirrored here — see `uniffi_types::IncomingRequest` for the rationale.
 #[repr(C)]
 #[derive(Debug)]
 pub struct FfiIncomingRequest {
