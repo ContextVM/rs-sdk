@@ -6,9 +6,11 @@
 
 pub(crate) mod announcement_manager;
 pub mod correlation_store;
+pub mod middleware;
 pub mod session_store;
 
 pub use correlation_store::{RouteEntry, ServerEventRouteStore};
+pub use middleware::{InboundContext, InboundMiddleware, Next};
 pub use session_store::{SessionSnapshot, SessionStore};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::RwLock;
@@ -329,6 +331,9 @@ pub struct NostrServerTransport {
     cancellation_token: CancellationToken,
     /// Handles for spawned tasks (event loop + cleanup).
     task_handles: Vec<tokio::task::JoinHandle<()>>,
+    /// Ordered inbound middleware chain (FIFO). Registered before `start()`; moved
+    /// into the event loop there. Empty means the direct forward path.
+    inbound_middlewares: Vec<Arc<dyn InboundMiddleware>>,
 }
 
 impl NostrServerTransportConfig {
@@ -564,6 +569,7 @@ impl NostrServerTransport {
             event_routes: ServerEventRouteStore::new(),
             request_wrap_kinds: Arc::new(RwLock::new(HashMap::new())),
             seen_gift_wrap_ids,
+            inbound_middlewares: Vec::new(),
             message_tx: Some(tx),
             message_rx: Some(rx),
             cancellation_token: CancellationToken::new(),
@@ -617,11 +623,23 @@ impl NostrServerTransport {
             request_wrap_kinds: Arc::new(RwLock::new(HashMap::new())),
             event_routes: ServerEventRouteStore::new(),
             seen_gift_wrap_ids,
+            inbound_middlewares: Vec::new(),
             message_tx: Some(tx),
             message_rx: Some(rx),
             cancellation_token: CancellationToken::new(),
             task_handles: Vec::new(),
         })
+    }
+
+    /// Register an inbound middleware. Middleware runs in registration order (FIFO)
+    /// as the final inbound stage before delivery to the MCP handler. Must be called
+    /// before [`start`](Self::start); later registrations do not take effect.
+    pub fn add_inbound_middleware(&mut self, middleware: Arc<dyn InboundMiddleware>) {
+        debug_assert!(
+            self.task_handles.is_empty(),
+            "add_inbound_middleware must be called before start()"
+        );
+        self.inbound_middlewares.push(middleware);
     }
 
     /// Start listening for incoming requests.
@@ -686,6 +704,8 @@ impl NostrServerTransport {
         let common_tags_snapshot = self.announcement_manager.common_tags_snapshot();
         let seen_gift_wrap_ids = self.seen_gift_wrap_ids.clone();
         let open_stream = self.open_stream.clone();
+        let inbound_middlewares: Arc<[Arc<dyn InboundMiddleware>]> =
+            Arc::from(std::mem::take(&mut self.inbound_middlewares));
         let event_loop_token = self.cancellation_token.child_token();
 
         let event_loop_handle = tokio::spawn(async move {
@@ -707,6 +727,7 @@ impl NostrServerTransport {
                 seen_gift_wrap_ids,
                 open_stream,
                 event_loop_token,
+                inbound_middlewares,
             )
             .await;
         });
@@ -1575,6 +1596,7 @@ impl NostrServerTransport {
         seen_gift_wrap_ids: Arc<Mutex<LruCache<EventId, ()>>>,
         open_stream: ServerOpenStreamState,
         cancel: CancellationToken,
+        middlewares: Arc<[Arc<dyn InboundMiddleware>]>,
     ) {
         let mut notifications = relay_pool.notifications();
 
@@ -1946,6 +1968,7 @@ impl NostrServerTransport {
                                 &tx,
                                 &open_stream,
                                 inbound_event,
+                                &middlewares,
                             )
                             .await;
                             continue;
@@ -2069,14 +2092,18 @@ impl NostrServerTransport {
                     }
                 }
 
-                // Forward to consumer
-                let _ = tx.send(IncomingRequest {
-                    message: mcp_msg,
-                    client_pubkey: sender_pubkey,
+                // Forward to consumer (through the inbound middleware chain).
+                middleware::dispatch_inbound(
+                    &middlewares,
+                    &tx,
+                    &event_routes,
+                    mcp_msg,
+                    sender_pubkey,
                     event_id,
                     is_encrypted,
-                    event: inbound_event,
-                });
+                    if is_gift_wrap { Some(outer_kind) } else { None },
+                    inbound_event,
+                );
             }
         }
     }
@@ -2107,6 +2134,7 @@ impl NostrServerTransport {
         tx: &tokio::sync::mpsc::UnboundedSender<IncomingRequest>,
         open_stream: &ServerOpenStreamState,
         inbound_event: Option<Event>,
+        chain: &Arc<[Arc<dyn InboundMiddleware>]>,
     ) {
         // The outer progressToken keys the transfer (needed for accept + route).
         // String or number — defensive only: every known sender stringifies
@@ -2225,13 +2253,17 @@ impl NostrServerTransport {
                         );
                     }
                 }
-                let _ = tx.send(IncomingRequest {
+                middleware::dispatch_inbound(
+                    chain,
+                    tx,
+                    event_routes,
                     message,
-                    client_pubkey: sender_pubkey.to_string(),
-                    event_id: event_id.to_string(),
+                    sender_pubkey.to_string(),
+                    event_id.to_string(),
                     is_encrypted,
-                    event: inbound_event,
-                });
+                    if is_gift_wrap { Some(outer_kind) } else { None },
+                    inbound_event,
+                );
             }
             // Clean up locally, let the peer's own timeout fire.
             Err(error) => {

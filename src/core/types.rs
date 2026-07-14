@@ -237,6 +237,20 @@ impl ClientSession {
     }
 }
 
+// ── Payment interaction (CEP-8) ─────────────────────────────────────
+
+/// CEP-8 payment interaction mode negotiated per session.
+///
+/// Serialized as `"transparent"` / `"explicit_gating"` on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaymentInteractionMode {
+    /// Side-band notifications; the request is still forwarded after payment.
+    Transparent,
+    /// Request is gated with a JSON-RPC error until paid.
+    ExplicitGating,
+}
+
 // ── JSON-RPC types ──────────────────────────────────────────────────
 //
 // MCP uses JSON-RPC 2.0. We define our own types here since there's
@@ -410,6 +424,24 @@ mod tests {
         let s = serde_json::to_string(&mode).unwrap();
         assert_eq!(s, "\"disabled\"");
         let parsed: EncryptionMode = serde_json::from_str(&s).unwrap();
+        assert_eq!(parsed, mode);
+    }
+
+    #[test]
+    fn test_payment_interaction_mode_serde_roundtrip_transparent() {
+        let mode = PaymentInteractionMode::Transparent;
+        let s = serde_json::to_string(&mode).unwrap();
+        assert_eq!(s, "\"transparent\"");
+        let parsed: PaymentInteractionMode = serde_json::from_str(&s).unwrap();
+        assert_eq!(parsed, mode);
+    }
+
+    #[test]
+    fn test_payment_interaction_mode_serde_roundtrip_explicit_gating() {
+        let mode = PaymentInteractionMode::ExplicitGating;
+        let s = serde_json::to_string(&mode).unwrap();
+        assert_eq!(s, "\"explicit_gating\"");
+        let parsed: PaymentInteractionMode = serde_json::from_str(&s).unwrap();
         assert_eq!(parsed, mode);
     }
 

@@ -62,7 +62,7 @@ pub use core::error::{Error, Result};
 pub use core::types::{
     CapabilityExclusion, ClientSession, EncryptionMode, GiftWrapMode, JsonRpcError,
     JsonRpcErrorResponse, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
-    ProfileMetadata, ServerInfo,
+    PaymentInteractionMode, ProfileMetadata, ServerInfo,
 };
 
 // ── Discovery ────────────────────────────────────────────────────────
@@ -83,8 +83,9 @@ pub use transport::discovery_tags::{DiscoveredPeerCapabilities, PeerCapabilities
 
 // ── Transport (server) ──────────────────────────────────────────────
 pub use transport::server::{
-    ClientPubkey, InboundEvent, IncomingRequest, NostrServerTransport, NostrServerTransportConfig,
-    RouteEntry, ServerEventRouteStore, SessionSnapshot, SessionStore,
+    ClientPubkey, InboundContext, InboundEvent, InboundMiddleware, IncomingRequest, Next,
+    NostrServerTransport, NostrServerTransportConfig, RouteEntry, ServerEventRouteStore,
+    SessionSnapshot, SessionStore,
 };
 
 // ── rmcp re-export ──────────────────────────────────────────────────
