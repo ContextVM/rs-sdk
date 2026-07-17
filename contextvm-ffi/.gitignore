@@ -2,5 +2,6 @@
 __pycache__/
 *.py[cod]
 
-# C test binary built by c-tests/Makefile
+# C test binary + debug bundle built by c-tests/Makefile
 c-tests/test_ffi
+c-tests/test_ffi.dSYM/
