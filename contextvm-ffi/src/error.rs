@@ -22,6 +22,8 @@ pub enum ErrorCode {
     Unauthorized = 6,
     /// Serialization/deserialization error.
     Serialization = 7,
+    /// Payment (CEP-8) error.
+    Payment = 8,
     /// Generic / unknown error.
     Other = 99,
 }
@@ -43,6 +45,11 @@ impl From<&contextvm_sdk::Error> for ErrorCode {
             // transport-layer, so they surface as CVM_TRANSPORT. The C header
             // exposes no dedicated code; mirrors `OversizedTransfer`.
             contextvm_sdk::Error::OpenStream(_) => ErrorCode::Transport,
+            // CEP-8 payment failures get a dedicated FFI code so foreign callers can
+            // branch on "payment required/failed" rather than a generic error. The
+            // wildcard on the inner PaymentError keeps every later payment error off
+            // this map.
+            contextvm_sdk::Error::Payment(_) => ErrorCode::Payment,
             contextvm_sdk::Error::Other(_) => ErrorCode::Other,
         }
     }

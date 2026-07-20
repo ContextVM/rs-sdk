@@ -45,6 +45,8 @@ pub mod discovery;
 pub mod encryption;
 /// Gateway bridging a local MCP server to Nostr
 pub mod gateway;
+/// CEP-8 capability pricing and payment primitives
+pub mod payments;
 /// Proxy connecting to a remote MCP server via Nostr
 pub mod proxy;
 /// Nostr relay pool management
@@ -86,6 +88,20 @@ pub use transport::server::{
     ClientPubkey, InboundContext, InboundEvent, InboundMiddleware, IncomingRequest, Next,
     NostrServerTransport, NostrServerTransportConfig, RouteEntry, ServerEventRouteStore,
     SessionSnapshot, SessionStore,
+};
+
+// ── Payments (CEP-8) ─────────────────────────────────────────────────
+#[cfg(feature = "test-utils")]
+pub use payments::{
+    FakePaymentHandler, FakePaymentHandlerOptions, FakePaymentProcessor,
+    FakePaymentProcessorOptions,
+};
+pub use payments::{
+    Meta, PaymentAcceptedParams, PaymentError, PaymentHandler, PaymentHandlerRequest,
+    PaymentInteractionPolicy, PaymentOption, PaymentPendingErrorData, PaymentProcessor,
+    PaymentProcessorCreateParams, PaymentProcessorVerifyParams, PaymentRejectedParams,
+    PaymentRequiredErrorData, PaymentRequiredParams, PricedCapability, ResolvePrice,
+    ResolvePriceParams, ResolvePriceResult, VerifyOutcome,
 };
 
 // ── rmcp re-export ──────────────────────────────────────────────────

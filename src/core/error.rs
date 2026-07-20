@@ -42,6 +42,10 @@ pub enum Error {
     #[error("Open stream error: {0}")]
     OpenStream(#[from] crate::transport::open_stream::OpenStreamError),
 
+    /// CEP-8 payment error (pricing, issuance, verification, or settlement).
+    #[error("Payment error: {0}")]
+    Payment(#[from] crate::payments::PaymentError),
+
     /// Generic error
     #[error("{0}")]
     Other(String),
