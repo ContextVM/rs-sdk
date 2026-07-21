@@ -25,6 +25,18 @@ pub enum PaymentError {
     #[error("Payment handler error: {0}")]
     Handler(String),
 
+    /// Canonicalizing an invocation payload for the given method failed. In this
+    /// SDK the only trigger is a JSON integer outside the safe range
+    /// (`|n| > 2^53 - 1`), which RFC 8785 / I-JSON deem non-interoperable; the
+    /// message also names causes that only a dynamically typed peer can hit
+    /// (circular references, functions, symbols, BigInt) so it reads identically
+    /// to the ts-sdk failure.
+    #[error("Failed to canonicalize invocation payload for method '{method}'. Ensure params contain only JSON-serializable values (no circular references, functions, symbols, or BigInt).")]
+    Canonicalize {
+        /// The JSON-RPC method whose payload failed to canonicalize.
+        method: String,
+    },
+
     /// (De)serialization of a payment payload failed.
     #[error("Payment serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
