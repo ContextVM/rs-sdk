@@ -91,17 +91,17 @@ pub use transport::server::{
 };
 
 // ── Payments (CEP-8) ─────────────────────────────────────────────────
+pub use payments::{
+    CanonicalInvocationIdentity, Meta, PaymentAcceptedParams, PaymentError, PaymentHandler,
+    PaymentHandlerRequest, PaymentInteractionPolicy, PaymentOption, PaymentPendingErrorData,
+    PaymentProcessor, PaymentProcessorCreateParams, PaymentProcessorVerifyParams,
+    PaymentRejectedParams, PaymentRequiredErrorData, PaymentRequiredParams, PricedCapability,
+    ResolvePrice, ResolvePriceParams, ResolvePriceResult, VerifyOutcome,
+};
 #[cfg(feature = "test-utils")]
 pub use payments::{
     FakePaymentHandler, FakePaymentHandlerOptions, FakePaymentProcessor,
     FakePaymentProcessorOptions,
-};
-pub use payments::{
-    Meta, PaymentAcceptedParams, PaymentError, PaymentHandler, PaymentHandlerRequest,
-    PaymentInteractionPolicy, PaymentOption, PaymentPendingErrorData, PaymentProcessor,
-    PaymentProcessorCreateParams, PaymentProcessorVerifyParams, PaymentRejectedParams,
-    PaymentRequiredErrorData, PaymentRequiredParams, PricedCapability, ResolvePrice,
-    ResolvePriceParams, ResolvePriceResult, VerifyOutcome,
 };
 
 // ── rmcp re-export ──────────────────────────────────────────────────
