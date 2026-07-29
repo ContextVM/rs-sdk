@@ -248,6 +248,38 @@ pub struct ClientOpenStreamHandle {
 
 #[cfg_attr(not(feature = "rmcp"), allow(dead_code))]
 impl ClientOpenStreamHandle {
+    /// Cancel an active open-stream reader session by its progress token.
+    ///
+    /// Send-safe equivalent of `ToolStreamCall::abort`: publishes the `abort`
+    /// frame to the server and frees the reader-registry slot. Use this when the
+    /// caller can't hold `&ToolStreamCall` across an `.await` — e.g. a stream
+    /// driven inside `tokio::spawn`, where `ToolStreamCall`'s `!Sync` (its
+    /// `result: BoxFuture` field) makes `abort(&self)` unusable from a `Send`
+    /// task. This handle is `Sync`, so cloning it into a task and calling
+    /// `cancel(token, reason)` works from any thread.
+    ///
+    /// Mirrors the `abort` path: `OpenStreamSession::abort` publishes the frame
+    /// and finalizes the local stream, then `OpenStreamRegistry::consumer_abort`
+    /// removes the entry and runs the `on_abort` hook. Both are idempotent, so
+    /// canceling an unknown or already-terminated token is a harmless no-op.
+    /// Without it, dropping a `ToolStreamCall` without aborting leaves the reader
+    /// session lingering in the registry until the keepalive sweep probe-times it
+    /// out (`Probe timeout`).
+    pub async fn cancel(&self, progress_token: &str, reason: Option<String>) {
+        let registry = self.registry.clone();
+        // Clone the session out and release the lock before the publish await, so
+        // the frame send doesn't block other open-stream operations.
+        let session = registry.lock().await.get_session(progress_token);
+        if let Some(session) = session {
+            session.abort(reason.clone()).await;
+        }
+        registry
+            .lock()
+            .await
+            .consumer_abort(progress_token, reason)
+            .await;
+    }
+
     /// Register a placeholder for the next outbound `call_tool_stream` session
     /// (resolved by the served transport's `send`).
     pub(crate) fn prepare_outbound(
