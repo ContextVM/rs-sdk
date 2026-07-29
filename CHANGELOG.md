@@ -2,6 +2,49 @@
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-07-29
+
+### Added
+
+- `ClientOpenStreamHandle::cancel(token, reason)`: a `Send`-safe way to cancel a
+  CEP-41 open-stream reader session by its progress token from any task —
+  including a `tokio::spawn` that drives the stream. `ToolStreamCall` is `!Sync`
+  (its `result: BoxFuture` field), so `abort(&self)` can't be awaited from a
+  `Send` task, forcing consumers that drive a stream in a spawned task to drop the
+  call without cleaning up. `cancel` mirrors `abort` (publishes the `abort` frame
+  and frees the reader-registry slot via the idempotent `abort`/`consumer_abort`
+  pair) but operates on the `Sync` handle, so cloning the handle into a task and
+  calling `cancel(token, reason)` works from any thread.
+
+### Fixed
+
+- CEP-41 open-stream (server): the writer `progress_token → event_id` index is
+  now scoped by `(client_pubkey, token)`, not the bare token. The progress token
+  is only unique *within* a peer — rmcp mints it from a per-peer counter, so every
+  client's first stream carries token `"0"`. The old global key let two concurrent
+  clients clobber each other's entry, and either one's cleanup then deleted the
+  shared key, orphaning the other's still-live writer. The orphaned client's
+  keepalive pings found no writer → no `pong` → `Probe timeout` on an
+  otherwise-alive stream, reproducing only with ≥2 concurrent clients (hence unseen
+  by single-client test suites). The fix mirrors the TS `getProgressTokenKey`
+  composite and the existing per-peer reader registry; `slots` (keyed by
+  `event_id`) is unaffected. The oversized-transfer reassembly was verified
+  already per-peer scoped (`LruCache<sender_pubkey, …>`) and needs no change.
+- CEP-41 open-stream: a reader session whose `start` frame had not yet arrived no
+  longer emits a keepalive `ping`. The reader `SessionState::tick` now gates its
+  idle→ping transition on `started`, matching the writer's `tick` and restoring parity
+  with the TS SDK (whose idle timer arms only on `start`). Previously, a session
+  registered at request-publish time would ping after `idle_timeout` without ever
+  receiving `start`; on the server, a ping for a token whose writer had been disposed
+  (e.g. a tool that returned without streaming) was raised as a fatal
+  `Received ping frame before start` sequence error and logged as a WARN, and the
+  unanswered probe then aborted the client stream. (`session.rs`)
+- CEP-41 open-stream: a control frame (`ping`/`pong`/`abort`) for a token with no
+  reader session is now dropped at debug level instead of raising a fatal sequence
+  error. Such a frame is a teardown linger or pre-start desync, not a data-plane
+  violation; data frames (`chunk`/`close`) for unknown tokens still error.
+  (`registry.rs`)
+
 ## [0.2.1] - 2026-07-10
 
 ### Added
