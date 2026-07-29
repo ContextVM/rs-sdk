@@ -199,9 +199,25 @@ impl ServerOpenStreamState {
         self.lock_slots().get(event_id).map(|s| s.writer.clone())
     }
 
-    /// Resolve `progress_token → event_id`.
-    fn event_id_for_token(&self, token: &str) -> Option<String> {
-        self.lock_token_index().get(token).cloned()
+    /// Composite key for the per-client writer-token index.
+    ///
+    /// The progress token is only unique *within* a peer — rmcp mints it from a
+    /// per-peer counter (every client's first stream is `"0"`), so keying the
+    /// writer index by token alone lets concurrent clients clobber each other's
+    /// `token → event_id` entry and orphan a still-live writer (inbound pings
+    /// then find no writer → client `Probe timeout` on an alive stream). Scope by
+    /// `(client_pubkey, token)`, mirroring the TS `getProgressTokenKey` composite
+    /// and the per-peer reader registry. `slots` (keyed by `event_id`, globally
+    /// unique) is unaffected.
+    fn client_token_key(client_pubkey_hex: &str, token: &str) -> String {
+        format!("{client_pubkey_hex}:{token}")
+    }
+
+    /// Resolve `(client_pubkey, progress_token) → event_id`.
+    fn event_id_for_token(&self, client_pubkey_hex: &str, token: &str) -> Option<String> {
+        self.lock_token_index()
+            .get(&Self::client_token_key(client_pubkey_hex, token))
+            .cloned()
     }
 }
 
@@ -1079,9 +1095,12 @@ impl NostrServerTransport {
             // Drop the writer and send normally (progress-token-conflict guard —
             // a deferred-but-never-closed stream would otherwise hang the response).
             let token = slot.writer.progress_token().to_string();
+            let client = slot.snapshot.client_pubkey.to_hex();
             slots.remove(event_id);
             drop(slots);
-            self.open_stream.lock_token_index().remove(&token);
+            self.open_stream
+                .lock_token_index()
+                .remove(&ServerOpenStreamState::client_token_key(&client, &token));
             return OpenStreamDeferral::Passthrough(response);
         }
 
@@ -1090,9 +1109,12 @@ impl NostrServerTransport {
             // deliver now from the captured snapshot (the route may be swept).
             let snapshot = slot.snapshot.clone();
             let token = slot.writer.progress_token().to_string();
+            let client = snapshot.client_pubkey.to_hex();
             slots.remove(event_id);
             drop(slots);
-            self.open_stream.lock_token_index().remove(&token);
+            self.open_stream
+                .lock_token_index()
+                .remove(&ServerOpenStreamState::client_token_key(&client, &token));
             OpenStreamDeferral::SendNow { snapshot, response }
         } else {
             // Ordering A: the stream is still open — hold the response; the
@@ -1194,7 +1216,12 @@ impl NostrServerTransport {
         // Ordering A: the response was stashed before the stream closed — remove
         // the slot and deliver it now.
         state.lock_slots().remove(event_id);
-        state.lock_token_index().remove(&token);
+        state
+            .lock_token_index()
+            .remove(&ServerOpenStreamState::client_token_key(
+                &snapshot.client_pubkey.to_hex(),
+                &token,
+            ));
         if let Err(error) = Self::publish_open_stream_deferred_response(
             base,
             gift_wrap_mode,
@@ -2436,9 +2463,10 @@ impl NostrServerTransport {
                 terminated: false,
             },
         );
-        state
-            .lock_token_index()
-            .insert(progress_token.to_string(), event_id.to_string());
+        state.lock_token_index().insert(
+            ServerOpenStreamState::client_token_key(client_pubkey_hex, progress_token),
+            event_id.to_string(),
+        );
     }
 
     /// CEP-41 inbound interception (beside the oversized branch). Routes control
@@ -2466,7 +2494,7 @@ impl NostrServerTransport {
         // An active server→client writer owns this token's control frames.
         let writer = token
             .as_deref()
-            .and_then(|t| state.event_id_for_token(t))
+            .and_then(|t| state.event_id_for_token(sender_pubkey, t))
             .and_then(|eid| state.writer_for(&eid));
 
         match open_stream_frame_from_notification(notification) {
@@ -2754,7 +2782,7 @@ impl NostrServerTransport {
                     // (that index is only populated for server→client writers), so
                     // this ping is uncorrelated until bidirectional streaming wires
                     // a reader-side event id through.
-                    let correlated = state.event_id_for_token(&token);
+                    let correlated = state.event_id_for_token(&peer, &token);
                     Self::publish_open_stream_control_frame(
                         state,
                         relay_pool,
@@ -2771,7 +2799,7 @@ impl NostrServerTransport {
                     .await;
                 }
                 KeepaliveAction::Abort(reason) => {
-                    if let Some(eid) = state.event_id_for_token(&token) {
+                    if let Some(eid) = state.event_id_for_token(&peer, &token) {
                         if let Some(writer) = state.writer_for(&eid) {
                             let _ = writer.abort(Some(reason)).await;
                         }
@@ -3678,10 +3706,12 @@ mod tests {
         event_id: &str,
         writer: OpenStreamWriter,
         terminated: bool,
-    ) {
+    ) -> String {
         let token = writer.progress_token().to_string();
+        let client_pubkey = Keys::generate().public_key();
+        let client_pubkey_hex = client_pubkey.to_hex();
         let snapshot = RouteSnapshot {
-            client_pubkey: Keys::generate().public_key(),
+            client_pubkey,
             original_request_id: serde_json::json!(1),
             is_encrypted: false,
             mirrored_wrap_kind: None,
@@ -3695,7 +3725,11 @@ mod tests {
                 terminated,
             },
         );
-        state.lock_token_index().insert(token, event_id.to_string());
+        state.lock_token_index().insert(
+            ServerOpenStreamState::client_token_key(&client_pubkey_hex, &token),
+            event_id.to_string(),
+        );
+        client_pubkey_hex
     }
 
     fn dummy_response() -> JsonRpcMessage {
@@ -3724,7 +3758,7 @@ mod tests {
         // `!writer.has_started()` — writer created (progressToken present) but the
         // tool never streamed → drop the writer and Passthrough. The slot AND the
         // token index entry must both be removed so the unused writer cannot leak.
-        install_slot(
+        let unstarted_pk = install_slot(
             &transport.open_stream,
             "evt-unstarted",
             deferral_test_writer("tok-unstarted"),
@@ -3746,7 +3780,10 @@ mod tests {
             transport
                 .open_stream
                 .lock_token_index()
-                .get("tok-unstarted")
+                .get(&ServerOpenStreamState::client_token_key(
+                    &unstarted_pk,
+                    "tok-unstarted"
+                ))
                 .is_none(),
             "unstarted writer token index must be removed (no leak)"
         );
@@ -3756,7 +3793,7 @@ mod tests {
         // the slot + token index are freed.
         let terminal = deferral_test_writer("tok-terminal");
         terminal.start().await.expect("start");
-        install_slot(&transport.open_stream, "evt-terminal", terminal, true);
+        let terminal_pk = install_slot(&transport.open_stream, "evt-terminal", terminal, true);
         assert!(matches!(
             transport.try_defer_open_stream_response("evt-terminal", dummy_response()),
             OpenStreamDeferral::SendNow { .. }
@@ -3769,7 +3806,10 @@ mod tests {
         assert!(transport
             .open_stream
             .lock_token_index()
-            .get("tok-terminal")
+            .get(&ServerOpenStreamState::client_token_key(
+                &terminal_pk,
+                "tok-terminal"
+            ))
             .is_none());
 
         // `else` of `slot.terminated` (the function's "Ordering A") — started
@@ -3810,6 +3850,52 @@ mod tests {
             disabled.get_open_stream_writer("evt-disabled").is_none(),
             "a disabled server must not expose writers (deferral never attempted)"
         );
+    }
+
+    #[tokio::test]
+    async fn open_stream_writer_token_index_is_scoped_per_client() {
+        // Regression for the multi-client collision: the writer `token → event_id`
+        // index is keyed by `(client_pubkey, token)`, so two clients whose first
+        // stream both carry token "0" (rmcp's per-peer counter starts at 0) must
+        // NOT clobber each other. Each routes to its own writer, and either's
+        // cleanup leaves the other's live writer routable — otherwise an inbound
+        // ping finds no writer and the peer `Probe timeout`s an alive stream.
+        let config = NostrServerTransportConfig::default()
+            .with_open_stream(OpenStreamConfig::default().with_enabled(true));
+        let pool: Arc<dyn RelayPoolTrait> = Arc::new(MockRelayPool::new());
+        let transport = NostrServerTransport::with_relay_pool(config, pool)
+            .await
+            .expect("server transport");
+        let state = &transport.open_stream;
+
+        // Two clients both open their first stream: token "0" twice, distinct keys.
+        let pk_a = install_slot(state, "evtA", deferral_test_writer("0"), false);
+        let pk_b = install_slot(state, "evtB", deferral_test_writer("0"), false);
+
+        // Both writers are live and each token routes to its OWN event — no clobber.
+        assert_ne!(pk_a, pk_b, "distinct clients");
+        assert!(state.writer_for("evtA").is_some());
+        assert!(state.writer_for("evtB").is_some());
+        assert_eq!(
+            state.event_id_for_token(&pk_a, "0"),
+            Some("evtA".to_string())
+        );
+        assert_eq!(
+            state.event_id_for_token(&pk_b, "0"),
+            Some("evtB".to_string())
+        );
+
+        // B's cleanup removes only B's key; A's writer stays routable (the exact
+        // condition the bare-token index violated — A's ping would find nothing).
+        state
+            .lock_token_index()
+            .remove(&ServerOpenStreamState::client_token_key(&pk_b, "0"));
+        assert_eq!(
+            state.event_id_for_token(&pk_a, "0"),
+            Some("evtA".to_string())
+        );
+        assert!(state.writer_for("evtA").is_some());
+        assert_eq!(state.event_id_for_token(&pk_b, "0"), None);
     }
 
     // ── CEP-41 writer keepalive sweep (server→client, silent-client abort) ──
