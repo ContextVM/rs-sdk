@@ -36,6 +36,18 @@
 
 ### Fixed
 
+- CEP-41 open-stream (server): the writer `progress_token → event_id` index is
+  now scoped by `(client_pubkey, token)`, not the bare token. The progress token
+  is only unique *within* a peer — rmcp mints it from a per-peer counter, so every
+  client's first stream carries token `"0"`. The old global key let two concurrent
+  clients clobber each other's entry, and either one's cleanup then deleted the
+  shared key, orphaning the other's still-live writer. The orphaned client's
+  keepalive pings found no writer → no `pong` → `Probe timeout` on an
+  otherwise-alive stream, reproducing only with ≥2 concurrent clients (hence unseen
+  by single-client test suites). The fix mirrors the TS `getProgressTokenKey`
+  composite and the existing per-peer reader registry; `slots` (keyed by
+  `event_id`) is unaffected. The oversized-transfer reassembly was verified
+  already per-peer scoped (`LruCache<sender_pubkey, …>`) and needs no change.
 - CEP-41 open-stream: a reader session whose `start` frame had not yet arrived no
   longer emits a keepalive `ping`. The reader `SessionState::tick` now gates its
   idle→ping transition on `started`, matching the writer's `tick` and restoring parity
