@@ -70,6 +70,18 @@ pub mod tags {
 
     /// Support CEP-41 open-ended streaming via notifications/progress framing
     pub const SUPPORT_OPEN_STREAM: &str = "support_open_stream";
+
+    /// CEP-8 payment method identifier advertisement/negotiation tag.
+    pub const PMI: &str = "pmi";
+
+    /// CEP-8 session payment-interaction negotiation tag.
+    pub const PAYMENT_INTERACTION: &str = "payment_interaction";
+
+    /// CEP-8 optional bearer-asset direct-payment tag (type/name only; never produced by this SDK).
+    pub const DIRECT_PAYMENT: &str = "direct_payment";
+
+    /// CEP-8 optional bearer-asset change tag (type/name only; never produced by this SDK).
+    pub const CHANGE: &str = "change";
 }
 
 /// Maximum message size (1MB)
@@ -181,6 +193,11 @@ mod tests {
             tags::SUPPORT_OVERSIZED_TRANSFER,
             "support_oversized_transfer"
         );
+        assert_eq!(tags::SUPPORT_OPEN_STREAM, "support_open_stream");
+        assert_eq!(tags::PMI, "pmi");
+        assert_eq!(tags::PAYMENT_INTERACTION, "payment_interaction");
+        assert_eq!(tags::DIRECT_PAYMENT, "direct_payment");
+        assert_eq!(tags::CHANGE, "change");
     }
 
     #[test]

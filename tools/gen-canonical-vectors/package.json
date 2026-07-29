@@ -1,0 +1,14 @@
+{
+  "name": "gen-canonical-vectors",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Generates the CEP-8 canonical-invocation golden vectors (../../tests/fixtures/canonical_vectors.json) for rs-sdk by running the ts-sdk's real computeCanonicalInvocationHash. Development tool; not published.",
+  "scripts": {
+    "generate": "bun run generate.mjs"
+  },
+  "dependencies": {
+    "canonicalize": "2.1.0",
+    "@noble/hashes": "2.2.0"
+  }
+}

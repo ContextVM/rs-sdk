@@ -45,6 +45,8 @@ pub mod discovery;
 pub mod encryption;
 /// Gateway bridging a local MCP server to Nostr
 pub mod gateway;
+/// CEP-8 capability pricing and payment primitives
+pub mod payments;
 /// Proxy connecting to a remote MCP server via Nostr
 pub mod proxy;
 /// Nostr relay pool management
@@ -62,7 +64,7 @@ pub use core::error::{Error, Result};
 pub use core::types::{
     CapabilityExclusion, ClientSession, EncryptionMode, GiftWrapMode, JsonRpcError,
     JsonRpcErrorResponse, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
-    ProfileMetadata, ServerInfo,
+    PaymentInteractionMode, ProfileMetadata, ServerInfo,
 };
 
 // ── Discovery ────────────────────────────────────────────────────────
@@ -83,8 +85,24 @@ pub use transport::discovery_tags::{DiscoveredPeerCapabilities, PeerCapabilities
 
 // ── Transport (server) ──────────────────────────────────────────────
 pub use transport::server::{
-    ClientPubkey, InboundEvent, IncomingRequest, NostrServerTransport, NostrServerTransportConfig,
-    RouteEntry, ServerEventRouteStore, SessionSnapshot, SessionStore,
+    ClientPubkey, InboundContext, InboundEvent, InboundMiddleware, IncomingRequest, Next,
+    NostrServerTransport, NostrServerTransportConfig, RouteEntry, ServerEventRouteStore,
+    SessionSnapshot, SessionStore,
+};
+
+// ── Payments (CEP-8) ─────────────────────────────────────────────────
+pub use payments::{
+    AuthorizationStore, CanonicalInvocationIdentity, Meta, PaymentAcceptedParams, PaymentError,
+    PaymentHandler, PaymentHandlerRequest, PaymentInteractionPolicy, PaymentOption,
+    PaymentPendingErrorData, PaymentProcessor, PaymentProcessorCreateParams,
+    PaymentProcessorVerifyParams, PaymentRejectedParams, PaymentRequiredErrorData,
+    PaymentRequiredParams, PricedCapability, ResolvePrice, ResolvePriceParams, ResolvePriceResult,
+    VerifyOutcome,
+};
+#[cfg(feature = "test-utils")]
+pub use payments::{
+    FakePaymentHandler, FakePaymentHandlerOptions, FakePaymentProcessor,
+    FakePaymentProcessorOptions,
 };
 
 // ── rmcp re-export ──────────────────────────────────────────────────
