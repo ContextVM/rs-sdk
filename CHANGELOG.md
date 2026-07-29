@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-07-29
+
 ### Added
 
 - `ClientOpenStreamHandle::cancel(token, reason)`: a `Send`-safe way to cancel a
@@ -12,27 +14,7 @@
   call without cleaning up. `cancel` mirrors `abort` (publishes the `abort` frame
   and frees the reader-registry slot via the idempotent `abort`/`consumer_abort`
   pair) but operates on the `Sync` handle, so cloning the handle into a task and
-  calling `cancel(token, reason)` works from any thread. Without it, a dropped
-  `ToolStreamCall` leaves the reader session lingering in the registry until the
-  keepalive sweep probe-times it out (`Probe timeout`).
-- A general-purpose, public inbound-middleware seam on `NostrServerTransport`:
-  `add_inbound_middleware` with the `InboundMiddleware` trait, an `InboundContext`
-  describing the request, and an owned `Next`, letting callers observe, gate, or
-  transform an inbound request before it reaches the MCP handler. Behavior-preserving
-  when no middleware is registered.
-- CEP-8 capability pricing and payments (in progress; foundational pieces, not yet a
-  usable payment flow):
-  - Payment protocol primitives: constants, `cap` / `pmi` / `payment_interaction` tag
-    builders and parsers, the notification and explicit-gating error `data` types, the
-    `PaymentProcessor` / `PaymentHandler` / `ResolvePrice` traits, and deterministic
-    fakes behind the `test-utils` feature.
-  - Canonical invocation identity: the SHA-256 of the RFC 8785 (JCS) serialization of
-    `{ method, params }` with `params._meta` removed, so a retry matches a paid
-    authorization regardless of per-request transport metadata. Includes cross-SDK
-    golden vectors.
-  - `AuthorizationStore`: a bounded, TTL-aware store of pending and granted payment
-    authorizations, with atomic single-use `claim` and check-and-set `try_set_pending`
-    semantics that are double-spend-safe under multi-threaded tokio.
+  calling `cancel(token, reason)` works from any thread.
 
 ### Fixed
 
