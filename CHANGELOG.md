@@ -4,6 +4,17 @@
 
 ### Added
 
+- `ClientOpenStreamHandle::cancel(token, reason)`: a `Send`-safe way to cancel a
+  CEP-41 open-stream reader session by its progress token from any task —
+  including a `tokio::spawn` that drives the stream. `ToolStreamCall` is `!Sync`
+  (its `result: BoxFuture` field), so `abort(&self)` can't be awaited from a
+  `Send` task, forcing consumers that drive a stream in a spawned task to drop the
+  call without cleaning up. `cancel` mirrors `abort` (publishes the `abort` frame
+  and frees the reader-registry slot via the idempotent `abort`/`consumer_abort`
+  pair) but operates on the `Sync` handle, so cloning the handle into a task and
+  calling `cancel(token, reason)` works from any thread. Without it, a dropped
+  `ToolStreamCall` leaves the reader session lingering in the registry until the
+  keepalive sweep probe-times it out (`Probe timeout`).
 - A general-purpose, public inbound-middleware seam on `NostrServerTransport`:
   `add_inbound_middleware` with the `InboundMiddleware` trait, an `InboundContext`
   describing the request, and an owned `Next`, letting callers observe, gate, or

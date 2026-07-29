@@ -518,6 +518,53 @@ async fn open_stream_client_abort_propagates() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn open_stream_cancel_by_token_from_spawn() {
+    // Regression for the consumer "forced onto the drop path" gap: `ToolStreamCall`
+    // is `!Sync` (`result: BoxFuture`), so `abort(&self)` can't be awaited from a
+    // `tokio::spawn`. `ClientOpenStreamHandle::cancel(token)` is the Send-safe way
+    // out — it must (a) compile when called from a spawned task and (b) behave
+    // like `abort`: publish an `abort` to the server, surface a local terminal
+    // error, free the slot, and let the tool return.
+    let fx = fixture(true, true, false).await;
+
+    let mut call = call_tool_stream(
+        fx.client.peer(),
+        &fx.handle,
+        call_params("client_abortable", "orders"),
+    )
+    .await
+    .expect("call_tool_stream");
+
+    let first = call.stream.next().await.expect("first chunk").expect("ok");
+    assert_eq!(first, "orders:1");
+
+    // Cancel by token from a spawned task — the path `call.abort()` can't take.
+    let token = call.progress_token.clone();
+    let cancel_handle = fx.handle.clone();
+    let cancel_task = tokio::spawn(async move {
+        cancel_handle
+            .cancel(&token, Some("client cancelled".to_string()))
+            .await;
+    });
+    cancel_task.await.expect("cancel task panicked");
+
+    // The local stream surfaces the terminal abort error.
+    match call.stream.next().await {
+        Some(Err(error)) => assert!(error.to_string().contains("client cancelled")),
+        other => panic!("expected an abort error, got {other:?}"),
+    }
+
+    // The server tool observed the abort (writer inactive) and returned.
+    let result = tokio::time::timeout(Duration::from_secs(10), &mut call.result)
+        .await
+        .expect("result timed out")
+        .expect("tool call failed");
+    assert_eq!(first_text(&result), "client-aborted:orders");
+
+    shutdown(fx).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn open_stream_unstarted_writer_sends_normal_response() {
     let fx = fixture(true, true, false).await;
 
