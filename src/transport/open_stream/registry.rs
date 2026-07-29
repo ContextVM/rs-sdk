@@ -212,13 +212,37 @@ impl OpenStreamRegistry {
         let (progress_token, progress, frame) = parse_frame(notification)?;
 
         if !self.sessions.contains_key(&progress_token) {
-            if frame.frame_type() != "start" {
-                return Err(OpenStreamError::Sequence(format!(
-                    "Received {} frame before start for {progress_token}",
-                    frame.frame_type()
-                )));
+            match frame.frame_type() {
+                "start" => {
+                    self.create_session_with(
+                        progress_token.clone(),
+                        OpenStreamSessionInit::default(),
+                    )?;
+                }
+                // A control frame (`ping`/`pong`/`abort`) for a token with no
+                // session is a teardown linger — the writer was already disposed
+                // — or a pre-start desync. It carries no data, so drop it at
+                // debug instead of raising a fatal sequence error that logs a
+                // misleading "Received ping frame before start" WARN. Data
+                // frames (`chunk`/`close`) still error: those are a genuine
+                // protocol problem.
+                "ping" | "pong" | "abort" => {
+                    tracing::debug!(
+                        target: LOG_TARGET,
+                        frame = %frame.frame_type(),
+                        %progress_token,
+                        "open-stream control frame for unknown token; dropping \
+                         (teardown linger or pre-start desync)"
+                    );
+                    return Ok(FrameOutcome::None);
+                }
+                _ => {
+                    return Err(OpenStreamError::Sequence(format!(
+                        "Received {} frame before start for {progress_token}",
+                        frame.frame_type()
+                    )));
+                }
             }
-            self.create_session_with(progress_token.clone(), OpenStreamSessionInit::default())?;
         }
 
         // Clone the Arc-backed handle out so the map is not borrowed across the
@@ -507,6 +531,44 @@ mod tests {
         assert!(matches!(err, OpenStreamError::Sequence(_)));
         assert!(registry.get_session("token-missing-start").is_none());
         assert_eq!(registry.size(), 0);
+    }
+
+    #[tokio::test]
+    async fn drops_control_frames_for_unknown_tokens() {
+        // A `ping`/`pong`/`abort` for a token with no session is a teardown
+        // linger (the writer was already disposed) or a pre-start desync — not a
+        // data-plane violation. Drop it at debug instead of raising a fatal
+        // sequence error, and create no session. Data frames still error (see
+        // `rejects_non_start_frames_for_unknown_tokens`).
+        let mut registry = OpenStreamRegistry::with_policy(small_policy(2));
+        for (label, frame) in [
+            (
+                "ping",
+                OpenStreamFrame::Ping {
+                    nonce: "n".to_string(),
+                },
+            ),
+            (
+                "pong",
+                OpenStreamFrame::Pong {
+                    nonce: "n".to_string(),
+                },
+            ),
+            (
+                "abort",
+                OpenStreamFrame::Abort {
+                    reason: Some("bye".to_string()),
+                },
+            ),
+        ] {
+            let outcome = registry
+                .process_frame(now(), &notif("token-ctrl", 1, frame))
+                .await
+                .unwrap_or_else(|e| panic!("{label} for unknown token should drop, got {e}"));
+            assert_eq!(outcome, FrameOutcome::None, "{label} outcome");
+            assert!(registry.get_session("token-ctrl").is_none());
+            assert_eq!(registry.size(), 0);
+        }
     }
 
     #[tokio::test]
