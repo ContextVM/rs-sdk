@@ -23,6 +23,23 @@
     authorizations, with atomic single-use `claim` and check-and-set `try_set_pending`
     semantics that are double-spend-safe under multi-threaded tokio.
 
+### Fixed
+
+- CEP-41 open-stream: a reader session whose `start` frame had not yet arrived no
+  longer emits a keepalive `ping`. The reader `SessionState::tick` now gates its
+  idle→ping transition on `started`, matching the writer's `tick` and restoring parity
+  with the TS SDK (whose idle timer arms only on `start`). Previously, a session
+  registered at request-publish time would ping after `idle_timeout` without ever
+  receiving `start`; on the server, a ping for a token whose writer had been disposed
+  (e.g. a tool that returned without streaming) was raised as a fatal
+  `Received ping frame before start` sequence error and logged as a WARN, and the
+  unanswered probe then aborted the client stream. (`session.rs`)
+- CEP-41 open-stream: a control frame (`ping`/`pong`/`abort`) for a token with no
+  reader session is now dropped at debug level instead of raising a fatal sequence
+  error. Such a frame is a teardown linger or pre-start desync, not a data-plane
+  violation; data frames (`chunk`/`close`) for unknown tokens still error.
+  (`registry.rs`)
+
 ## [0.2.1] - 2026-07-10
 
 ### Added
