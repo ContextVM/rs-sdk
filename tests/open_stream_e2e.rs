@@ -518,6 +518,53 @@ async fn open_stream_client_abort_propagates() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn open_stream_cancel_by_token_from_spawn() {
+    // Regression for the consumer "forced onto the drop path" gap: `ToolStreamCall`
+    // is `!Sync` (`result: BoxFuture`), so `abort(&self)` can't be awaited from a
+    // `tokio::spawn`. `ClientOpenStreamHandle::cancel(token)` is the Send-safe way
+    // out — it must (a) compile when called from a spawned task and (b) behave
+    // like `abort`: publish an `abort` to the server, surface a local terminal
+    // error, free the slot, and let the tool return.
+    let fx = fixture(true, true, false).await;
+
+    let mut call = call_tool_stream(
+        fx.client.peer(),
+        &fx.handle,
+        call_params("client_abortable", "orders"),
+    )
+    .await
+    .expect("call_tool_stream");
+
+    let first = call.stream.next().await.expect("first chunk").expect("ok");
+    assert_eq!(first, "orders:1");
+
+    // Cancel by token from a spawned task — the path `call.abort()` can't take.
+    let token = call.progress_token.clone();
+    let cancel_handle = fx.handle.clone();
+    let cancel_task = tokio::spawn(async move {
+        cancel_handle
+            .cancel(&token, Some("client cancelled".to_string()))
+            .await;
+    });
+    cancel_task.await.expect("cancel task panicked");
+
+    // The local stream surfaces the terminal abort error.
+    match call.stream.next().await {
+        Some(Err(error)) => assert!(error.to_string().contains("client cancelled")),
+        other => panic!("expected an abort error, got {other:?}"),
+    }
+
+    // The server tool observed the abort (writer inactive) and returned.
+    let result = tokio::time::timeout(Duration::from_secs(10), &mut call.result)
+        .await
+        .expect("result timed out")
+        .expect("tool call failed");
+    assert_eq!(first_text(&result), "client-aborted:orders");
+
+    shutdown(fx).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn open_stream_unstarted_writer_sends_normal_response() {
     let fx = fixture(true, true, false).await;
 
@@ -805,4 +852,113 @@ async fn plain_call_with_progress_token_does_not_interfere_with_live_stream() {
     assert_eq!(first_text(&result), "done:orders");
 
     shutdown(fx).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn open_stream_two_clients_same_token_no_crosstalk() {
+    // The multi-client guard that should have always existed. Two CVM clients
+    // each open their FIRST stream → both carry progress token "0" (rmcp's
+    // per-peer counter starts at 0). The server's writer token index is scoped by
+    // `(client_pubkey, token)`, so one client's `abort` must route to its OWN
+    // writer, not the other's. Before the per-client fix the second install
+    // clobbered the shared "0" key, so A's abort killed B's writer (cross-talk)
+    // while A's kept running — the failure that surfaced live as `Probe timeout`
+    // on otherwise-alive streams.
+    //
+    // Discriminator: `client_abortable` returns `client-aborted:{topic}` as soon
+    // as its writer goes inactive, else after a 1.5 s spin. So a correctly-routed
+    // abort resolves A's result in << 500 ms; a misrouted one (abort hit B) lets
+    // A's result hang past 500 ms — failing the assertion below.
+    let mut pools = MockRelayPool::create_linked_group(3);
+    let server_pubkey_hex = pools[0].mock_public_key().to_hex();
+    let server_pool: Arc<dyn RelayPoolTrait> = Arc::new(pools.remove(0));
+
+    let server_transport = NostrServerTransport::with_relay_pool(
+        NostrServerTransportConfig::default()
+            .with_encryption_mode(EncryptionMode::Disabled)
+            .with_open_stream(OpenStreamConfig::default().with_enabled(true)),
+        server_pool,
+    )
+    .await
+    .expect("server transport");
+
+    let release = Arc::new(Notify::new());
+    let server = StreamServer::new(release);
+    let server_handle = tokio::spawn(async move {
+        server
+            .serve(server_transport)
+            .await
+            .expect("server serve failed")
+            .waiting()
+            .await
+            .expect("server error");
+    });
+    let_event_loops_start().await;
+
+    // Serve two independent clients on the shared server.
+    let mk_client = |pool: MockRelayPool, server_pubkey_hex: String| async move {
+        let transport = NostrClientTransport::with_relay_pool(
+            NostrClientTransportConfig::default()
+                .with_server_pubkey(server_pubkey_hex)
+                .with_encryption_mode(EncryptionMode::Disabled)
+                .with_relay_urls(vec!["wss://mock.relay".to_string()])
+                .with_open_stream(OpenStreamConfig::default().with_enabled(true)),
+            as_pool(pool),
+        )
+        .await
+        .expect("client transport");
+        let handle = transport.open_stream_handle();
+        let client = tokio::time::timeout(Duration::from_secs(5), DemoClient.serve(transport))
+            .await
+            .expect("client startup timed out")
+            .expect("client init failed");
+        (client, handle)
+    };
+    let client_a_pool = pools.remove(0);
+    let client_b_pool = pools.remove(0);
+    let (client_a, handle_a) = mk_client(client_a_pool, server_pubkey_hex.clone()).await;
+    let (client_b, handle_b) = mk_client(client_b_pool, server_pubkey_hex.clone()).await;
+
+    // Both FIRST streams → token "0" each, from distinct client pubkeys.
+    let mut call_a = call_tool_stream(
+        client_a.peer(),
+        &handle_a,
+        call_params("client_abortable", "alpha"),
+    )
+    .await
+    .expect("call_a");
+    let mut call_b = call_tool_stream(
+        client_b.peer(),
+        &handle_b,
+        call_params("client_abortable", "beta"),
+    )
+    .await
+    .expect("call_b");
+    assert_eq!(call_a.stream.next().await.unwrap().unwrap(), "alpha:1");
+    assert_eq!(call_b.stream.next().await.unwrap().unwrap(), "beta:1");
+
+    // A cancels its own stream. The `abort` must reach A's writer (not B's).
+    call_a.abort(None).await;
+
+    // A's writer went inactive immediately → A's tool returns well inside the
+    // 1.5 s spin. Before the fix, A's abort routed to B's writer via the
+    // clobbered "0" key, so A's writer never saw it and this timed out.
+    let result_a = tokio::time::timeout(Duration::from_millis(500), &mut call_a.result)
+        .await
+        .expect("A's abort must route to A's own writer, not hang")
+        .expect("A tool failed");
+    assert_eq!(first_text(&result_a), "client-aborted:alpha");
+
+    // B was not collateral-damaged: clean it up and confirm its OWN abort routes
+    // to its OWN writer (returns client-aborted:beta, not alpha).
+    call_b.abort(None).await;
+    let result_b = tokio::time::timeout(Duration::from_secs(5), &mut call_b.result)
+        .await
+        .expect("B result timed out")
+        .expect("B tool failed");
+    assert_eq!(first_text(&result_b), "client-aborted:beta");
+
+    let _ = client_a.cancel().await;
+    let _ = client_b.cancel().await;
+    server_handle.abort();
 }

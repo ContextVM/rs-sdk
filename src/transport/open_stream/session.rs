@@ -286,8 +286,17 @@ impl SessionState {
             }
         }
 
-        // 3. Idle past the threshold (and not closed / not already probing) → ping.
-        if !self.closed_remotely
+        // 3. Idle past the threshold (and started / not closed / not already
+        //    probing) → ping. A session that hasn't received `start` has nothing
+        //    to probe — and the writer-side `tick` already gates on `started`.
+        //    This also restores parity with the TS port, whose idle timer arms
+        //    only on `start`; the sweep-driven `tick` matches by gating here.
+        //    Without it, a reader session registered at request-publish time
+        //    (before `start` lands) pings after `idle_timeout` and the server —
+        //    which may have reaped an un-started writer — raises a fatal
+        //    "Received ping frame before start" sequence error.
+        if self.started
+            && !self.closed_remotely
             && self.pending_probe_nonce.is_none()
             && now.saturating_duration_since(self.last_activity) >= self.idle_timeout
         {
@@ -1038,6 +1047,23 @@ mod tests {
     }
 
     // ── keepalive (pure `tick`, injected clock) ─────────────────────
+
+    #[tokio::test]
+    async fn tick_returns_none_before_start() {
+        // Parity with the writer's `tick_returns_none_before_start`: a reader
+        // session that hasn't received `start` must not probe (nothing to keep
+        // alive yet). The TS port arms its idle timer only on `start`; the
+        // sweep-driven `tick` matches by gating on `started`. Regression guard
+        // for the pre-start ping that surfaced server-side as "Received ping
+        // frame before start for <token>".
+        let t0 = Instant::now();
+        let s = make_session_timers("token-pre-start", 10, 10, 100);
+        assert_eq!(
+            s.tick(t0 + Duration::from_millis(100)),
+            KeepaliveAction::None
+        );
+        assert!(!s.has_started());
+    }
 
     #[tokio::test]
     async fn ping_frame_requests_a_pong() {
