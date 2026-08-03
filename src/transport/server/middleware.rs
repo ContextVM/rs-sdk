@@ -21,8 +21,9 @@ use crate::core::types::{JsonRpcMessage, PaymentInteractionMode};
 /// Per-event context handed to every inbound middleware.
 ///
 /// Built once per event and shared (by `Arc`) across the whole chain. The four transport-level
-/// fields are populated at the seam; `client_pmis` and `payment_interaction` stay `None` until
-/// CEP-8 negotiation fills them.
+/// fields are populated at the seam. The two CEP-8 fields have different lifetimes:
+/// `client_pmis` is read off this event's tags, while `payment_interaction` is the mode negotiated
+/// for the session.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct InboundContext {
@@ -34,9 +35,14 @@ pub struct InboundContext {
     pub is_encrypted: bool,
     /// Inbound gift-wrap kind to mirror on the response (CEP-19); `None` for plaintext.
     pub mirrored_wrap_kind: Option<u16>,
-    /// Client-advertised payment method ids. `None` until CEP-8 negotiation populates it.
+    /// Payment method ids the client advertised **on this event** (CEP-8 `pmi` tags), in
+    /// preference order. `None` when this event carried none, which says nothing about what the
+    /// client advertised earlier: the ids are not accumulated on the session, so a client that
+    /// sent them with `initialize` presents `None` on a later invocation.
     pub client_pmis: Option<Vec<String>>,
-    /// Effective negotiated payment interaction mode. `None` until CEP-8 negotiation populates it.
+    /// Effective CEP-8 payment interaction mode negotiated for the session this event belongs to.
+    /// Unlike [`client_pmis`](Self::client_pmis) this persists across the session, and an
+    /// unnegotiated session resolves to [`PaymentInteractionMode::Transparent`] rather than `None`.
     pub payment_interaction: Option<PaymentInteractionMode>,
 }
 
@@ -123,6 +129,8 @@ pub(crate) fn dispatch_inbound(
     event_id: String,
     is_encrypted: bool,
     mirrored_wrap_kind: Option<u16>,
+    client_pmis: Option<Vec<String>>,
+    payment_interaction: Option<PaymentInteractionMode>,
     event: Option<Event>,
 ) {
     if middlewares.is_empty() {
@@ -142,8 +150,8 @@ pub(crate) fn dispatch_inbound(
         request_event_id: event_id,
         is_encrypted,
         mirrored_wrap_kind,
-        client_pmis: None,
-        payment_interaction: None,
+        client_pmis,
+        payment_interaction,
     });
     spawn_inbound_chain(
         Arc::clone(middlewares),
@@ -368,8 +376,10 @@ mod tests {
             "client_pk".to_string(),
             "e1".to_string(),
             false,
-            None,
-            None,
+            None, // mirrored_wrap_kind
+            None, // client_pmis
+            None, // payment_interaction
+            None, // event
         );
 
         let got = rx.try_recv().expect("empty chain forwards inline");

@@ -17,7 +17,7 @@
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
-use crate::core::types::JsonRpcRequest;
+use crate::core::types::{JsonRpcRequest, PaymentInteractionMode};
 
 /// Permissive transparency metadata (`_meta`), a JSON object of arbitrary keys.
 ///
@@ -55,6 +55,11 @@ pub struct PricedCapability {
 /// Server policy for which payment lifecycles it accepts (config; mirrors the OPTIONAL enc/giftwrap pattern).
 ///
 /// Wire values are `"optional"` / `"transparent"`.
+///
+/// [`Default`] is the permissive `Optional`, which applies when a server is configuring payments and
+/// does not name a policy. It is NOT what an unconfigured server does: a transport that was never
+/// given a policy rejects `explicit_gating`, so absent payments and `Default::default()` mean
+/// opposite things here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PaymentInteractionPolicy {
@@ -153,6 +158,30 @@ pub struct PaymentPendingErrorData {
     /// Optional seconds the client SHOULD wait before retrying.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_after: Option<u64>,
+}
+
+/// `error.data` for the `-32602` unsupported-`payment_interaction` negotiation error.
+/// Emitter key order: requested, supported.
+///
+/// Serializes to `{ "requested": "<mode>", "supported": ["transparent"] }`, byte-identical to the
+/// ts-sdk inline literal. This is a JSON-RPC invalid-params negotiation error, not a payment error.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnsupportedPaymentInteractionData {
+    /// The mode the client requested (`explicit_gating` at the only emit site).
+    pub requested: PaymentInteractionMode,
+    /// The modes the server supports.
+    pub supported: Vec<PaymentInteractionMode>,
+}
+
+impl UnsupportedPaymentInteractionData {
+    /// Build the data for a rejected requested mode. A server that rejects a mode supports only
+    /// `transparent`, so `supported` is always `["transparent"]`.
+    pub fn new(requested: PaymentInteractionMode) -> Self {
+        Self {
+            requested,
+            supported: vec![PaymentInteractionMode::Transparent],
+        }
+    }
 }
 
 // ── Trait param / return structs (internal; not wire types) ─────────

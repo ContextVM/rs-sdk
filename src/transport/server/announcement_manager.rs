@@ -244,7 +244,6 @@ impl AnnouncementManager {
     }
 
     /// Returns a reference to the current pricing tags.
-    #[allow(dead_code)] // API reserved for CEP-8 pricing integration
     pub fn get_pricing_tags(&self) -> &[Tag] {
         &self.pricing_tags
     }

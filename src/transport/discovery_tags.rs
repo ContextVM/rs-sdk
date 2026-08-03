@@ -7,6 +7,7 @@
 use nostr_sdk::prelude::*;
 
 use crate::core::constants::tags;
+use crate::payments::tags::parse_pmi_tag;
 
 /// Routing tag names that are excluded from discovery tags.
 const NON_DISCOVERY_TAG_NAMES: &[&str] = &["p", "e"];
@@ -61,6 +62,34 @@ pub fn learn_peer_capabilities(tags: &[Tag]) -> PeerCapabilities {
         supports_oversized_transfer: has_single_tag(tags, tags::SUPPORT_OVERSIZED_TRANSFER),
         supports_open_stream: has_single_tag(tags, tags::SUPPORT_OPEN_STREAM),
     }
+}
+
+// ── CEP-8 payment negotiation tags ──────────────────────────────────
+
+/// Collects every `pmi` tag value (index 1), in tag order. Empty when none are present.
+///
+/// CEP-8 sends one 2-element `pmi` tag per payment method, in preference order, so this is a
+/// multi-valued collector rather than a boolean flag. Mirrors TS SDK's client-PMI filter/map in
+/// `inbound-coordinator.ts`.
+pub fn extract_pmis(tags: &[Tag]) -> Vec<String> {
+    tags.iter().filter_map(parse_pmi_tag).collect()
+}
+
+/// Returns the value (index 1) of the **first** `payment_interaction` tag, raw, or `None` when
+/// absent.
+///
+/// The value is deliberately not parsed into a mode here: negotiation distinguishes "absent"
+/// (inherit the current effective mode) from "present but unrecognized" (downgrade to
+/// `transparent`), and a parse that mapped both to `None` would collapse the two. Mirrors TS SDK's
+/// `tags.find(...)` in `inbound-coordinator.ts`.
+pub fn extract_payment_interaction(tags: &[Tag]) -> Option<String> {
+    tags.iter().find_map(|tag| {
+        let parts = tag.clone().to_vec();
+        match (parts.first().map(String::as_str), parts.get(1)) {
+            (Some(name), Some(value)) if name == tags::PAYMENT_INTERACTION => Some(value.clone()),
+            _ => None,
+        }
+    })
 }
 
 /// Parsed capability flags together with the raw discovery tags.
@@ -267,6 +296,99 @@ mod tests {
         let result = parse_discovered_peer_capabilities(&[]);
         assert!(result.discovery_tags.is_empty());
         assert_eq!(result.capabilities, PeerCapabilities::default());
+    }
+
+    // ── extract_pmis (CEP-8) ────────────────────────────────────────
+
+    #[test]
+    fn extract_pmis_collects_in_order() {
+        let tags = vec![
+            make_tag(&["pmi", "bitcoin-lightning-bolt11"]),
+            make_tag(&["support_encryption"]),
+            make_tag(&["pmi", "cashu"]),
+        ];
+        assert_eq!(
+            extract_pmis(&tags),
+            vec!["bitcoin-lightning-bolt11", "cashu"]
+        );
+    }
+
+    #[test]
+    fn extract_pmis_empty_when_absent() {
+        assert!(extract_pmis(&[]).is_empty());
+        assert!(extract_pmis(&[make_tag(&["name", "Server"])]).is_empty());
+    }
+
+    #[test]
+    fn extract_pmis_ignores_valueless_pmi() {
+        // A bare `["pmi"]` carries no method id and is skipped.
+        assert!(extract_pmis(&[make_tag(&["pmi"])]).is_empty());
+    }
+
+    // ── extract_payment_interaction (CEP-8) ─────────────────────────
+
+    #[test]
+    fn extract_payment_interaction_returns_raw_value() {
+        let tags = vec![make_tag(&["payment_interaction", "explicit_gating"])];
+        assert_eq!(
+            extract_payment_interaction(&tags),
+            Some("explicit_gating".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_payment_interaction_none_when_absent() {
+        assert_eq!(extract_payment_interaction(&[]), None);
+        assert_eq!(
+            extract_payment_interaction(&[make_tag(&["support_encryption"])]),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_payment_interaction_preserves_unknown_value() {
+        // An unrecognized value must survive extraction so the negotiator can
+        // distinguish it from an absent tag and downgrade to `transparent`.
+        let tags = vec![make_tag(&["payment_interaction", "bogus"])];
+        assert_eq!(
+            extract_payment_interaction(&tags),
+            Some("bogus".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_payment_interaction_takes_first_of_many() {
+        let tags = vec![
+            make_tag(&["payment_interaction", "transparent"]),
+            make_tag(&["payment_interaction", "explicit_gating"]),
+        ];
+        assert_eq!(
+            extract_payment_interaction(&tags),
+            Some("transparent".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_payment_interaction_ignores_valueless_tag() {
+        assert_eq!(
+            extract_payment_interaction(&[make_tag(&["payment_interaction"])]),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_payment_interaction_skips_valueless_and_continues() {
+        // A valueless tag must be skipped, not treated as the match. Stopping at the first tag
+        // that merely has the right NAME would return `None` here and silently disable
+        // negotiation for a client that sent both.
+        let tags = vec![
+            make_tag(&["payment_interaction"]),
+            make_tag(&["payment_interaction", "explicit_gating"]),
+        ];
+        assert_eq!(
+            extract_payment_interaction(&tags),
+            Some("explicit_gating".to_string())
+        );
     }
 
     // ── PeerCapabilities ────────────────────────────────────────────
