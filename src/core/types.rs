@@ -186,7 +186,11 @@ impl ProfileMetadata {
 // ── Client session ──────────────────────────────────────────────────
 
 /// Client session state tracked by the server transport.
+///
+/// `#[non_exhaustive]`: the transport adds fields as new CEPs land, so construct via
+/// [`ClientSession::new`] rather than a struct literal.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ClientSession {
     /// Whether the client has completed MCP initialization.
     pub is_initialized: bool,
@@ -205,6 +209,12 @@ pub struct ClientSession {
     /// Learned from client discovery tags: peer supports CEP-41 open streams
     /// (learned, gated by the server's open-stream config).
     pub supports_open_stream: bool,
+    /// CEP-8: the payment-interaction mode the client requested (last `payment_interaction` tag seen).
+    pub requested_payment_interaction: Option<PaymentInteractionMode>,
+    /// CEP-8: the payment-interaction mode negotiated as effective for this session.
+    pub effective_payment_interaction: Option<PaymentInteractionMode>,
+    /// CEP-8: whether the effective mode has been disclosed on a response to this client yet.
+    pub has_disclosed_payment_interaction: bool,
     /// Last activity timestamp.
     pub last_activity: Instant,
     /// Pending requests: event_id → original request ID.
@@ -225,6 +235,9 @@ impl ClientSession {
             supports_ephemeral_encryption: false,
             supports_oversized_transfer: false,
             supports_open_stream: false,
+            requested_payment_interaction: None,
+            effective_payment_interaction: None,
+            has_disclosed_payment_interaction: false,
             last_activity: Instant::now(),
             pending_requests: HashMap::new(),
             event_to_progress_token: HashMap::new(),

@@ -2,6 +2,38 @@
 
 ## [Unreleased]
 
+### Added
+
+- CEP-8 capability pricing and payments (in progress; foundational pieces, not yet a
+  usable payment flow):
+  - Server-side payment-interaction negotiation and advertisement: the server transport
+    now parses client `pmi` and `payment_interaction` tags, negotiates the effective
+    session mode (`transparent` by default, `explicit_gating` when the server policy
+    allows it via `set_supported_payment_interaction`), rejects an unsupported
+    `explicit_gating` request with a JSON-RPC `-32602` error, discloses the effective
+    mode on the first response, and attaches `cap` pricing tags to capability-list
+    responses. The negotiated mode is read into the inbound-middleware context for the
+    payment middlewares that follow.
+
+### Fixed
+
+- CEP-41 open-stream: a deferred final response (one held back while a stream was
+  still open) went out with routing tags only, so it carried neither the CEP-35
+  discovery tags nor the CEP-8 effective-mode disclosure. A client whose first server
+  event was such a response captured it as its session baseline and then reported no
+  server identity and no capabilities for the rest of the session. The deferred path now
+  composes its tags exactly as the normal response path does: discovery tags and the
+  effective-mode disclosure behind the same one-shot latches, and `cap` pricing tags on a
+  capability-list result.
+
+### Changed
+
+- **Breaking:** `ClientSession` and `SessionSnapshot` are now `#[non_exhaustive]`. Both
+  gain fields as new CEPs land (CEP-8 adds three to each), so downstream code must
+  construct `ClientSession` via `ClientSession::new` and destructure either struct with
+  `..` rather than exhaustively. This matches `InboundContext`, which is already
+  `#[non_exhaustive]`, and makes future field additions non-breaking.
+
 ## [0.2.2] - 2026-07-29
 
 ### Added

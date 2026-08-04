@@ -18,7 +18,7 @@ use contextvm_sdk::core::constants::{
     MAX_MESSAGE_SIZE, PROMPTS_LIST_KIND, RESOURCES_LIST_KIND, RESOURCETEMPLATES_LIST_KIND,
     SERVER_ANNOUNCEMENT_KIND, TOOLS_LIST_KIND,
 };
-use contextvm_sdk::core::types::{EncryptionMode, GiftWrapMode};
+use contextvm_sdk::core::types::{EncryptionMode, GiftWrapMode, PaymentInteractionMode};
 use contextvm_sdk::relay::mock::MockRelayPool;
 use contextvm_sdk::transport::base::BaseTransport;
 use contextvm_sdk::transport::client::{NostrClientTransport, NostrClientTransportConfig};
@@ -5023,4 +5023,827 @@ async fn server_emits_accept_frame_with_expected_shape() {
         Some("oversized request accepted"),
         "accept frame must carry the TS-matching human-readable message"
     );
+}
+
+// ── 47. CEP-8 payment-interaction negotiation and advertisement ──────────────
+
+/// Build a raw client request event carrying arbitrary extra tags, so the server's negotiation
+/// path can be driven without a client-side CEP-8 emitter (that lands with the client changes).
+fn cep8_request_event(
+    client_keys: &Keys,
+    server_pubkey: PublicKey,
+    request_id: serde_json::Value,
+    method: &str,
+    extra_tags: Vec<Tag>,
+) -> Event {
+    let request = JsonRpcMessage::Request(JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: request_id,
+        method: method.to_string(),
+        params: None,
+    });
+    let mut tags = BaseTransport::create_recipient_tags(&server_pubkey);
+    tags.extend(extra_tags);
+    contextvm_sdk::core::serializers::mcp_to_nostr_event(&request, CTXVM_MESSAGES_KIND, tags)
+        .expect("serialize CEP-8 request")
+        .sign_with_keys(client_keys)
+        .expect("sign CEP-8 request")
+}
+
+fn payment_interaction_tag(value: &str) -> Tag {
+    Tag::custom(
+        TagKind::Custom(tags::PAYMENT_INTERACTION.into()),
+        vec![value.to_string()],
+    )
+}
+
+fn response_tag_values(event: &Event, name: &str) -> Vec<String> {
+    event
+        .tags
+        .iter()
+        .filter_map(|t| {
+            let parts = t.clone().to_vec();
+            match (parts.first().map(String::as_str), parts.get(1)) {
+                (Some(n), Some(v)) if n == name => Some(v.clone()),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cep8_rejects_explicit_gating_request_when_unsupported() {
+    let (client_pool, server_pool) = MockRelayPool::create_pair();
+    let server_pubkey = server_pool.mock_public_key();
+    let s_pool = Arc::new(server_pool);
+
+    // Default policy: payments are not configured, so explicit gating is not on offer.
+    let mut server = NostrServerTransport::with_relay_pool(
+        NostrServerTransportConfig::default().with_encryption_mode(EncryptionMode::Disabled),
+        Arc::clone(&s_pool) as Arc<dyn RelayPoolTrait>,
+    )
+    .await
+    .expect("create server transport");
+
+    let mut server_rx = server
+        .take_message_receiver()
+        .expect("server message receiver");
+    server.start().await.expect("server start");
+    let_event_loops_start().await;
+
+    let client_keys = Keys::generate();
+    let event = cep8_request_event(
+        &client_keys,
+        server_pubkey,
+        serde_json::json!("gated-1"),
+        "tools/call",
+        vec![payment_interaction_tag("explicit_gating")],
+    );
+    client_pool
+        .publish_event(&event)
+        .await
+        .expect("publish gated request");
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    // The request must never reach the handler.
+    assert!(
+        server_rx.try_recv().is_err(),
+        "a rejected negotiation must skip dispatch entirely"
+    );
+
+    let events = s_pool.stored_events().await;
+    let error_event = events
+        .iter()
+        .filter(|e| e.kind == Kind::Custom(CTXVM_MESSAGES_KIND))
+        .find(|e| e.content.contains("-32602"))
+        .expect("server must publish a -32602 negotiation error");
+
+    let payload: serde_json::Value =
+        serde_json::from_str(&error_event.content).expect("error content is JSON");
+    // Correlation rides the id the client sent, not the carrying Nostr event id.
+    assert_eq!(payload["id"], serde_json::json!("gated-1"));
+    assert_eq!(payload["error"]["code"], serde_json::json!(-32602));
+    assert_eq!(
+        payload["error"]["message"],
+        serde_json::json!("Unsupported payment_interaction mode: explicit_gating")
+    );
+    assert_eq!(
+        payload["error"]["data"],
+        serde_json::json!({ "requested": "explicit_gating", "supported": ["transparent"] })
+    );
+
+    server.close().await.expect("close server");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cep8_notification_carrying_explicit_gating_is_not_rejected() {
+    let (client_pool, server_pool) = MockRelayPool::create_pair();
+    let server_pubkey = server_pool.mock_public_key();
+    let s_pool = Arc::new(server_pool);
+
+    let mut server = NostrServerTransport::with_relay_pool(
+        NostrServerTransportConfig::default().with_encryption_mode(EncryptionMode::Disabled),
+        Arc::clone(&s_pool) as Arc<dyn RelayPoolTrait>,
+    )
+    .await
+    .expect("create server transport");
+
+    let mut server_rx = server
+        .take_message_receiver()
+        .expect("server message receiver");
+    server.start().await.expect("server start");
+    let_event_loops_start().await;
+
+    let client_keys = Keys::generate();
+    let notification = JsonRpcMessage::Notification(JsonRpcNotification {
+        jsonrpc: "2.0".to_string(),
+        method: "notifications/initialized".to_string(),
+        params: None,
+    });
+    let mut tags = BaseTransport::create_recipient_tags(&server_pubkey);
+    tags.push(payment_interaction_tag("explicit_gating"));
+    let event = contextvm_sdk::core::serializers::mcp_to_nostr_event(
+        &notification,
+        CTXVM_MESSAGES_KIND,
+        tags,
+    )
+    .expect("serialize notification")
+    .sign_with_keys(&client_keys)
+    .expect("sign notification");
+
+    client_pool
+        .publish_event(&event)
+        .await
+        .expect("publish gated notification");
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    // The notification is upserted and forwarded; only a request draws the error.
+    let forwarded = server_rx
+        .try_recv()
+        .expect("notification must be forwarded");
+    assert_eq!(
+        forwarded.message.method(),
+        Some("notifications/initialized")
+    );
+
+    let events = s_pool.stored_events().await;
+    assert!(
+        !events.iter().any(|e| e.content.contains("-32602")),
+        "a notification carrying an unsupported mode must not draw an error"
+    );
+
+    // The session is left on the mode the server can serve.
+    let snapshot = server
+        .session_snapshot(&client_keys.public_key().to_hex())
+        .await
+        .expect("session exists");
+    assert_eq!(
+        snapshot.effective_payment_interaction,
+        Some(contextvm_sdk::core::types::PaymentInteractionMode::Transparent)
+    );
+
+    server.close().await.expect("close server");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cep8_first_response_discloses_effective_mode() {
+    let (client_pool, server_pool) = MockRelayPool::create_pair();
+    let server_pubkey = server_pool.mock_public_key();
+    let s_pool = Arc::new(server_pool);
+
+    let mut server = NostrServerTransport::with_relay_pool(
+        NostrServerTransportConfig::default().with_encryption_mode(EncryptionMode::Disabled),
+        Arc::clone(&s_pool) as Arc<dyn RelayPoolTrait>,
+    )
+    .await
+    .expect("create server transport");
+    // An optional policy mirrors the client's requested mode.
+    server.set_supported_payment_interaction(contextvm_sdk::PaymentInteractionPolicy::Optional);
+
+    let mut server_rx = server
+        .take_message_receiver()
+        .expect("server message receiver");
+    server.start().await.expect("server start");
+    let_event_loops_start().await;
+
+    let client_keys = Keys::generate();
+    for (n, id) in [(0usize, "gate-1"), (1, "gate-2")] {
+        let event = cep8_request_event(
+            &client_keys,
+            server_pubkey,
+            serde_json::json!(id),
+            "tools/call",
+            // Only the first message carries the tag; the second inherits the mode.
+            if n == 0 {
+                vec![payment_interaction_tag("explicit_gating")]
+            } else {
+                vec![]
+            },
+        );
+        client_pool
+            .publish_event(&event)
+            .await
+            .expect("publish request");
+
+        let incoming = tokio::time::timeout(Duration::from_millis(500), server_rx.recv())
+            .await
+            .expect("request must reach the handler")
+            .expect("channel closed");
+        server
+            .send_response(
+                &incoming.event_id,
+                JsonRpcMessage::Response(JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
+                    id: serde_json::json!(id),
+                    result: serde_json::json!({ "content": [] }),
+                }),
+            )
+            .await
+            .expect("send response");
+    }
+
+    // The paired pools share one store, so select the server-authored events.
+    let events = s_pool.stored_events().await;
+    let responses: Vec<_> = events
+        .iter()
+        .filter(|e| e.kind == Kind::Custom(CTXVM_MESSAGES_KIND) && e.pubkey == server_pubkey)
+        .collect();
+
+    let first = responses
+        .iter()
+        .find(|e| e.content.contains("gate-1"))
+        .expect("first response missing");
+    assert_eq!(
+        response_tag_values(first, tags::PAYMENT_INTERACTION),
+        vec!["explicit_gating"],
+        "first response must disclose the effective mode exactly once"
+    );
+
+    let second = responses
+        .iter()
+        .find(|e| e.content.contains("gate-2"))
+        .expect("second response missing");
+    assert!(
+        response_tag_values(second, tags::PAYMENT_INTERACTION).is_empty(),
+        "disclosure is a one-shot per negotiated mode"
+    );
+
+    server.close().await.expect("close server");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cep8_transparent_client_gets_no_disclosure_tag() {
+    let (client_pool, server_pool) = MockRelayPool::create_pair();
+    let server_pubkey = server_pool.mock_public_key();
+    let s_pool = Arc::new(server_pool);
+
+    let mut server = NostrServerTransport::with_relay_pool(
+        NostrServerTransportConfig::default().with_encryption_mode(EncryptionMode::Disabled),
+        Arc::clone(&s_pool) as Arc<dyn RelayPoolTrait>,
+    )
+    .await
+    .expect("create server transport");
+    server.set_supported_payment_interaction(contextvm_sdk::PaymentInteractionPolicy::Optional);
+
+    let mut server_rx = server
+        .take_message_receiver()
+        .expect("server message receiver");
+    server.start().await.expect("server start");
+    let_event_loops_start().await;
+
+    let client_keys = Keys::generate();
+    let event = cep8_request_event(
+        &client_keys,
+        server_pubkey,
+        serde_json::json!("plain-1"),
+        "tools/call",
+        vec![payment_interaction_tag("transparent")],
+    );
+    client_pool
+        .publish_event(&event)
+        .await
+        .expect("publish request");
+
+    let incoming = tokio::time::timeout(Duration::from_millis(500), server_rx.recv())
+        .await
+        .expect("request must reach the handler")
+        .expect("channel closed");
+    server
+        .send_response(
+            &incoming.event_id,
+            JsonRpcMessage::Response(JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id: serde_json::json!("plain-1"),
+                result: serde_json::json!({ "content": [] }),
+            }),
+        )
+        .await
+        .expect("send response");
+
+    // The paired pools share one store, so select the server-authored event.
+    let events = s_pool.stored_events().await;
+    let response = events
+        .iter()
+        .find(|e| {
+            e.kind == Kind::Custom(CTXVM_MESSAGES_KIND)
+                && e.pubkey == server_pubkey
+                && e.content.contains("plain-1")
+        })
+        .expect("response missing");
+    assert!(
+        response_tag_values(response, tags::PAYMENT_INTERACTION).is_empty(),
+        "a client that stayed on the default mode gets no disclosure tag"
+    );
+
+    server.close().await.expect("close server");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cep8_capability_list_response_carries_cap_tags() {
+    let (client_pool, server_pool) = MockRelayPool::create_pair();
+    let server_pubkey = server_pool.mock_public_key();
+    let s_pool = Arc::new(server_pool);
+
+    let mut server = NostrServerTransport::with_relay_pool(
+        NostrServerTransportConfig::default().with_encryption_mode(EncryptionMode::Disabled),
+        Arc::clone(&s_pool) as Arc<dyn RelayPoolTrait>,
+    )
+    .await
+    .expect("create server transport");
+    server.set_announcement_pricing_tags(
+        contextvm_sdk::payments::tags::cap_tags_from_priced_capabilities(&[
+            contextvm_sdk::PricedCapability {
+                method: "tools/call".to_string(),
+                name: Some("get_weather".to_string()),
+                amount: 100,
+                max_amount: None,
+                currency_unit: "sats".to_string(),
+                description: None,
+            },
+        ]),
+    );
+
+    let mut server_rx = server
+        .take_message_receiver()
+        .expect("server message receiver");
+    server.start().await.expect("server start");
+    let_event_loops_start().await;
+
+    let client_keys = Keys::generate();
+    // A capability-list response carries the pricing tags; a tool-call response does not.
+    let cases = [
+        (
+            "list-1",
+            "tools/list",
+            serde_json::json!({ "tools": [] }),
+            true,
+        ),
+        (
+            "call-1",
+            "tools/call",
+            serde_json::json!({ "content": [], "isError": false }),
+            false,
+        ),
+    ];
+    for (id, method, result, expect_cap) in cases {
+        let event = cep8_request_event(
+            &client_keys,
+            server_pubkey,
+            serde_json::json!(id),
+            method,
+            vec![],
+        );
+        client_pool
+            .publish_event(&event)
+            .await
+            .expect("publish request");
+
+        let incoming = tokio::time::timeout(Duration::from_millis(500), server_rx.recv())
+            .await
+            .expect("request must reach the handler")
+            .expect("channel closed");
+        server
+            .send_response(
+                &incoming.event_id,
+                JsonRpcMessage::Response(JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
+                    id: serde_json::json!(id),
+                    result,
+                }),
+            )
+            .await
+            .expect("send response");
+
+        // The paired pools share one store, so select the server-authored event.
+        let events = s_pool.stored_events().await;
+        let response = events
+            .iter()
+            .find(|e| {
+                e.kind == Kind::Custom(CTXVM_MESSAGES_KIND)
+                    && e.pubkey == server_pubkey
+                    && e.content.contains(id)
+            })
+            .expect("response missing");
+        let caps = response_tag_values(response, tags::CAPABILITY);
+        if expect_cap {
+            assert_eq!(
+                caps,
+                vec!["tool:get_weather"],
+                "a capability-list response must carry the pricing tags"
+            );
+        } else {
+            assert!(
+                caps.is_empty(),
+                "a non-list response must not carry pricing tags"
+            );
+        }
+    }
+
+    server.close().await.expect("close server");
+}
+
+// ── 48. CEP-8 inbound-context population and disclosure dedup ────────────────
+
+/// The CEP-8 half of an observed inbound context.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ObservedPaymentContext {
+    client_pmis: Option<Vec<String>>,
+    payment_interaction: Option<PaymentInteractionMode>,
+}
+
+type ObservedContexts = Arc<std::sync::Mutex<Vec<ObservedPaymentContext>>>;
+
+/// Records the context every inbound message is dispatched with, then forwards unchanged.
+/// This is the interface the payment middlewares read, so it is asserted directly.
+struct RecordingMiddleware {
+    seen: ObservedContexts,
+}
+
+#[async_trait]
+impl contextvm_sdk::transport::server::InboundMiddleware for RecordingMiddleware {
+    async fn handle(
+        &self,
+        message: JsonRpcMessage,
+        ctx: &contextvm_sdk::transport::server::InboundContext,
+        next: contextvm_sdk::transport::server::Next,
+    ) -> bool {
+        self.seen
+            .lock()
+            .expect("recording middleware lock")
+            .push(ObservedPaymentContext {
+                client_pmis: ctx.client_pmis.clone(),
+                payment_interaction: ctx.payment_interaction,
+            });
+        next.run(message).await
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cep8_inbound_context_carries_negotiated_mode_and_pmis() {
+    let (client_pool, server_pool) = MockRelayPool::create_pair();
+    let server_pubkey = server_pool.mock_public_key();
+    let s_pool = Arc::new(server_pool);
+
+    let mut server = NostrServerTransport::with_relay_pool(
+        NostrServerTransportConfig::default().with_encryption_mode(EncryptionMode::Disabled),
+        Arc::clone(&s_pool) as Arc<dyn RelayPoolTrait>,
+    )
+    .await
+    .expect("create server transport");
+    server.set_supported_payment_interaction(contextvm_sdk::PaymentInteractionPolicy::Optional);
+
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    server.add_inbound_middleware(Arc::new(RecordingMiddleware {
+        seen: Arc::clone(&seen),
+    }));
+
+    let mut server_rx = server
+        .take_message_receiver()
+        .expect("server message receiver");
+    server.start().await.expect("server start");
+    let_event_loops_start().await;
+
+    // A client that advertises two payment methods and asks for the gated lifecycle.
+    let gating_client = Keys::generate();
+    client_pool
+        .publish_event(&cep8_request_event(
+            &gating_client,
+            server_pubkey,
+            serde_json::json!("ctx-1"),
+            "tools/call",
+            vec![
+                contextvm_sdk::payments::tags::pmi_tag("bitcoin-lightning-bolt11"),
+                contextvm_sdk::payments::tags::pmi_tag("cashu"),
+                payment_interaction_tag("explicit_gating"),
+            ],
+        ))
+        .await
+        .expect("publish gating request");
+    tokio::time::timeout(Duration::from_millis(500), server_rx.recv())
+        .await
+        .expect("gating request must reach the handler")
+        .expect("channel closed");
+
+    // A different client that sends no CEP-8 tags at all.
+    let plain_client = Keys::generate();
+    client_pool
+        .publish_event(&cep8_request_event(
+            &plain_client,
+            server_pubkey,
+            serde_json::json!("ctx-2"),
+            "tools/call",
+            vec![],
+        ))
+        .await
+        .expect("publish plain request");
+    tokio::time::timeout(Duration::from_millis(500), server_rx.recv())
+        .await
+        .expect("plain request must reach the handler")
+        .expect("channel closed");
+
+    let observed = seen.lock().expect("recording lock").clone();
+    assert_eq!(observed.len(), 2, "both requests must run the chain");
+
+    assert_eq!(
+        observed[0].client_pmis,
+        Some(vec![
+            "bitcoin-lightning-bolt11".to_string(),
+            "cashu".to_string()
+        ]),
+        "advertised payment methods must reach the context in preference order"
+    );
+    assert_eq!(
+        observed[0].payment_interaction,
+        Some(PaymentInteractionMode::ExplicitGating),
+        "the negotiated mode must reach the context"
+    );
+
+    assert_eq!(
+        observed[1].client_pmis, None,
+        "a client that advertised no payment methods must not produce an empty list"
+    );
+    // The resolved mode, not the raw unset option: a middleware comparing against a concrete mode
+    // must never see None for a session that simply never negotiated.
+    assert_eq!(
+        observed[1].payment_interaction,
+        Some(PaymentInteractionMode::Transparent),
+        "an unnegotiated session must resolve to the default mode, not None"
+    );
+
+    server.close().await.expect("close server");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cep8_inbound_context_survives_oversized_reassembly() {
+    let (client_pool, server_pool) = MockRelayPool::create_pair();
+    let server_pubkey = server_pool.mock_public_key();
+    let s_pool = Arc::new(server_pool);
+
+    let oversized = OversizedTransferConfig::enabled()
+        .with_threshold(6000)
+        .with_chunk_size(6000);
+    // The raw negotiation event must come from the same identity the client transport signs with,
+    // since sessions are keyed by client pubkey.
+    let client_keys = client_pool.mock_keys();
+    let c_pool = Arc::new(client_pool);
+
+    let mut server = NostrServerTransport::with_relay_pool(
+        NostrServerTransportConfig::default()
+            .with_encryption_mode(EncryptionMode::Disabled)
+            .with_oversized_transfer(oversized.clone()),
+        Arc::clone(&s_pool) as Arc<dyn RelayPoolTrait>,
+    )
+    .await
+    .expect("create server transport");
+    server.set_supported_payment_interaction(contextvm_sdk::PaymentInteractionPolicy::Optional);
+
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    server.add_inbound_middleware(Arc::new(RecordingMiddleware {
+        seen: Arc::clone(&seen),
+    }));
+
+    let mut client = NostrClientTransport::with_relay_pool(
+        NostrClientTransportConfig::default()
+            .with_relay_urls(vec!["wss://mock.relay".to_string()])
+            .with_server_pubkey(server_pubkey.to_hex())
+            .with_encryption_mode(EncryptionMode::Disabled)
+            .with_oversized_transfer(oversized),
+        Arc::clone(&c_pool) as Arc<dyn RelayPoolTrait>,
+    )
+    .await
+    .expect("create client transport");
+
+    let mut server_rx = server.take_message_receiver().expect("server rx");
+    server.start().await.expect("server start");
+    client.start().await.expect("client start");
+    let_event_loops_start().await;
+
+    // Negotiate a NON-default mode first, so the assertion below cannot be satisfied by a
+    // hard-coded default.
+    c_pool
+        .publish_event(&cep8_request_event(
+            &client_keys,
+            server_pubkey,
+            serde_json::json!("neg-ctx"),
+            "tools/call",
+            vec![payment_interaction_tag("explicit_gating")],
+        ))
+        .await
+        .expect("publish negotiation request");
+    tokio::time::timeout(Duration::from_millis(500), server_rx.recv())
+        .await
+        .expect("negotiation request must reach the handler")
+        .expect("channel closed");
+
+    client
+        .send(&JsonRpcMessage::Request(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: serde_json::json!("big-ctx"),
+            method: "tools/call".to_string(),
+            params: Some(serde_json::json!({
+                "_meta": { "progressToken": "tok-ctx" },
+                "blob": "A".repeat(10000),
+            })),
+        }))
+        .await
+        .expect("send oversized request");
+
+    tokio::time::timeout(Duration::from_millis(1000), server_rx.recv())
+        .await
+        .expect("reassembled request must reach the handler")
+        .expect("channel closed");
+
+    // A reassembled request must be dispatched with the same negotiated context as a direct one.
+    let observed = seen.lock().expect("recording lock").clone();
+    let reassembled = observed
+        .last()
+        .expect("the reassembled request must run the chain");
+    assert_eq!(
+        reassembled.payment_interaction,
+        Some(PaymentInteractionMode::ExplicitGating),
+        "the oversized dispatch path must carry the session's NEGOTIATED mode, not a default"
+    );
+
+    server.close().await.expect("close server");
+    client.close().await.expect("close client");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cep8_disclosure_dedups_against_the_server_advertisement() {
+    let (client_pool, server_pool) = MockRelayPool::create_pair();
+    let server_pubkey = server_pool.mock_public_key();
+    let s_pool = Arc::new(server_pool);
+
+    let mut server = NostrServerTransport::with_relay_pool(
+        NostrServerTransportConfig::default().with_encryption_mode(EncryptionMode::Disabled),
+        Arc::clone(&s_pool) as Arc<dyn RelayPoolTrait>,
+    )
+    .await
+    .expect("create server transport");
+    server.set_supported_payment_interaction(contextvm_sdk::PaymentInteractionPolicy::Optional);
+    // The availability advertisement a payments-configured server publishes. It rides the first
+    // response through the discovery-tag latch, carrying the same value the disclosure would add.
+    server.set_announcement_extra_tags(vec![
+        contextvm_sdk::payments::tags::payment_interaction_tag(
+            PaymentInteractionMode::ExplicitGating,
+        ),
+    ]);
+
+    let mut server_rx = server
+        .take_message_receiver()
+        .expect("server message receiver");
+    server.start().await.expect("server start");
+    let_event_loops_start().await;
+
+    let client_keys = Keys::generate();
+    client_pool
+        .publish_event(&cep8_request_event(
+            &client_keys,
+            server_pubkey,
+            serde_json::json!("dedup-1"),
+            "tools/call",
+            vec![payment_interaction_tag("explicit_gating")],
+        ))
+        .await
+        .expect("publish gating request");
+
+    let incoming = tokio::time::timeout(Duration::from_millis(500), server_rx.recv())
+        .await
+        .expect("request must reach the handler")
+        .expect("channel closed");
+    server
+        .send_response(
+            &incoming.event_id,
+            JsonRpcMessage::Response(JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id: serde_json::json!("dedup-1"),
+                result: serde_json::json!({ "content": [] }),
+            }),
+        )
+        .await
+        .expect("send response");
+
+    let events = s_pool.stored_events().await;
+    let response = events
+        .iter()
+        .find(|e| {
+            e.kind == Kind::Custom(CTXVM_MESSAGES_KIND)
+                && e.pubkey == server_pubkey
+                && e.content.contains("dedup-1")
+        })
+        .expect("response missing");
+    // Exactly one tag: the advertisement already satisfies the disclosure obligation, so the
+    // disclosure must not add a second copy of the same value.
+    assert_eq!(
+        response_tag_values(response, tags::PAYMENT_INTERACTION),
+        vec!["explicit_gating"],
+        "advertisement and disclosure must not both emit the same tag"
+    );
+
+    server.close().await.expect("close server");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cep8_rejects_explicit_gating_over_gift_wrap() {
+    let (client_pool, server_pool) = MockRelayPool::create_pair();
+    let server_pubkey = server_pool.mock_public_key();
+    let s_pool = Arc::new(server_pool);
+
+    // Default policy: gating is not on offer.
+    let mut server = NostrServerTransport::with_relay_pool(
+        NostrServerTransportConfig::default().with_encryption_mode(EncryptionMode::Required),
+        Arc::clone(&s_pool) as Arc<dyn RelayPoolTrait>,
+    )
+    .await
+    .expect("create server transport");
+
+    let mut server_rx = server
+        .take_message_receiver()
+        .expect("server message receiver");
+    server.start().await.expect("server start");
+    let_event_loops_start().await;
+
+    // The CEP-8 tag rides the INNER event, which is what negotiation must read. The request is
+    // wrapped ephemerally, which the reply must mirror (under the default mode that is the only
+    // wrap kind mirroring can distinguish from the fallback).
+    let client_keys = Keys::generate();
+    let inner = cep8_request_event(
+        &client_keys,
+        server_pubkey,
+        serde_json::json!("wrapped-1"),
+        "tools/call",
+        vec![payment_interaction_tag("explicit_gating")],
+    );
+    let wrapped = contextvm_sdk::encryption::gift_wrap_single_layer_with_kind(
+        &client_keys,
+        &server_pubkey,
+        &serde_json::to_string(&inner).expect("serialize inner event"),
+        EPHEMERAL_GIFT_WRAP_KIND,
+    )
+    .await
+    .expect("gift wrap the request");
+
+    client_pool
+        .publish_event(&wrapped)
+        .await
+        .expect("publish wrapped request");
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    assert!(
+        server_rx.try_recv().is_err(),
+        "a rejected negotiation must skip dispatch even when encrypted"
+    );
+
+    // The reply must itself be gift-wrapped, and must decrypt to the -32602 correlated on the
+    // original inner request id.
+    // Both wraps are signed by throwaway ephemeral keys, so the reply is identified by its
+    // recipient tag rather than its author.
+    let client_pubkey_hex = client_keys.public_key().to_hex();
+    let events = s_pool.stored_events().await;
+    let reply = events
+        .iter()
+        .find(|e| {
+            (e.kind == Kind::Custom(GIFT_WRAP_KIND)
+                || e.kind == Kind::Custom(EPHEMERAL_GIFT_WRAP_KIND))
+                && contextvm_sdk::core::serializers::get_tag_value(&e.tags, tags::PUBKEY).as_deref()
+                    == Some(client_pubkey_hex.as_str())
+        })
+        .expect("server must reply with a gift wrap addressed to the client");
+    assert_eq!(
+        reply.kind,
+        Kind::Custom(EPHEMERAL_GIFT_WRAP_KIND),
+        "the reject reply must mirror the request's ephemeral wrap kind"
+    );
+    let plaintext = contextvm_sdk::encryption::decrypt_gift_wrap_single_layer(&client_keys, reply)
+        .await
+        .expect("decrypt the reply");
+    // The plaintext is the JSON of the inner signed event; the JSON-RPC payload is its content.
+    let inner_reply: Event = serde_json::from_str(&plaintext).expect("reply is a signed event");
+    let payload: serde_json::Value =
+        serde_json::from_str(&inner_reply.content).expect("reply payload is JSON");
+
+    assert_eq!(payload["id"], serde_json::json!("wrapped-1"));
+    assert_eq!(payload["error"]["code"], serde_json::json!(-32602));
+
+    server.close().await.expect("close server");
 }

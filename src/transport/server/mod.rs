@@ -30,9 +30,13 @@ use crate::core::error::{Error, Result};
 use crate::core::types::*;
 use crate::core::validation;
 use crate::encryption;
+use crate::payments::constants::UNSUPPORTED_PAYMENT_INTERACTION_ERROR_CODE;
+use crate::payments::{PaymentInteractionPolicy, UnsupportedPaymentInteractionData};
 use crate::relay::{RelayPool, RelayPoolTrait};
 use crate::transport::base::BaseTransport;
-use crate::transport::discovery_tags::learn_peer_capabilities;
+use crate::transport::discovery_tags::{
+    extract_payment_interaction, extract_pmis, learn_peer_capabilities,
+};
 use crate::transport::open_stream::{
     open_stream_frame_from_notification, FrameOutcome, KeepaliveAction, OnAbortHook, OnCloseHook,
     OpenStreamConfig, OpenStreamFrame, OpenStreamReceiver, OpenStreamRegistryPolicy,
@@ -236,6 +240,46 @@ enum OpenStreamDeferral {
     Passthrough(JsonRpcMessage),
 }
 
+/// Tag sets a response can draw on, captured for the paths that have no `&self`.
+///
+/// The CEP-41 deferred publish is static so the writer's terminal hooks can call it, which means it
+/// cannot reach the announcement manager. These are captured when the writer is created so a
+/// deferred response composes the same tags the normal response path would.
+#[derive(Clone)]
+struct ResponseTagSources {
+    /// First-response discovery tags, sent once per session.
+    common: Vec<Tag>,
+    /// CEP-8 `cap` pricing tags, appended to capability-list results.
+    pricing: Vec<Tag>,
+}
+
+/// CEP-8: the outcome of one payment-interaction negotiation.
+#[derive(Debug, PartialEq)]
+enum NegotiationOutcome {
+    /// Proceed to dispatch; the inbound context carries the session's effective mode.
+    Proceed,
+    /// The client requested `explicit_gating` on a request but the server does not support it:
+    /// answer with `-32602` carrying this requested mode, and skip dispatch.
+    RejectUnsupported {
+        /// The mode the client asked for (always `explicit_gating`).
+        requested: PaymentInteractionMode,
+    },
+}
+
+/// CEP-8: write the effective mode and re-arm disclosure, but only when the mode actually changes.
+///
+/// A re-sent tag naming the mode already in force is idempotent: it must not re-arm disclosure.
+fn apply_effective(
+    session: &mut ClientSession,
+    prev_effective: Option<PaymentInteractionMode>,
+    next: PaymentInteractionMode,
+) {
+    if Some(next) != prev_effective {
+        session.effective_payment_interaction = Some(next);
+        session.has_disclosed_payment_interaction = false;
+    }
+}
+
 /// Configuration for the server transport.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -350,6 +394,10 @@ pub struct NostrServerTransport {
     /// Ordered inbound middleware chain (FIFO). Registered before `start()`; moved
     /// into the event loop there. Empty means the direct forward path.
     inbound_middlewares: Vec<Arc<dyn InboundMiddleware>>,
+    /// CEP-8: which payment-interaction lifecycles this server accepts. `None` means payments are
+    /// not configured, which negotiates exactly like a transparent-only server (an
+    /// `explicit_gating` request is rejected with a JSON-RPC `-32602`). Set before `start()`.
+    supported_payment_interaction: Option<PaymentInteractionPolicy>,
 }
 
 impl NostrServerTransportConfig {
@@ -586,6 +634,7 @@ impl NostrServerTransport {
             request_wrap_kinds: Arc::new(RwLock::new(HashMap::new())),
             seen_gift_wrap_ids,
             inbound_middlewares: Vec::new(),
+            supported_payment_interaction: None,
             message_tx: Some(tx),
             message_rx: Some(rx),
             cancellation_token: CancellationToken::new(),
@@ -640,6 +689,7 @@ impl NostrServerTransport {
             event_routes: ServerEventRouteStore::new(),
             seen_gift_wrap_ids,
             inbound_middlewares: Vec::new(),
+            supported_payment_interaction: None,
             message_tx: Some(tx),
             message_rx: Some(rx),
             cancellation_token: CancellationToken::new(),
@@ -656,6 +706,40 @@ impl NostrServerTransport {
             "add_inbound_middleware must be called before start()"
         );
         self.inbound_middlewares.push(middleware);
+    }
+
+    /// CEP-8: set which payment-interaction lifecycles this server accepts.
+    ///
+    /// [`PaymentInteractionPolicy::Optional`] lets a client negotiate `explicit_gating`;
+    /// [`PaymentInteractionPolicy::Transparent`] rejects such a request with a JSON-RPC `-32602`.
+    /// Leaving this unset rejects it too, so a server that has not configured payments never
+    /// accepts a gated lifecycle. (Note this is the opposite of
+    /// [`PaymentInteractionPolicy::default`], which is the permissive `Optional`: that default
+    /// applies when payments are being configured, not when they are absent.)
+    ///
+    /// Must be called before [`start`](Self::start): the policy is captured into the event loop
+    /// there, so a later call does not take effect.
+    ///
+    /// The negotiated mode lives on the client's session, which is bounded and evicted LRU. A
+    /// client whose session is evicted renegotiates from scratch, and per CEP-8 a client that sees
+    /// no effective-mode disclosure must treat the negotiation as unestablished.
+    ///
+    /// # Invariant when advertising availability
+    ///
+    /// If you also advertise a `payment_interaction` tag through
+    /// [`set_announcement_extra_tags`](Self::set_announcement_extra_tags), its value **must** equal
+    /// the mode this policy can actually produce, or be absent. The advertisement is replayed onto
+    /// a client's first response ahead of the effective-mode disclosure, the disclosure suppresses
+    /// only an exact-value duplicate, and both SDKs read the first `payment_interaction` tag they
+    /// find. A mismatched advertisement therefore wins on the wire and tells the client a mode the
+    /// server is not running. In practice: advertise `explicit_gating` only under
+    /// [`PaymentInteractionPolicy::Optional`].
+    pub fn set_supported_payment_interaction(&mut self, policy: PaymentInteractionPolicy) {
+        debug_assert!(
+            self.task_handles.is_empty(),
+            "set_supported_payment_interaction must be called before start()"
+        );
+        self.supported_payment_interaction = Some(policy);
     }
 
     /// Start listening for incoming requests.
@@ -718,10 +802,22 @@ impl NostrServerTransport {
         let oversized_receiver = self.oversized_receiver.clone();
         let transfer_policy: TransferPolicy = (&self.config.oversized_transfer).into();
         let common_tags_snapshot = self.announcement_manager.common_tags_snapshot();
+        // The tag sets a deferred open-stream response needs, captured here because the publish
+        // that sends it is static and cannot reach the announcement manager.
+        let tag_sources = ResponseTagSources {
+            common: self.announcement_manager.get_common_tags(),
+            pricing: self.announcement_manager.get_pricing_tags().to_vec(),
+        };
         let seen_gift_wrap_ids = self.seen_gift_wrap_ids.clone();
         let open_stream = self.open_stream.clone();
         let inbound_middlewares: Arc<[Arc<dyn InboundMiddleware>]> =
             Arc::from(std::mem::take(&mut self.inbound_middlewares));
+        // CEP-8: reduce the policy to the single bit negotiation needs. Only an `optional` policy
+        // lets a client hold `explicit_gating`; unset and `transparent` both reject it.
+        let supports_explicit_gating = matches!(
+            self.supported_payment_interaction,
+            Some(PaymentInteractionPolicy::Optional)
+        );
         let event_loop_token = self.cancellation_token.child_token();
 
         let event_loop_handle = tokio::spawn(async move {
@@ -744,6 +840,8 @@ impl NostrServerTransport {
                 open_stream,
                 event_loop_token,
                 inbound_middlewares,
+                supports_explicit_gating,
+                tag_sources,
             )
             .await;
         });
@@ -910,6 +1008,9 @@ impl NostrServerTransport {
 
         // CEP-35: include discovery tags on first response to this client
         let discovery_tags = self.take_pending_server_discovery_tags(session);
+        // CEP-8: decide the first-response effective-mode disclosure while the lock is held; the
+        // tag itself is appended below, once the composed tag list exists.
+        let disclose_effective = Self::take_payment_interaction_disclosure(session);
         drop(sessions_w);
 
         // CEP-19: Look up the incoming wrap kind for mirroring
@@ -942,7 +1043,40 @@ impl NostrServerTransport {
         })?;
 
         let base_tags = BaseTransport::create_response_tags(&client_pubkey, &event_id_parsed);
-        let tags = BaseTransport::compose_outbound_tags(&base_tags, &discovery_tags, &[]);
+        let mut tags = BaseTransport::compose_outbound_tags(&base_tags, &discovery_tags, &[]);
+
+        // CEP-8: disclose the effective mode. The server's availability advertisement can already
+        // be riding this same first response with the same value, in which case it satisfies the
+        // disclosure on its own and a second tag would be redundant.
+        if let Some(effective) = disclose_effective {
+            // The comparison is derived from the builder, not a second hand-written mapping, so the
+            // two can never drift apart. Name and value only, matching how both SDKs read the tag.
+            let disclosure = crate::payments::tags::payment_interaction_tag(effective);
+            let expected = disclosure.clone().to_vec();
+            let already_present = tags.iter().any(|tag| {
+                let parts = tag.clone().to_vec();
+                parts.first() == expected.first() && parts.get(1) == expected.get(1)
+            });
+            if !already_present {
+                tags.push(disclosure);
+            }
+        }
+
+        // CEP-8: attach the pricing tags to capability-list responses so clients can read prices
+        // without waiting for a payment_required error.
+        //
+        // Both this and the disclosure above ride the single composed tag list, so they reach the
+        // start frame of an oversized response too. That is deliberate: the spec requires disclosure
+        // on the first response, the client reads the tag off any inbound event, and the appends
+        // happen before the published-size measurement below, so an added tag can never push a
+        // response over the fragmentation threshold unmeasured. Continuation frames carry only the
+        // base routing tags, as before.
+        if let JsonRpcMessage::Response(ref r) = response {
+            if Self::is_capability_list_result(&r.result) {
+                tags.extend(self.announcement_manager.get_pricing_tags().iter().cloned());
+            }
+        }
+
         let gift_wrap_kind = Self::select_outbound_gift_wrap_kind(
             self.config.gift_wrap_mode,
             is_encrypted,
@@ -1159,6 +1293,11 @@ impl NostrServerTransport {
             event_id,
             snapshot,
             response,
+            &self.sessions,
+            &ResponseTagSources {
+                common: self.announcement_manager.get_common_tags(),
+                pricing: self.announcement_manager.get_pricing_tags().to_vec(),
+            },
         )
         .await
     }
@@ -1171,6 +1310,8 @@ impl NostrServerTransport {
         event_id: &str,
         snapshot: &RouteSnapshot,
         mut response: JsonRpcMessage,
+        sessions: &SessionStore,
+        tag_sources: &ResponseTagSources,
     ) -> Result<()> {
         // Restore the original request id (the normal path restores it from the
         // popped route; here it comes from the snapshot).
@@ -1184,7 +1325,53 @@ impl NostrServerTransport {
         })?;
         // Correlate via the `e` tag exactly like a normal response so the client's
         // correlation gate accepts it.
-        let tags = BaseTransport::create_response_tags(&snapshot.client_pubkey, &event_id_parsed);
+        let mut tags =
+            BaseTransport::create_response_tags(&snapshot.client_pubkey, &event_id_parsed);
+
+        // A deferred response is still a server-to-client response, so it carries the same
+        // first-response tags the normal path sends: the CEP-35 discovery set and the CEP-8
+        // effective-mode disclosure. Both one-shot latches are read and flipped under a single
+        // session lock, and the tags are appended after it drops. When the session is gone, both
+        // latches are left untouched so a later response still carries them.
+        let (send_discovery, disclose_effective) = {
+            let mut sessions_w = sessions.write().await;
+            match sessions_w.get_mut(&snapshot.client_pubkey.to_hex()) {
+                Some(session) => {
+                    let send_discovery = !session.has_sent_common_tags;
+                    session.has_sent_common_tags = true;
+                    (
+                        send_discovery,
+                        Self::take_payment_interaction_disclosure(session),
+                    )
+                }
+                None => (false, None),
+            }
+        };
+        if send_discovery {
+            tags.extend(tag_sources.common.iter().cloned());
+        }
+        // The discovery set can carry the server's availability advertisement, which may already
+        // name this mode, so dedup on the value exactly as the normal response path does.
+        if let Some(effective) = disclose_effective {
+            let disclosure = crate::payments::tags::payment_interaction_tag(effective);
+            let expected = disclosure.clone().to_vec();
+            let already_present = tags.iter().any(|tag| {
+                let parts = tag.clone().to_vec();
+                parts.first() == expected.first() && parts.get(1) == expected.get(1)
+            });
+            if !already_present {
+                tags.push(disclosure);
+            }
+        }
+
+        // CEP-8: price a capability-list result here too. A streaming tool is free to return one,
+        // and the normal response path tags it, so the deferred path must not differ.
+        if let JsonRpcMessage::Response(ref r) = response {
+            if Self::is_capability_list_result(&r.result) {
+                tags.extend(tag_sources.pricing.iter().cloned());
+            }
+        }
+
         let gift_wrap_kind = Self::select_outbound_gift_wrap_kind(
             gift_wrap_mode,
             snapshot.is_encrypted,
@@ -1210,6 +1397,8 @@ impl NostrServerTransport {
         base: &BaseTransport,
         gift_wrap_mode: GiftWrapMode,
         event_id: &str,
+        sessions: &SessionStore,
+        tag_sources: &ResponseTagSources,
     ) {
         let ready = {
             let mut slots = state.lock_slots();
@@ -1249,6 +1438,8 @@ impl NostrServerTransport {
             event_id,
             &snapshot,
             response,
+            sessions,
+            tag_sources,
         )
         .await
         {
@@ -1418,11 +1609,28 @@ impl NostrServerTransport {
     }
 
     /// Sets extra discovery tags to include in announcements and first-response discovery replay.
+    ///
+    /// Announcements and the normal response path read these live; the CEP-41 open-stream writer
+    /// hooks capture the first-response tag set once, when [`start`](Self::start) runs. That split
+    /// falls through the middle of a single deferred delivery rather than between the deferred and
+    /// normal paths: if the stream ends before the final response arrives, `send_response` delivers
+    /// it and reads these live, but if the response is stashed while the stream is still open, the
+    /// close or abort hook flushes it from the `start()` snapshot. Which of the two happens is a
+    /// race, so after a post-`start()` change the same response can go out with either set. Set
+    /// these before `start()` if a client's very first response may be a deferred one.
     pub fn set_announcement_extra_tags(&mut self, tags: Vec<Tag>) {
         self.announcement_manager.set_extra_common_tags(tags);
     }
 
     /// Sets pricing tags to include in announcement/list events and capability list responses.
+    ///
+    /// Announcements and the normal response path read these live; the CEP-41 open-stream writer
+    /// hooks capture them when [`start`](Self::start) runs, with the same race between the two
+    /// deferred-delivery orderings described on
+    /// [`set_announcement_extra_tags`](Self::set_announcement_extra_tags). A deferred response
+    /// flushed by a stream's close or abort hook carries the prices as they stood at `start()`,
+    /// while one delivered by `send_response` after the stream has already ended carries them live.
+    /// Set these before `start()` if a streaming tool can return a capability-list result.
     pub fn set_announcement_pricing_tags(&mut self, tags: Vec<Tag>) {
         self.announcement_manager.set_pricing_tags(tags);
     }
@@ -1551,6 +1759,141 @@ impl NostrServerTransport {
         self.announcement_manager.get_common_tags()
     }
 
+    // ── CEP-8 payment-interaction negotiation ─────────────────────
+
+    /// Negotiate this session's payment-interaction mode from an inbound message's inner tags.
+    ///
+    /// Pure and synchronous: it mutates the session's three payment fields and reports whether the
+    /// caller must answer with `-32602` instead of dispatching. `supports_explicit_gating` is the
+    /// server policy reduced to one bit.
+    fn negotiate_payment_interaction(
+        session: &mut ClientSession,
+        inner_tags: &[Tag],
+        method: Option<&str>,
+        is_request: bool,
+        supports_explicit_gating: bool,
+    ) -> NegotiationOutcome {
+        // A fresh `initialize` request re-opens negotiation for a reconnecting stateful client.
+        // Only the payment fields reset; the learned transport capabilities stay as they are.
+        if is_request && method == Some("initialize") {
+            session.requested_payment_interaction = None;
+            session.effective_payment_interaction = None;
+            session.has_disclosed_payment_interaction = false;
+        }
+
+        // The mode is upserted only by a message that carries the tag; an absent tag inherits the
+        // mode currently in force.
+        let Some(raw) = extract_payment_interaction(inner_tags) else {
+            return NegotiationOutcome::Proceed;
+        };
+        let prev_effective = session.effective_payment_interaction;
+
+        match raw.as_str() {
+            "transparent" | "explicit_gating" => {
+                let mode = if raw == "explicit_gating" {
+                    PaymentInteractionMode::ExplicitGating
+                } else {
+                    PaymentInteractionMode::Transparent
+                };
+                session.requested_payment_interaction = Some(mode);
+
+                if mode == PaymentInteractionMode::ExplicitGating && !supports_explicit_gating {
+                    // CEP-8 says a rejected upsert leaves the effective mode unchanged. Writing
+                    // `transparent` here honors that: the policy is fixed for the transport's
+                    // lifetime, so a server that rejects gating can never have held any other
+                    // effective mode, and an unset mode already means `transparent`.
+                    apply_effective(session, prev_effective, PaymentInteractionMode::Transparent);
+
+                    // A request gets an error; a notification silently keeps the downgrade.
+                    if is_request {
+                        return NegotiationOutcome::RejectUnsupported { requested: mode };
+                    }
+                }
+
+                let next = if supports_explicit_gating {
+                    mode
+                } else {
+                    PaymentInteractionMode::Transparent
+                };
+                apply_effective(session, prev_effective, next);
+                NegotiationOutcome::Proceed
+            }
+            // An unrecognized value is treated as a request for the default mode.
+            _ => {
+                session.requested_payment_interaction = Some(PaymentInteractionMode::Transparent);
+                apply_effective(session, prev_effective, PaymentInteractionMode::Transparent);
+                NegotiationOutcome::Proceed
+            }
+        }
+    }
+
+    /// Build the CEP-8 `-32602` unsupported-`payment_interaction` error for an inbound message.
+    ///
+    /// The id is the message's **original inner request id**, never the Nostr event id (the worker's
+    /// id rewrite has not run at this point), so the client correlates it to the request it sent.
+    fn unsupported_payment_interaction_error(
+        inbound: &JsonRpcMessage,
+        requested: PaymentInteractionMode,
+    ) -> JsonRpcMessage {
+        let id = match inbound {
+            JsonRpcMessage::Request(req) => req.id.clone(),
+            // Unreachable: negotiation only rejects requests.
+            _ => serde_json::Value::Null,
+        };
+        JsonRpcMessage::ErrorResponse(JsonRpcErrorResponse {
+            jsonrpc: "2.0".to_string(),
+            id,
+            error: JsonRpcError {
+                code: UNSUPPORTED_PAYMENT_INTERACTION_ERROR_CODE,
+                message: "Unsupported payment_interaction mode: explicit_gating".to_string(),
+                // Serializing this struct cannot fail; `.ok()` only avoids a `?` the event loop's
+                // `()` return type cannot carry.
+                data: serde_json::to_value(UnsupportedPaymentInteractionData::new(requested)).ok(),
+            },
+        })
+    }
+
+    /// CEP-8: the effective mode to disclose on this response, flipping the session's latch.
+    ///
+    /// Fires only when the client requested a non-transparent mode, and only once per negotiated
+    /// mode. The latch flips even when the caller ends up deduplicating the tag away, because an
+    /// already-present tag of the same value satisfies the disclosure obligation.
+    fn take_payment_interaction_disclosure(
+        session: &mut ClientSession,
+    ) -> Option<PaymentInteractionMode> {
+        match (
+            session.requested_payment_interaction,
+            session.effective_payment_interaction,
+        ) {
+            (Some(requested), Some(effective))
+                if requested != PaymentInteractionMode::Transparent
+                    && !session.has_disclosed_payment_interaction =>
+            {
+                session.has_disclosed_payment_interaction = true;
+                Some(effective)
+            }
+            _ => None,
+        }
+    }
+
+    /// True when a JSON-RPC result is an MCP capability-list result, which is what CEP-8 attaches
+    /// `cap` pricing tags to.
+    ///
+    /// Shape-based rather than method-based: the request method is no longer available by response
+    /// time. Mirrors the ts-sdk gate, which parses the result against the four list schemas; those
+    /// schemas are permissive about unknown keys, so this is bare key presence with no exclusions
+    /// (a result carrying both `content` and a list array is a list result in both SDKs).
+    ///
+    /// The one looseness is that ts also validates the array elements, for all four keys, while this
+    /// checks only that the value is an array. A malformed list therefore gets `cap` tags here and
+    /// not in ts. That is harmless: `cap` is a reference signal, never authoritative for the amount
+    /// charged, and no real MCP handler emits that shape.
+    fn is_capability_list_result(result: &serde_json::Value) -> bool {
+        ["tools", "resources", "resourceTemplates", "prompts"]
+            .iter()
+            .any(|key| result.get(key).is_some_and(serde_json::Value::is_array))
+    }
+
     // ── Internal ────────────────────────────────────────────────
 
     fn is_capability_excluded(
@@ -1624,6 +1967,8 @@ impl NostrServerTransport {
         open_stream: ServerOpenStreamState,
         cancel: CancellationToken,
         middlewares: Arc<[Arc<dyn InboundMiddleware>]>,
+        supports_explicit_gating: bool,
+        tag_sources: ResponseTagSources,
     ) {
         let mut notifications = relay_pool.notifications();
 
@@ -1970,6 +2315,70 @@ impl NostrServerTransport {
                     open_stream.enabled && discovered.supports_open_stream;
                 let client_supports_open_stream = session.supports_open_stream;
 
+                // CEP-8: negotiate this session's payment-interaction mode from the inner tags.
+                let is_request = matches!(mcp_msg, JsonRpcMessage::Request(_));
+                let inbound_method = mcp_msg.method().map(str::to_owned);
+                let negotiation = Self::negotiate_payment_interaction(
+                    session,
+                    &inner_tags,
+                    inbound_method.as_deref(),
+                    is_request,
+                    supports_explicit_gating,
+                );
+                // Capture both context inputs as owned locals while the lock is held, so every
+                // branch below can dispatch after dropping it.
+                let client_pmis = extract_pmis(&inner_tags);
+                let client_pmis = (!client_pmis.is_empty()).then_some(client_pmis);
+                // A resolved mode, not the raw option: an unset effective mode means `transparent`,
+                // and a middleware comparing against a concrete mode must not see `None`.
+                let effective_payment_interaction = Some(
+                    session
+                        .effective_payment_interaction
+                        .unwrap_or(PaymentInteractionMode::Transparent),
+                );
+
+                // CEP-8: the client asked for a lifecycle this server does not offer. Answer the
+                // request with `-32602` and do not dispatch it.
+                if let NegotiationOutcome::RejectUnsupported { requested } = negotiation {
+                    let error_response =
+                        Self::unsupported_payment_interaction_error(&mcp_msg, requested);
+                    drop(sessions_w);
+                    if let Ok(client_pk) = PublicKey::from_hex(&sender_pubkey) {
+                        let event_id_parsed =
+                            EventId::from_hex(&event_id).unwrap_or(EventId::all_zeros());
+                        let tags =
+                            BaseTransport::create_response_tags(&client_pk, &event_id_parsed);
+                        let base = BaseTransport {
+                            relay_pool: Arc::clone(&relay_pool),
+                            encryption_mode,
+                            is_connected: true,
+                        };
+                        if let Err(e) = base
+                            .send_mcp_message(
+                                &error_response,
+                                &client_pk,
+                                CTXVM_MESSAGES_KIND,
+                                tags,
+                                Some(is_encrypted),
+                                Self::select_outbound_gift_wrap_kind(
+                                    gift_wrap_mode,
+                                    is_encrypted,
+                                    if is_gift_wrap { Some(outer_kind) } else { None },
+                                ),
+                            )
+                            .await
+                        {
+                            tracing::error!(
+                                target: LOG_TARGET,
+                                error = %e,
+                                sender_pubkey = %sender_pubkey,
+                                "Failed to send unsupported payment_interaction error response"
+                            );
+                        }
+                    }
+                    continue;
+                }
+
                 // CEP-22: intercept oversized-transfer frames before request
                 // correlation/dispatch. A disabled server forwards raw progress
                 // notifications as before.
@@ -1996,6 +2405,10 @@ impl NostrServerTransport {
                                 &open_stream,
                                 inbound_event,
                                 &middlewares,
+                                client_pmis,
+                                effective_payment_interaction,
+                                &sessions,
+                                &tag_sources,
                             )
                             .await;
                             continue;
@@ -2102,6 +2515,8 @@ impl NostrServerTransport {
                                 writer_request_id,
                                 is_encrypted,
                                 if is_gift_wrap { Some(outer_kind) } else { None },
+                                &sessions,
+                                &tag_sources,
                             );
                         }
                     }
@@ -2129,6 +2544,8 @@ impl NostrServerTransport {
                     event_id,
                     is_encrypted,
                     if is_gift_wrap { Some(outer_kind) } else { None },
+                    client_pmis,
+                    effective_payment_interaction,
                     inbound_event,
                 );
             }
@@ -2162,6 +2579,14 @@ impl NostrServerTransport {
         open_stream: &ServerOpenStreamState,
         inbound_event: Option<Event>,
         chain: &Arc<[Arc<dyn InboundMiddleware>]>,
+        // CEP-8: negotiated for the carrying frame's iteration and forwarded onto the reassembled
+        // request. Transfer frames are notifications, so an oversized request carrying an
+        // unsupported mode is downgraded and disclosed on the response rather than drawing a
+        // `-32602`, which is what the reference implementation does as well.
+        client_pmis: Option<Vec<String>>,
+        payment_interaction: Option<PaymentInteractionMode>,
+        sessions: &SessionStore,
+        tag_sources: &ResponseTagSources,
     ) {
         // The outer progressToken keys the transfer (needed for accept + route).
         // String or number — defensive only: every known sender stringifies
@@ -2277,6 +2702,8 @@ impl NostrServerTransport {
                             writer_request_id,
                             is_encrypted,
                             if is_gift_wrap { Some(outer_kind) } else { None },
+                            sessions,
+                            tag_sources,
                         );
                     }
                 }
@@ -2289,6 +2716,8 @@ impl NostrServerTransport {
                     event_id.to_string(),
                     is_encrypted,
                     if is_gift_wrap { Some(outer_kind) } else { None },
+                    client_pmis,
+                    payment_interaction,
                     inbound_event,
                 );
             }
@@ -2386,6 +2815,8 @@ impl NostrServerTransport {
         original_request_id: serde_json::Value,
         is_encrypted: bool,
         mirrored_wrap_kind: Option<u16>,
+        sessions: &SessionStore,
+        tag_sources: &ResponseTagSources,
     ) {
         let client_pubkey = match PublicKey::from_hex(client_pubkey_hex) {
             Ok(pk) => pk,
@@ -2426,23 +2857,36 @@ impl NostrServerTransport {
             })
         });
 
-        // Terminal hooks flush any deferred final response from the snapshot.
+        // Terminal hooks flush any deferred final response from the snapshot. They carry a session
+        // handle and the first-response tag set so a flushed response still gets the same discovery
+        // tags and effective-mode disclosure the normal response path sends.
         let on_close: OnCloseHook = {
             let state = state.clone();
             let relay_pool = Arc::clone(relay_pool);
             let event_id = event_id.to_string();
+            let sessions = sessions.clone();
+            let tag_sources = tag_sources.clone();
             Arc::new(move || {
                 let state = state.clone();
                 let relay_pool = Arc::clone(&relay_pool);
                 let event_id = event_id.clone();
+                let sessions = sessions.clone();
+                let tag_sources = tag_sources.clone();
                 Box::pin(async move {
                     let base = BaseTransport {
                         relay_pool,
                         encryption_mode,
                         is_connected: true,
                     };
-                    Self::flush_open_stream_response(&state, &base, gift_wrap_mode, &event_id)
-                        .await;
+                    Self::flush_open_stream_response(
+                        &state,
+                        &base,
+                        gift_wrap_mode,
+                        &event_id,
+                        &sessions,
+                        &tag_sources,
+                    )
+                    .await;
                 })
             })
         };
@@ -2450,18 +2894,29 @@ impl NostrServerTransport {
             let state = state.clone();
             let relay_pool = Arc::clone(relay_pool);
             let event_id = event_id.to_string();
+            let sessions = sessions.clone();
+            let tag_sources = tag_sources.clone();
             Arc::new(move |_reason| {
                 let state = state.clone();
                 let relay_pool = Arc::clone(&relay_pool);
                 let event_id = event_id.clone();
+                let sessions = sessions.clone();
+                let tag_sources = tag_sources.clone();
                 Box::pin(async move {
                     let base = BaseTransport {
                         relay_pool,
                         encryption_mode,
                         is_connected: true,
                     };
-                    Self::flush_open_stream_response(&state, &base, gift_wrap_mode, &event_id)
-                        .await;
+                    Self::flush_open_stream_response(
+                        &state,
+                        &base,
+                        gift_wrap_mode,
+                        &event_id,
+                        &sessions,
+                        &tag_sources,
+                    )
+                    .await;
                 })
             })
         };
@@ -4041,5 +4496,1075 @@ mod tests {
             evicted.load(std::sync::atomic::Ordering::SeqCst),
             "eviction callback must fire on probe-timeout session release"
         );
+    }
+
+    // ── CEP-8 payment-interaction negotiation ───────────────────
+
+    fn pi_tag(value: &str) -> Tag {
+        Tag::custom(
+            TagKind::Custom(tags::PAYMENT_INTERACTION.into()),
+            vec![value.to_string()],
+        )
+    }
+
+    fn negotiate(
+        session: &mut ClientSession,
+        tags: &[Tag],
+        is_request: bool,
+        supports_explicit_gating: bool,
+    ) -> NegotiationOutcome {
+        NostrServerTransport::negotiate_payment_interaction(
+            session,
+            tags,
+            Some("tools/call"),
+            is_request,
+            supports_explicit_gating,
+        )
+    }
+
+    #[test]
+    fn negotiate_transparent_request_under_optional_policy() {
+        let mut session = ClientSession::new(false);
+        let outcome = negotiate(&mut session, &[pi_tag("transparent")], true, true);
+
+        assert_eq!(outcome, NegotiationOutcome::Proceed);
+        assert_eq!(
+            session.requested_payment_interaction,
+            Some(PaymentInteractionMode::Transparent)
+        );
+        assert_eq!(
+            session.effective_payment_interaction,
+            Some(PaymentInteractionMode::Transparent)
+        );
+    }
+
+    #[test]
+    fn negotiate_accepts_gating_under_optional_policy() {
+        let mut session = ClientSession::new(false);
+        let outcome = negotiate(&mut session, &[pi_tag("explicit_gating")], true, true);
+
+        assert_eq!(outcome, NegotiationOutcome::Proceed);
+        assert_eq!(
+            session.requested_payment_interaction,
+            Some(PaymentInteractionMode::ExplicitGating)
+        );
+        assert_eq!(
+            session.effective_payment_interaction,
+            Some(PaymentInteractionMode::ExplicitGating)
+        );
+        assert!(!session.has_disclosed_payment_interaction);
+    }
+
+    #[test]
+    fn negotiate_rejects_gating_request_when_unsupported() {
+        let mut session = ClientSession::new(false);
+        let outcome = negotiate(&mut session, &[pi_tag("explicit_gating")], true, false);
+
+        assert_eq!(
+            outcome,
+            NegotiationOutcome::RejectUnsupported {
+                requested: PaymentInteractionMode::ExplicitGating
+            }
+        );
+        // The request is recorded, but the session is left on the lifecycle the server can serve.
+        assert_eq!(
+            session.requested_payment_interaction,
+            Some(PaymentInteractionMode::ExplicitGating)
+        );
+        assert_eq!(
+            session.effective_payment_interaction,
+            Some(PaymentInteractionMode::Transparent)
+        );
+    }
+
+    #[test]
+    fn negotiate_does_not_reject_a_notification_carrying_gating() {
+        let mut session = ClientSession::new(false);
+        let outcome = negotiate(&mut session, &[pi_tag("explicit_gating")], false, false);
+
+        assert_eq!(outcome, NegotiationOutcome::Proceed);
+        assert_eq!(
+            session.effective_payment_interaction,
+            Some(PaymentInteractionMode::Transparent)
+        );
+    }
+
+    #[test]
+    fn negotiate_absent_tag_inherits_current_mode() {
+        let mut session = ClientSession::new(false);
+        session.requested_payment_interaction = Some(PaymentInteractionMode::ExplicitGating);
+        session.effective_payment_interaction = Some(PaymentInteractionMode::ExplicitGating);
+        session.has_disclosed_payment_interaction = true;
+
+        let outcome = negotiate(&mut session, &[], true, true);
+
+        assert_eq!(outcome, NegotiationOutcome::Proceed);
+        assert_eq!(
+            session.requested_payment_interaction,
+            Some(PaymentInteractionMode::ExplicitGating)
+        );
+        assert_eq!(
+            session.effective_payment_interaction,
+            Some(PaymentInteractionMode::ExplicitGating)
+        );
+        assert!(session.has_disclosed_payment_interaction);
+    }
+
+    #[test]
+    fn negotiate_initialize_resets_payment_fields_only() {
+        let mut session = ClientSession::new(false);
+        session.requested_payment_interaction = Some(PaymentInteractionMode::ExplicitGating);
+        session.effective_payment_interaction = Some(PaymentInteractionMode::ExplicitGating);
+        session.has_disclosed_payment_interaction = true;
+        session.supports_encryption = true;
+        session.supports_ephemeral_encryption = true;
+        session.supports_oversized_transfer = true;
+        session.supports_open_stream = true;
+        session.is_initialized = true;
+        session.has_sent_common_tags = true;
+
+        let outcome = NostrServerTransport::negotiate_payment_interaction(
+            &mut session,
+            &[],
+            Some("initialize"),
+            true,
+            true,
+        );
+
+        assert_eq!(outcome, NegotiationOutcome::Proceed);
+        assert_eq!(session.requested_payment_interaction, None);
+        assert_eq!(session.effective_payment_interaction, None);
+        assert!(!session.has_disclosed_payment_interaction);
+        // The learned transport capabilities must survive a renegotiation.
+        assert!(session.supports_encryption);
+        assert!(session.supports_ephemeral_encryption);
+        assert!(session.supports_oversized_transfer);
+        assert!(session.supports_open_stream);
+        assert!(session.is_initialized);
+        assert!(session.has_sent_common_tags);
+    }
+
+    #[test]
+    fn negotiate_initialize_rederives_from_its_own_tag() {
+        let mut session = ClientSession::new(false);
+        session.effective_payment_interaction = Some(PaymentInteractionMode::Transparent);
+        session.has_disclosed_payment_interaction = true;
+
+        let outcome = NostrServerTransport::negotiate_payment_interaction(
+            &mut session,
+            &[pi_tag("explicit_gating")],
+            Some("initialize"),
+            true,
+            true,
+        );
+
+        assert_eq!(outcome, NegotiationOutcome::Proceed);
+        assert_eq!(
+            session.effective_payment_interaction,
+            Some(PaymentInteractionMode::ExplicitGating)
+        );
+        assert!(!session.has_disclosed_payment_interaction);
+    }
+
+    #[test]
+    fn negotiate_mid_session_flip_rearms_disclosure() {
+        let mut session = ClientSession::new(false);
+        session.requested_payment_interaction = Some(PaymentInteractionMode::Transparent);
+        session.effective_payment_interaction = Some(PaymentInteractionMode::Transparent);
+        session.has_disclosed_payment_interaction = true;
+
+        let outcome = negotiate(&mut session, &[pi_tag("explicit_gating")], true, true);
+
+        assert_eq!(outcome, NegotiationOutcome::Proceed);
+        assert_eq!(
+            session.effective_payment_interaction,
+            Some(PaymentInteractionMode::ExplicitGating)
+        );
+        assert!(!session.has_disclosed_payment_interaction);
+    }
+
+    #[test]
+    fn negotiate_resent_same_mode_is_idempotent() {
+        let mut session = ClientSession::new(false);
+        session.requested_payment_interaction = Some(PaymentInteractionMode::ExplicitGating);
+        session.effective_payment_interaction = Some(PaymentInteractionMode::ExplicitGating);
+        session.has_disclosed_payment_interaction = true;
+
+        let outcome = negotiate(&mut session, &[pi_tag("explicit_gating")], true, true);
+
+        assert_eq!(outcome, NegotiationOutcome::Proceed);
+        assert_eq!(
+            session.effective_payment_interaction,
+            Some(PaymentInteractionMode::ExplicitGating)
+        );
+        // Unchanged mode must not re-arm disclosure.
+        assert!(session.has_disclosed_payment_interaction);
+    }
+
+    #[test]
+    fn negotiate_unrecognized_value_downgrades() {
+        let mut session = ClientSession::new(false);
+        let outcome = negotiate(&mut session, &[pi_tag("bogus")], true, true);
+
+        assert_eq!(outcome, NegotiationOutcome::Proceed);
+        assert_eq!(
+            session.requested_payment_interaction,
+            Some(PaymentInteractionMode::Transparent)
+        );
+        assert_eq!(
+            session.effective_payment_interaction,
+            Some(PaymentInteractionMode::Transparent)
+        );
+    }
+
+    #[test]
+    fn unsupported_payment_interaction_error_pins_original_request_id() {
+        let request = JsonRpcMessage::Request(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: serde_json::json!(42),
+            method: "tools/call".to_string(),
+            params: None,
+        });
+
+        let error = NostrServerTransport::unsupported_payment_interaction_error(
+            &request,
+            PaymentInteractionMode::ExplicitGating,
+        );
+
+        let JsonRpcMessage::ErrorResponse(response) = error else {
+            panic!("expected an error response");
+        };
+        // The client correlates on the id it sent, not on the carrying Nostr event id.
+        assert_eq!(response.id, serde_json::json!(42));
+        assert_eq!(response.error.code, -32602);
+        assert_eq!(
+            response.error.message,
+            "Unsupported payment_interaction mode: explicit_gating"
+        );
+        assert_eq!(
+            response.error.data,
+            Some(serde_json::json!({
+                "requested": "explicit_gating",
+                "supported": ["transparent"],
+            }))
+        );
+    }
+
+    #[test]
+    fn unsupported_payment_interaction_error_preserves_string_id() {
+        let request = JsonRpcMessage::Request(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: serde_json::json!("req-abc"),
+            method: "tools/call".to_string(),
+            params: None,
+        });
+
+        let error = NostrServerTransport::unsupported_payment_interaction_error(
+            &request,
+            PaymentInteractionMode::ExplicitGating,
+        );
+
+        let JsonRpcMessage::ErrorResponse(response) = error else {
+            panic!("expected an error response");
+        };
+        assert_eq!(response.id, serde_json::json!("req-abc"));
+    }
+
+    // ── CEP-8 disclosure latch ──────────────────────────────────
+
+    #[test]
+    fn discloses_once_when_gating_requested() {
+        let mut session = ClientSession::new(false);
+        session.requested_payment_interaction = Some(PaymentInteractionMode::ExplicitGating);
+        session.effective_payment_interaction = Some(PaymentInteractionMode::ExplicitGating);
+
+        assert_eq!(
+            NostrServerTransport::take_payment_interaction_disclosure(&mut session),
+            Some(PaymentInteractionMode::ExplicitGating)
+        );
+        assert!(session.has_disclosed_payment_interaction);
+        // Latched: a second response carries no disclosure.
+        assert_eq!(
+            NostrServerTransport::take_payment_interaction_disclosure(&mut session),
+            None
+        );
+    }
+
+    #[test]
+    fn discloses_downgraded_effective_mode() {
+        let mut session = ClientSession::new(false);
+        session.requested_payment_interaction = Some(PaymentInteractionMode::ExplicitGating);
+        session.effective_payment_interaction = Some(PaymentInteractionMode::Transparent);
+
+        assert_eq!(
+            NostrServerTransport::take_payment_interaction_disclosure(&mut session),
+            Some(PaymentInteractionMode::Transparent)
+        );
+    }
+
+    #[test]
+    fn no_disclosure_when_transparent_requested() {
+        let mut session = ClientSession::new(false);
+        session.requested_payment_interaction = Some(PaymentInteractionMode::Transparent);
+        session.effective_payment_interaction = Some(PaymentInteractionMode::Transparent);
+
+        assert_eq!(
+            NostrServerTransport::take_payment_interaction_disclosure(&mut session),
+            None
+        );
+        assert!(!session.has_disclosed_payment_interaction);
+    }
+
+    #[test]
+    fn no_disclosure_before_effective_is_set() {
+        let mut session = ClientSession::new(false);
+        session.requested_payment_interaction = Some(PaymentInteractionMode::ExplicitGating);
+
+        assert_eq!(
+            NostrServerTransport::take_payment_interaction_disclosure(&mut session),
+            None
+        );
+        assert!(!session.has_disclosed_payment_interaction);
+    }
+
+    #[test]
+    fn no_disclosure_for_a_client_that_never_asked() {
+        let mut session = ClientSession::new(false);
+        session.effective_payment_interaction = Some(PaymentInteractionMode::Transparent);
+
+        assert_eq!(
+            NostrServerTransport::take_payment_interaction_disclosure(&mut session),
+            None
+        );
+    }
+
+    // ── CEP-8 capability-list result shape ──────────────────────
+
+    #[test]
+    fn capability_list_results_are_recognized() {
+        for key in ["tools", "resources", "resourceTemplates", "prompts"] {
+            let result = serde_json::json!({ key: [] });
+            assert!(
+                NostrServerTransport::is_capability_list_result(&result),
+                "{key} list result must be recognized"
+            );
+        }
+    }
+
+    #[test]
+    fn non_list_results_are_not_recognized() {
+        // A tools/call result.
+        assert!(!NostrServerTransport::is_capability_list_result(
+            &serde_json::json!({ "content": [{ "type": "text", "text": "hi" }], "isError": false })
+        ));
+        // An initialize result.
+        assert!(!NostrServerTransport::is_capability_list_result(
+            &serde_json::json!({ "protocolVersion": "2025-06-18", "capabilities": {} })
+        ));
+        // Empty and non-object results.
+        assert!(!NostrServerTransport::is_capability_list_result(
+            &serde_json::json!({})
+        ));
+        assert!(!NostrServerTransport::is_capability_list_result(
+            &serde_json::json!("tools")
+        ));
+    }
+
+    #[test]
+    fn list_key_must_hold_an_array() {
+        assert!(!NostrServerTransport::is_capability_list_result(
+            &serde_json::json!({ "tools": {} })
+        ));
+        assert!(!NostrServerTransport::is_capability_list_result(
+            &serde_json::json!({ "tools": null })
+        ));
+    }
+
+    #[test]
+    fn result_carrying_content_and_a_list_is_recognized() {
+        // The ts-sdk list schemas ignore unknown keys, so a result carrying both `content` and a
+        // list array parses as a list result there too. No `content` exclusion.
+        assert!(NostrServerTransport::is_capability_list_result(
+            &serde_json::json!({ "content": [], "resources": [] })
+        ));
+        assert!(NostrServerTransport::is_capability_list_result(
+            &serde_json::json!({ "content": [{ "type": "text", "text": "hi" }], "tools": [] })
+        ));
+    }
+
+    #[tokio::test]
+    async fn deferred_open_stream_response_discloses_effective_mode() {
+        // Guards the deferred flush path, which the normal-response tests do not reach.
+        let pool = Arc::new(MockRelayPool::new());
+        let transport = NostrServerTransport::with_relay_pool(
+            NostrServerTransportConfig::default()
+                .with_open_stream(OpenStreamConfig::default().with_enabled(true)),
+            Arc::clone(&pool) as Arc<dyn RelayPoolTrait>,
+        )
+        .await
+        .expect("server transport");
+
+        let client_keys = Keys::generate();
+        let client_pubkey = client_keys.public_key();
+        let client_pubkey_hex = client_pubkey.to_hex();
+
+        // A session that negotiated the gated lifecycle and has not been told the outcome yet.
+        {
+            let mut sessions_w = transport.sessions.write().await;
+            let mut session = ClientSession::new(false);
+            session.requested_payment_interaction = Some(PaymentInteractionMode::ExplicitGating);
+            session.effective_payment_interaction = Some(PaymentInteractionMode::ExplicitGating);
+            sessions_w.put(client_pubkey_hex.clone(), session);
+        }
+
+        let event_id = EventId::all_zeros();
+        let snapshot = RouteSnapshot {
+            client_pubkey,
+            original_request_id: serde_json::json!("streamed-1"),
+            is_encrypted: false,
+            mirrored_wrap_kind: None,
+        };
+        NostrServerTransport::publish_open_stream_deferred_response(
+            &transport.base,
+            GiftWrapMode::Optional,
+            &event_id.to_hex(),
+            &snapshot,
+            JsonRpcMessage::Response(JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id: serde_json::json!("streamed-1"),
+                result: serde_json::json!({ "content": [] }),
+            }),
+            &transport.sessions,
+            &ResponseTagSources {
+                common: transport.announcement_manager.get_common_tags(),
+                pricing: transport.announcement_manager.get_pricing_tags().to_vec(),
+            },
+        )
+        .await
+        .expect("publish the deferred response");
+
+        let published = pool.stored_events().await;
+        let response = published
+            .iter()
+            .find(|e| e.kind == Kind::Custom(CTXVM_MESSAGES_KIND))
+            .expect("deferred response must be published");
+        let disclosed: Vec<String> = response
+            .tags
+            .iter()
+            .filter_map(|t| {
+                let parts = t.clone().to_vec();
+                match (parts.first().map(String::as_str), parts.get(1)) {
+                    (Some(name), Some(v)) if name == tags::PAYMENT_INTERACTION => Some(v.clone()),
+                    _ => None,
+                }
+            })
+            .collect();
+        assert_eq!(
+            disclosed,
+            vec!["explicit_gating"],
+            "a deferred response must disclose the effective mode exactly once"
+        );
+
+        // The latch is consumed, so a later response does not disclose again.
+        let snap = transport
+            .sessions
+            .get_session(&client_pubkey_hex)
+            .await
+            .expect("session");
+        assert!(snap.has_disclosed_payment_interaction);
+    }
+
+    #[tokio::test]
+    async fn deferred_open_stream_response_carries_discovery_tags() {
+        // The deferred flush is a first response like any other. If it carried only routing tags,
+        // a stateless client would capture it as its session baseline and then report no server
+        // name and no capabilities for the rest of the session, because the baseline only ever
+        // upgrades to an event carrying a full initialize result.
+        let pool = Arc::new(MockRelayPool::new());
+        let transport = NostrServerTransport::with_relay_pool(
+            NostrServerTransportConfig::default()
+                .with_encryption_mode(EncryptionMode::Optional)
+                .with_server_info(
+                    ServerInfo::default()
+                        .with_name("Deferred-Server")
+                        .with_about("about-text")
+                        .with_website("https://example.invalid")
+                        .with_picture("https://example.invalid/p.png"),
+                )
+                .with_open_stream(OpenStreamConfig::default().with_enabled(true)),
+            Arc::clone(&pool) as Arc<dyn RelayPoolTrait>,
+        )
+        .await
+        .expect("server transport");
+
+        let client_pubkey = Keys::generate().public_key();
+        {
+            let mut sessions_w = transport.sessions.write().await;
+            sessions_w.put(client_pubkey.to_hex(), ClientSession::new(false));
+        }
+
+        let snapshot = RouteSnapshot {
+            client_pubkey,
+            original_request_id: serde_json::json!(1),
+            is_encrypted: false,
+            mirrored_wrap_kind: None,
+        };
+        NostrServerTransport::publish_open_stream_deferred_response(
+            &transport.base,
+            GiftWrapMode::Optional,
+            &EventId::all_zeros().to_hex(),
+            &snapshot,
+            JsonRpcMessage::Response(JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id: serde_json::json!(1),
+                result: serde_json::json!({ "content": [] }),
+            }),
+            &transport.sessions,
+            &ResponseTagSources {
+                common: transport.announcement_manager.get_common_tags(),
+                pricing: transport.announcement_manager.get_pricing_tags().to_vec(),
+            },
+        )
+        .await
+        .expect("publish the deferred response");
+
+        let published = pool.stored_events().await;
+        let response = published
+            .iter()
+            .find(|e| e.kind == Kind::Custom(CTXVM_MESSAGES_KIND))
+            .expect("deferred response must be published");
+        // Pin the whole set, not a sample: the deferred path must send exactly what the normal
+        // response path sends. A leaner helper that emits only the name and the capability flags
+        // would satisfy any spot check while silently dropping the rest of the server identity,
+        // and the client's baseline capture is sticky, so that loss would last the session.
+        let sent: Vec<Vec<String>> = crate::transport::discovery_tags::get_discovery_tags(
+            &response.tags.iter().cloned().collect::<Vec<Tag>>(),
+        )
+        .into_iter()
+        .map(|t| t.to_vec())
+        .collect();
+        let expected: Vec<Vec<String>> = transport
+            .announcement_manager
+            .get_common_tags()
+            .into_iter()
+            .map(|t| t.to_vec())
+            .collect();
+        assert_eq!(
+            sent, expected,
+            "the deferred first response must carry the same tag set as the normal path"
+        );
+        for name in [tags::NAME, tags::ABOUT, tags::WEBSITE, tags::PICTURE] {
+            assert!(
+                sent.iter()
+                    .any(|t| t.first().map(String::as_str) == Some(name)),
+                "{name} must reach the client's session baseline"
+            );
+        }
+
+        // One-shot: a second deferred response carries none of it.
+        NostrServerTransport::publish_open_stream_deferred_response(
+            &transport.base,
+            GiftWrapMode::Optional,
+            &EventId::all_zeros().to_hex(),
+            &snapshot,
+            JsonRpcMessage::Response(JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id: serde_json::json!(2),
+                result: serde_json::json!({ "content": [] }),
+            }),
+            &transport.sessions,
+            &ResponseTagSources {
+                common: transport.announcement_manager.get_common_tags(),
+                pricing: transport.announcement_manager.get_pricing_tags().to_vec(),
+            },
+        )
+        .await
+        .expect("publish the second deferred response");
+        let published = pool.stored_events().await;
+        let second = published
+            .iter()
+            .rfind(|e| e.kind == Kind::Custom(CTXVM_MESSAGES_KIND))
+            .expect("second response");
+        assert_eq!(
+            crate::core::serializers::get_tag_value(&second.tags, tags::NAME),
+            None,
+            "the discovery latch is one-shot"
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_open_stream_response_dedups_disclosure_against_advertisement() {
+        // Now that the discovery set rides the deferred response, it can already carry the
+        // server's availability advertisement naming this same mode. The disclosure must not add
+        // a second copy.
+        let pool = Arc::new(MockRelayPool::new());
+        let mut transport = NostrServerTransport::with_relay_pool(
+            NostrServerTransportConfig::default()
+                .with_open_stream(OpenStreamConfig::default().with_enabled(true)),
+            Arc::clone(&pool) as Arc<dyn RelayPoolTrait>,
+        )
+        .await
+        .expect("server transport");
+        transport.set_announcement_extra_tags(vec![
+            crate::payments::tags::payment_interaction_tag(PaymentInteractionMode::ExplicitGating),
+        ]);
+
+        let client_pubkey = Keys::generate().public_key();
+        {
+            let mut sessions_w = transport.sessions.write().await;
+            let mut session = ClientSession::new(false);
+            session.requested_payment_interaction = Some(PaymentInteractionMode::ExplicitGating);
+            session.effective_payment_interaction = Some(PaymentInteractionMode::ExplicitGating);
+            sessions_w.put(client_pubkey.to_hex(), session);
+        }
+
+        let snapshot = RouteSnapshot {
+            client_pubkey,
+            original_request_id: serde_json::json!(1),
+            is_encrypted: false,
+            mirrored_wrap_kind: None,
+        };
+        NostrServerTransport::publish_open_stream_deferred_response(
+            &transport.base,
+            GiftWrapMode::Optional,
+            &EventId::all_zeros().to_hex(),
+            &snapshot,
+            JsonRpcMessage::Response(JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id: serde_json::json!(1),
+                result: serde_json::json!({ "content": [] }),
+            }),
+            &transport.sessions,
+            &ResponseTagSources {
+                common: transport.announcement_manager.get_common_tags(),
+                pricing: transport.announcement_manager.get_pricing_tags().to_vec(),
+            },
+        )
+        .await
+        .expect("publish the deferred response");
+
+        let published = pool.stored_events().await;
+        let response = published
+            .iter()
+            .find(|e| e.kind == Kind::Custom(CTXVM_MESSAGES_KIND))
+            .expect("deferred response must be published");
+        let disclosed: Vec<String> = response
+            .tags
+            .iter()
+            .filter_map(|t| {
+                let parts = t.clone().to_vec();
+                match (parts.first().map(String::as_str), parts.get(1)) {
+                    (Some(name), Some(v)) if name == tags::PAYMENT_INTERACTION => Some(v.clone()),
+                    _ => None,
+                }
+            })
+            .collect();
+        assert_eq!(
+            disclosed,
+            vec!["explicit_gating"],
+            "advertisement and disclosure must not both emit the same tag"
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_open_stream_response_prices_a_capability_list_result() {
+        // A streaming tool may return a capability-list result. The normal response path prices
+        // one, so this path must too, or the same content is tagged differently depending on
+        // whether a stream happened to be open.
+        let pool = Arc::new(MockRelayPool::new());
+        let mut transport = NostrServerTransport::with_relay_pool(
+            NostrServerTransportConfig::default()
+                .with_open_stream(OpenStreamConfig::default().with_enabled(true)),
+            Arc::clone(&pool) as Arc<dyn RelayPoolTrait>,
+        )
+        .await
+        .expect("server transport");
+        transport.set_announcement_pricing_tags(
+            crate::payments::tags::cap_tags_from_priced_capabilities(&[
+                crate::payments::types::PricedCapability {
+                    method: "tools/call".to_string(),
+                    name: Some("get_weather".to_string()),
+                    amount: 100,
+                    max_amount: None,
+                    currency_unit: "sats".to_string(),
+                    description: None,
+                },
+            ]),
+        );
+
+        let client_pubkey = Keys::generate().public_key();
+        {
+            let mut sessions_w = transport.sessions.write().await;
+            sessions_w.put(client_pubkey.to_hex(), ClientSession::new(false));
+        }
+        let snapshot = RouteSnapshot {
+            client_pubkey,
+            original_request_id: serde_json::json!(1),
+            is_encrypted: false,
+            mirrored_wrap_kind: None,
+        };
+        let sources = ResponseTagSources {
+            common: transport.announcement_manager.get_common_tags(),
+            pricing: transport.announcement_manager.get_pricing_tags().to_vec(),
+        };
+
+        let caps_on = |event: &Event| -> Vec<String> {
+            event
+                .tags
+                .iter()
+                .filter_map(|t| {
+                    let parts = t.clone().to_vec();
+                    match (parts.first().map(String::as_str), parts.get(1)) {
+                        (Some(n), Some(v)) if n == tags::CAPABILITY => Some(v.clone()),
+                        _ => None,
+                    }
+                })
+                .collect()
+        };
+
+        // A list-shaped result is priced.
+        NostrServerTransport::publish_open_stream_deferred_response(
+            &transport.base,
+            GiftWrapMode::Optional,
+            &EventId::all_zeros().to_hex(),
+            &snapshot,
+            JsonRpcMessage::Response(JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id: serde_json::json!(1),
+                result: serde_json::json!({ "content": [], "tools": [] }),
+            }),
+            &transport.sessions,
+            &sources,
+        )
+        .await
+        .expect("publish the list response");
+        let listed = pool.stored_events().await;
+        let list_response = listed
+            .iter()
+            .rfind(|e| e.kind == Kind::Custom(CTXVM_MESSAGES_KIND))
+            .expect("list response");
+        assert_eq!(
+            caps_on(list_response),
+            vec!["tool:get_weather"],
+            "a deferred capability-list result must carry the pricing tags"
+        );
+
+        // An ordinary tool result is not.
+        NostrServerTransport::publish_open_stream_deferred_response(
+            &transport.base,
+            GiftWrapMode::Optional,
+            &EventId::all_zeros().to_hex(),
+            &snapshot,
+            JsonRpcMessage::Response(JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id: serde_json::json!(2),
+                result: serde_json::json!({ "content": [], "isError": false }),
+            }),
+            &transport.sessions,
+            &sources,
+        )
+        .await
+        .expect("publish the plain response");
+        let all = pool.stored_events().await;
+        let plain = all
+            .iter()
+            .rfind(|e| e.kind == Kind::Custom(CTXVM_MESSAGES_KIND))
+            .expect("plain response");
+        assert!(
+            caps_on(plain).is_empty(),
+            "a non-list deferred result must not carry pricing tags"
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_open_stream_response_omits_tag_when_nothing_negotiated() {
+        // A client that never asked for a non-default mode gets no tag, exactly as on the
+        // normal response path.
+        let pool = Arc::new(MockRelayPool::new());
+        let transport = NostrServerTransport::with_relay_pool(
+            NostrServerTransportConfig::default()
+                .with_open_stream(OpenStreamConfig::default().with_enabled(true)),
+            Arc::clone(&pool) as Arc<dyn RelayPoolTrait>,
+        )
+        .await
+        .expect("server transport");
+
+        let client_pubkey = Keys::generate().public_key();
+        {
+            let mut sessions_w = transport.sessions.write().await;
+            sessions_w.put(client_pubkey.to_hex(), ClientSession::new(false));
+        }
+
+        let snapshot = RouteSnapshot {
+            client_pubkey,
+            original_request_id: serde_json::json!(1),
+            is_encrypted: false,
+            mirrored_wrap_kind: None,
+        };
+        NostrServerTransport::publish_open_stream_deferred_response(
+            &transport.base,
+            GiftWrapMode::Optional,
+            &EventId::all_zeros().to_hex(),
+            &snapshot,
+            JsonRpcMessage::Response(JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id: serde_json::json!(1),
+                result: serde_json::json!({ "content": [] }),
+            }),
+            &transport.sessions,
+            &ResponseTagSources {
+                common: transport.announcement_manager.get_common_tags(),
+                pricing: transport.announcement_manager.get_pricing_tags().to_vec(),
+            },
+        )
+        .await
+        .expect("publish the deferred response");
+
+        let published = pool.stored_events().await;
+        let response = published
+            .iter()
+            .find(|e| e.kind == Kind::Custom(CTXVM_MESSAGES_KIND))
+            .expect("deferred response must be published");
+        assert!(
+            !response.tags.iter().any(|t| {
+                t.clone().to_vec().first().map(String::as_str) == Some(tags::PAYMENT_INTERACTION)
+            }),
+            "no disclosure when the client never negotiated"
+        );
+    }
+
+    /// A raw `tools/call` request carrying a `_meta.progressToken`, which is what makes the event
+    /// loop create a real writer (and with it the terminal hooks) for this event.
+    fn streaming_call_event(
+        client_keys: &Keys,
+        server_pubkey: PublicKey,
+        request_id: serde_json::Value,
+        progress_token: &str,
+        extra_tags: Vec<Tag>,
+    ) -> Event {
+        let request = JsonRpcMessage::Request(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: request_id,
+            method: "tools/call".to_string(),
+            params: Some(serde_json::json!({
+                "name": "streamer",
+                "_meta": { "progressToken": progress_token },
+            })),
+        });
+        let mut tags = BaseTransport::create_recipient_tags(&server_pubkey);
+        tags.extend(extra_tags);
+        crate::core::serializers::mcp_to_nostr_event(&request, CTXVM_MESSAGES_KIND, tags)
+            .expect("serialize the streaming call")
+            .sign_with_keys(client_keys)
+            .expect("sign the streaming call")
+    }
+
+    /// A capability-list result, so the `cap` push is in play alongside discovery and disclosure.
+    fn list_result_response(id: serde_json::Value) -> JsonRpcMessage {
+        JsonRpcMessage::Response(JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id,
+            result: serde_json::json!({ "tools": [] }),
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deferred_response_tags_survive_the_writer_hook_wiring() {
+        // The deferred-path tests above all call `publish_open_stream_deferred_response` directly,
+        // handing it a `ResponseTagSources` the test built itself. That covers the composition but
+        // not the wiring that supplies it in production: `start()` -> `event_loop` ->
+        // `create_open_stream_writer` -> the two terminal hooks -> `flush_open_stream_response`.
+        // Giving those hooks an empty tag set, or transposing `common` and `pricing` where they are
+        // captured at `start()`, leaves every one of those tests green while shipping a deferred
+        // first response with no server identity (the round-2 bug) or with prices in place of it.
+        //
+        // So this one takes the long way round: a real inbound `tools/call` with a progressToken, a
+        // real writer taken from the slot the event loop created, and both flush orderings. The
+        // assertion is the whole tag list in order, because the failure being guarded against is a
+        // wrong tag SET, not a missing individual tag.
+        let (client_pool, server_pool) = MockRelayPool::create_pair();
+        let server_pubkey = server_pool.mock_public_key();
+        let s_pool = Arc::new(server_pool);
+
+        let mut transport = NostrServerTransport::with_relay_pool(
+            NostrServerTransportConfig::default()
+                .with_encryption_mode(EncryptionMode::Disabled)
+                .with_server_info(
+                    ServerInfo::default()
+                        .with_name("Wired-Server")
+                        .with_about("about-text")
+                        .with_website("https://example.invalid")
+                        .with_picture("https://example.invalid/p.png"),
+                )
+                .with_open_stream(OpenStreamConfig::default().with_enabled(true)),
+            Arc::clone(&s_pool) as Arc<dyn RelayPoolTrait>,
+        )
+        .await
+        .expect("server transport");
+        // An optional policy accepts the client's `explicit_gating`, so the disclosure fires.
+        transport.set_supported_payment_interaction(PaymentInteractionPolicy::Optional);
+        // Pricing must be non-empty and disjoint from the common set, or a transposition of the
+        // two would be indistinguishable from the correct wiring.
+        transport.set_announcement_pricing_tags(
+            crate::payments::tags::cap_tags_from_priced_capabilities(&[
+                crate::payments::types::PricedCapability {
+                    method: "tools/call".to_string(),
+                    name: Some("streamer".to_string()),
+                    amount: 100,
+                    max_amount: None,
+                    currency_unit: "sats".to_string(),
+                    description: None,
+                },
+            ]),
+        );
+
+        let common = transport.announcement_manager.get_common_tags();
+        let pricing = transport.announcement_manager.get_pricing_tags().to_vec();
+        assert!(!common.is_empty() && !pricing.is_empty());
+
+        let mut server_rx = transport
+            .take_message_receiver()
+            .expect("server message receiver");
+        transport.start().await.expect("server start");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // The full first-response tag list a deferred response must carry, in composition order:
+        // routing -> CEP-35 discovery -> CEP-8 disclosure -> CEP-8 pricing.
+        let expected_tags = |client_pubkey: &PublicKey, event_id: &str| -> Vec<Vec<String>> {
+            let mut expected = vec![
+                vec!["p".to_string(), client_pubkey.to_hex()],
+                vec!["e".to_string(), event_id.to_string()],
+            ];
+            expected.extend(common.iter().map(|t| t.clone().to_vec()));
+            expected.push(vec![
+                tags::PAYMENT_INTERACTION.to_string(),
+                "explicit_gating".to_string(),
+            ]);
+            expected.extend(pricing.iter().map(|t| t.clone().to_vec()));
+            expected
+        };
+
+        // Both orderings of the same delivery: the response can be stashed before the stream ends
+        // (flushed by the close hook, which reads the tag set captured at `start()`), or arrive
+        // after it (delivered by `send_response`'s SendNow branch, which reads it live). They are
+        // chosen by a race in production, so both have to be pinned.
+        // The close and abort hooks are two separately-built closures, so each captures the tag
+        // set on its own. Covering only one leaves the other free to ship an empty set.
+        for (label, request_id, token, stash_before_close, abort_stream) in [
+            (
+                "ordering A (stashed, close hook flushes)",
+                "stream-a",
+                "tok-a",
+                true,
+                false,
+            ),
+            (
+                "ordering B (stream terminal first)",
+                "stream-b",
+                "tok-b",
+                false,
+                false,
+            ),
+            (
+                "ordering A (stashed, abort hook flushes)",
+                "stream-c",
+                "tok-c",
+                true,
+                true,
+            ),
+        ] {
+            // A fresh client per ordering, so each gets an armed discovery latch.
+            let client_keys = Keys::generate();
+            let client_pubkey = client_keys.public_key();
+            client_pool
+                .publish_event(&streaming_call_event(
+                    &client_keys,
+                    server_pubkey,
+                    serde_json::json!(request_id),
+                    token,
+                    vec![pi_tag("explicit_gating")],
+                ))
+                .await
+                .expect("publish the streaming call");
+
+            let incoming = tokio::time::timeout(Duration::from_millis(500), server_rx.recv())
+                .await
+                .expect("the request must reach the handler")
+                .expect("channel closed");
+            let event_id = incoming.event_id.clone();
+
+            let writer = transport.get_open_stream_writer(&event_id).expect(
+                "the event loop must create a writer for a tools/call with a progressToken",
+            );
+            writer.start().await.expect("start the stream");
+            writer
+                .write("chunk".to_string())
+                .await
+                .expect("stream a chunk");
+
+            if stash_before_close {
+                transport
+                    .send_response(
+                        &event_id,
+                        list_result_response(serde_json::json!(request_id)),
+                    )
+                    .await
+                    .expect("stash the deferred response");
+                if abort_stream {
+                    writer
+                        .abort(Some("client cancelled".to_string()))
+                        .await
+                        .expect("abort the stream");
+                } else {
+                    writer.close().await.expect("close the stream");
+                }
+            } else {
+                writer.close().await.expect("close the stream");
+                transport
+                    .send_response(
+                        &event_id,
+                        list_result_response(serde_json::json!(request_id)),
+                    )
+                    .await
+                    .expect("deliver from the terminal slot");
+            }
+
+            // The response is the server-authored message carrying this request id; the stream
+            // frames published on the same kind carry the progress token instead.
+            let published = s_pool.stored_events().await;
+            let response = published
+                .iter()
+                .find(|e| {
+                    e.kind == Kind::Custom(CTXVM_MESSAGES_KIND)
+                        && e.pubkey == server_pubkey
+                        && e.content.contains(request_id)
+                })
+                .unwrap_or_else(|| panic!("{label}: the deferred response must be published"));
+
+            let sent: Vec<Vec<String>> = response.tags.iter().map(|t| t.clone().to_vec()).collect();
+            assert_eq!(
+                sent,
+                expected_tags(&client_pubkey, &event_id),
+                "{label}: a deferred first response must carry the same tag set, in the same order, \
+                 as the normal response path"
+            );
+        }
+
+        transport.close().await.expect("close the server");
+    }
+
+    #[test]
+    fn list_elements_are_not_validated_for_any_key() {
+        // Documented looseness: ts validates the array elements against its schemas for all four
+        // keys, so it would reject each of these malformed lists; the shape gate here accepts them.
+        // `cap` is a reference signal, and a real MCP handler does not emit these.
+        for key in ["tools", "resources", "resourceTemplates", "prompts"] {
+            assert!(
+                NostrServerTransport::is_capability_list_result(
+                    &serde_json::json!({ key: [{ "foo": 1 }] })
+                ),
+                "{key} elements are not validated"
+            );
+        }
     }
 }

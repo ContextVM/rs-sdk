@@ -13,7 +13,7 @@ use std::sync::Arc;
 use lru::LruCache;
 use tokio::sync::RwLock;
 
-use crate::core::types::ClientSession;
+use crate::core::types::{ClientSession, PaymentInteractionMode};
 use crate::transport::server::ServerEventRouteStore;
 
 const LOG_TARGET: &str = "contextvm_sdk::transport::server::session_store";
@@ -113,6 +113,9 @@ impl SessionStore {
             supports_ephemeral_encryption: s.supports_ephemeral_encryption,
             supports_oversized_transfer: s.supports_oversized_transfer,
             supports_open_stream: s.supports_open_stream,
+            requested_payment_interaction: s.requested_payment_interaction,
+            effective_payment_interaction: s.effective_payment_interaction,
+            has_disclosed_payment_interaction: s.has_disclosed_payment_interaction,
         })
     }
 
@@ -170,6 +173,9 @@ impl SessionStore {
                         supports_ephemeral_encryption: s.supports_ephemeral_encryption,
                         supports_oversized_transfer: s.supports_oversized_transfer,
                         supports_open_stream: s.supports_open_stream,
+                        requested_payment_interaction: s.requested_payment_interaction,
+                        effective_payment_interaction: s.effective_payment_interaction,
+                        has_disclosed_payment_interaction: s.has_disclosed_payment_interaction,
                     },
                 )
             })
@@ -233,7 +239,11 @@ impl SessionStore {
 
 /// A lightweight snapshot of session state (avoids exposing the full `ClientSession`
 /// through the async API boundary).
+///
+/// `#[non_exhaustive]`: it mirrors [`ClientSession`], which grows as new CEPs land, so match on
+/// the fields you need rather than destructuring exhaustively.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SessionSnapshot {
     /// Whether the MCP `initialize` handshake has completed
     pub is_initialized: bool,
@@ -251,6 +261,12 @@ pub struct SessionSnapshot {
     pub supports_oversized_transfer: bool,
     /// Whether the peer advertised CEP-41 open-stream support (learned, gated by server config)
     pub supports_open_stream: bool,
+    /// CEP-8: the payment-interaction mode the client requested
+    pub requested_payment_interaction: Option<PaymentInteractionMode>,
+    /// CEP-8: the payment-interaction mode negotiated as effective for this session
+    pub effective_payment_interaction: Option<PaymentInteractionMode>,
+    /// CEP-8: whether the effective mode has been disclosed on a response yet
+    pub has_disclosed_payment_interaction: bool,
 }
 
 #[cfg(test)]
@@ -403,6 +419,52 @@ mod tests {
         assert!(snap_all.supports_ephemeral_encryption);
         assert!(snap_all.supports_oversized_transfer);
         assert!(snap_all.supports_open_stream);
+    }
+
+    #[tokio::test]
+    async fn snapshot_surfaces_payment_fields() {
+        let store = SessionStore::new();
+        let r = routes();
+        store.get_or_create_session("client-1", false, &r).await;
+
+        // A fresh session has negotiated nothing.
+        let snap = store.get_session("client-1").await.unwrap();
+        assert_eq!(snap.requested_payment_interaction, None);
+        assert_eq!(snap.effective_payment_interaction, None);
+        assert!(!snap.has_disclosed_payment_interaction);
+
+        // The negotiated CEP-8 state must round-trip through the snapshot.
+        {
+            let mut sessions = store.write().await;
+            let session = sessions.get_mut("client-1").unwrap();
+            session.requested_payment_interaction = Some(PaymentInteractionMode::ExplicitGating);
+            session.effective_payment_interaction = Some(PaymentInteractionMode::Transparent);
+            session.has_disclosed_payment_interaction = true;
+        }
+
+        let snap = store.get_session("client-1").await.unwrap();
+        assert_eq!(
+            snap.requested_payment_interaction,
+            Some(PaymentInteractionMode::ExplicitGating)
+        );
+        assert_eq!(
+            snap.effective_payment_interaction,
+            Some(PaymentInteractionMode::Transparent)
+        );
+        assert!(snap.has_disclosed_payment_interaction);
+
+        // get_all_sessions exposes the same fields.
+        let all = store.get_all_sessions().await;
+        let (_, snap_all) = all.iter().find(|(k, _)| k == "client-1").unwrap();
+        assert_eq!(
+            snap_all.requested_payment_interaction,
+            Some(PaymentInteractionMode::ExplicitGating)
+        );
+        assert_eq!(
+            snap_all.effective_payment_interaction,
+            Some(PaymentInteractionMode::Transparent)
+        );
+        assert!(snap_all.has_disclosed_payment_interaction);
     }
 
     #[tokio::test]

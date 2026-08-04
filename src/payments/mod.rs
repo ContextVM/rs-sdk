@@ -37,7 +37,7 @@ pub use types::{
     Meta, PaymentAcceptedParams, PaymentHandlerRequest, PaymentInteractionPolicy, PaymentOption,
     PaymentPendingErrorData, PaymentProcessorCreateParams, PaymentProcessorVerifyParams,
     PaymentRejectedParams, PaymentRequiredErrorData, PaymentRequiredParams, PricedCapability,
-    ResolvePriceParams, ResolvePriceResult, VerifyOutcome,
+    ResolvePriceParams, ResolvePriceResult, UnsupportedPaymentInteractionData, VerifyOutcome,
 };
 
 #[cfg(feature = "test-utils")]

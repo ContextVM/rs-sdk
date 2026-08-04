@@ -97,7 +97,7 @@ pub use payments::{
     PaymentPendingErrorData, PaymentProcessor, PaymentProcessorCreateParams,
     PaymentProcessorVerifyParams, PaymentRejectedParams, PaymentRequiredErrorData,
     PaymentRequiredParams, PricedCapability, ResolvePrice, ResolvePriceParams, ResolvePriceResult,
-    VerifyOutcome,
+    UnsupportedPaymentInteractionData, VerifyOutcome,
 };
 #[cfg(feature = "test-utils")]
 pub use payments::{
