@@ -14,6 +14,17 @@
     mode on the first response, and attaches `cap` pricing tags to capability-list
     responses. The negotiated mode is read into the inbound-middleware context for the
     payment middlewares that follow.
+  - Client-side payment-interaction negotiation: the client transport now advertises its
+    payment methods (`pmi`) and its requested payment interaction mode
+    (`payment_interaction`) on outbound requests, configurable via `with_pmis` /
+    `with_payment_interaction` or the matching setters. The `pmi` tags ride every request;
+    the `payment_interaction` tag is sent once per mode and re-sent only when the requested
+    mode changes, so routine invocations stay clean while a mid-session change still
+    reaches the server. The client also records the effective mode the server discloses,
+    readable via `get_effective_payment_interaction`, and deliberately ignores an inbound
+    `payment_interaction` tag when it did not itself request `explicit_gating`, since such
+    a tag is a server availability advertisement rather than this session's negotiated
+    mode.
 
 ### Fixed
 
