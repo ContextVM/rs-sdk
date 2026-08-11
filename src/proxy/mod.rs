@@ -126,6 +126,8 @@ mod tests {
             fallback_operational_relay_urls: None,
             oversized_transfer: Default::default(),
             open_stream: Default::default(),
+            payment_interaction: None,
+            pmis: vec![],
         };
 
         let config = ProxyConfig { nostr_config };

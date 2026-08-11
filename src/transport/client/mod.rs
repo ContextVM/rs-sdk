@@ -28,9 +28,12 @@ use crate::core::serializers;
 use crate::core::types::*;
 use crate::core::validation;
 use crate::encryption;
+use crate::payments::tags::{parse_payment_interaction_value, payment_interaction_tag, pmi_tags};
 use crate::relay::{RelayPool, RelayPoolTrait};
 use crate::transport::base::BaseTransport;
-use crate::transport::discovery_tags::{parse_discovered_peer_capabilities, PeerCapabilities};
+use crate::transport::discovery_tags::{
+    extract_payment_interaction, parse_discovered_peer_capabilities, PeerCapabilities,
+};
 use crate::transport::open_stream::{
     FrameOutcome, KeepaliveAction, OpenStreamConfig, OpenStreamFrame, OpenStreamReceiver,
     OpenStreamRegistry, OpenStreamSession, OpenStreamSessionInit, PublishFrame,
@@ -79,6 +82,19 @@ pub struct NostrClientTransportConfig {
     /// engine, the keepalive sweep, and `call_tool_stream`. Opt in with
     /// `OpenStreamConfig::enabled()` / `with_enabled(true)`.
     pub open_stream: OpenStreamConfig,
+    /// CEP-8: the payment interaction mode this client requests for the session.
+    ///
+    /// Seeds the transport's negotiation state at construction;
+    /// [`NostrClientTransport::set_payment_interaction`] wins on any later call.
+    /// `None` (the default) means no `payment_interaction` tag is emitted and the
+    /// session runs in the protocol default, `transparent`.
+    pub payment_interaction: Option<PaymentInteractionMode>,
+    /// CEP-8: payment method identifiers this client advertises, in preference order.
+    ///
+    /// Seeds the transport's negotiation state at construction;
+    /// [`NostrClientTransport::set_client_pmis`] wins on any later call. Emitted as
+    /// `pmi` tags on every outbound request (they are not one-shot).
+    pub pmis: Vec<String>,
 }
 
 impl Default for NostrClientTransportConfig {
@@ -94,6 +110,8 @@ impl Default for NostrClientTransportConfig {
             fallback_operational_relay_urls: None,
             oversized_transfer: OversizedTransferConfig::default(),
             open_stream: OpenStreamConfig::default(),
+            payment_interaction: None,
+            pmis: vec![],
         }
     }
 }
@@ -155,6 +173,47 @@ impl NostrClientTransportConfig {
         self.open_stream = config;
         self
     }
+    /// CEP-8: request a payment interaction mode for the session.
+    ///
+    /// Seeds the transport at construction. To change the mode after the transport
+    /// exists, use [`NostrClientTransport::set_payment_interaction`], which wins over
+    /// this value.
+    pub fn with_payment_interaction(mut self, mode: PaymentInteractionMode) -> Self {
+        self.payment_interaction = Some(mode);
+        self
+    }
+    /// CEP-8: advertise payment method identifiers, in preference order.
+    ///
+    /// Seeds the transport at construction. To change the list after the transport
+    /// exists, use [`NostrClientTransport::set_client_pmis`], which replaces this
+    /// list rather than merging with it. An empty list emits no `pmi` tags.
+    pub fn with_pmis(mut self, pmis: Vec<String>) -> Self {
+        self.pmis = pmis;
+        self
+    }
+}
+
+/// CEP-8 client-side payment-interaction negotiation state.
+///
+/// All four fields live behind one mutex so the emission decision (does `requested`
+/// differ from `last_sent`?) is one critical section: split across two locks, a
+/// concurrent [`NostrClientTransport::set_payment_interaction`] could latch a mode
+/// that was never published.
+#[derive(Debug, Default)]
+struct ClientNegotiationState {
+    /// Payment method identifiers advertised on every negotiation-bearing request,
+    /// in preference order.
+    pmis: Vec<String>,
+    /// The payment interaction mode this client requests for the session.
+    requested: Option<PaymentInteractionMode>,
+    /// The mode most recently published. The tag is re-emitted only when `requested`
+    /// differs, so a routine invocation carries no `payment_interaction` tag (CEP-8
+    /// asks implementations to omit repeated tags on routine invocations).
+    last_sent: Option<PaymentInteractionMode>,
+    /// The effective mode the server disclosed. Recorded only when this client
+    /// requested `explicit_gating`; otherwise an inbound `payment_interaction` tag is
+    /// a server availability advertisement rather than this session's mode.
+    effective: Option<PaymentInteractionMode>,
 }
 
 /// Client-side Nostr transport for sending MCP requests and receiving responses.
@@ -176,6 +235,9 @@ pub struct NostrClientTransport {
     discovered_server_capabilities: Arc<Mutex<PeerCapabilities>>,
     /// CEP-35: first inbound event carrying discovery tags (session baseline).
     server_initialize_event: Arc<Mutex<Option<Event>>>,
+    /// CEP-8: requested/advertised/observed payment-interaction negotiation state.
+    /// Shared with the event loop, which records the server's disclosed mode into it.
+    negotiation: Arc<Mutex<ClientNegotiationState>>,
     /// Learned support for server-side ephemeral gift wraps.
     server_supports_ephemeral: Arc<AtomicBool>,
     /// Outer gift-wrap event IDs successfully decrypted and verified (inner `verify()`).
@@ -390,6 +452,12 @@ impl NostrClientTransport {
         let open_stream_registry = Arc::new(AsyncMutex::new(OpenStreamRegistry::with_policy(
             (&config.open_stream).into(),
         )));
+        // Seeded before the struct literal below moves `config` by field shorthand.
+        let negotiation = Arc::new(Mutex::new(ClientNegotiationState {
+            pmis: config.pmis.clone(),
+            requested: config.payment_interaction,
+            ..Default::default()
+        }));
 
         Ok(Self {
             base: BaseTransport {
@@ -415,6 +483,7 @@ impl NostrClientTransport {
             server_initialize_event: Arc::new(Mutex::new(None)),
             server_supports_ephemeral: Arc::new(AtomicBool::new(false)),
             seen_gift_wrap_ids,
+            negotiation,
             message_tx: Some(tx),
             message_rx: Some(rx),
             cancellation_token: CancellationToken::new(),
@@ -471,6 +540,12 @@ impl NostrClientTransport {
         let open_stream_registry = Arc::new(AsyncMutex::new(OpenStreamRegistry::with_policy(
             (&config.open_stream).into(),
         )));
+        // Seeded before the struct literal below moves `config` by field shorthand.
+        let negotiation = Arc::new(Mutex::new(ClientNegotiationState {
+            pmis: config.pmis.clone(),
+            requested: config.payment_interaction,
+            ..Default::default()
+        }));
 
         Ok(Self {
             base: BaseTransport {
@@ -496,6 +571,7 @@ impl NostrClientTransport {
             server_initialize_event: Arc::new(Mutex::new(None)),
             server_supports_ephemeral: Arc::new(AtomicBool::new(false)),
             seen_gift_wrap_ids,
+            negotiation,
             message_tx: Some(tx),
             message_rx: Some(rx),
             cancellation_token: CancellationToken::new(),
@@ -572,6 +648,7 @@ impl NostrClientTransport {
         let gift_wrap_mode = self.config.gift_wrap_mode;
         let discovered_caps = self.discovered_server_capabilities.clone();
         let init_event = self.server_initialize_event.clone();
+        let negotiation = self.negotiation.clone();
         let server_supports_ephemeral = self.server_supports_ephemeral.clone();
         let seen_gift_wrap_ids = self.seen_gift_wrap_ids.clone();
         let oversized_receiver = self.oversized_receiver.clone();
@@ -594,6 +671,7 @@ impl NostrClientTransport {
                 gift_wrap_mode,
                 discovered_caps,
                 init_event,
+                negotiation,
                 server_supports_ephemeral,
                 seen_gift_wrap_ids,
                 oversized_receiver,
@@ -709,7 +787,15 @@ impl NostrClientTransport {
         } else {
             vec![]
         };
-        let tags = BaseTransport::compose_outbound_tags(&base_tags, &discovery_tags, &[]);
+        // CEP-8: negotiation tags ride requests only, mirroring the discovery gate
+        // above. A notification therefore neither emits them nor burns the latch.
+        let (negotiation_tags, pending_payment_interaction) = if is_request {
+            self.get_pending_negotiation_tags()
+        } else {
+            (vec![], None)
+        };
+        let tags =
+            BaseTransport::compose_outbound_tags(&base_tags, &discovery_tags, &negotiation_tags);
         let gift_wrap_kind = self.choose_outbound_gift_wrap_kind();
         let discovery_sent = !discovery_tags.is_empty();
 
@@ -759,6 +845,7 @@ impl NostrClientTransport {
                         base_tags,
                         tags,
                         discovery_sent,
+                        pending_payment_interaction,
                     )
                     .await;
             }
@@ -790,11 +877,18 @@ impl NostrClientTransport {
                                 base_tags,
                                 tags,
                                 discovery_sent,
+                                pending_payment_interaction,
                             )
                             .await;
                     }
                     return self
-                        .publish_single_event(message, event_id, publishable_event, discovery_sent)
+                        .publish_single_event(
+                            message,
+                            event_id,
+                            publishable_event,
+                            discovery_sent,
+                            pending_payment_interaction,
+                        )
                         .await;
                 }
                 Err(error) => {
@@ -814,6 +908,7 @@ impl NostrClientTransport {
                             base_tags,
                             tags,
                             discovery_sent,
+                            pending_payment_interaction,
                         )
                         .await;
                 }
@@ -844,8 +939,14 @@ impl NostrClientTransport {
                 error
             })?;
 
-        self.publish_single_event(message, event_id, publishable_event, discovery_sent)
-            .await
+        self.publish_single_event(
+            message,
+            event_id,
+            publishable_event,
+            discovery_sent,
+            pending_payment_interaction,
+        )
+        .await
     }
 
     /// Register (for requests) and publish one prepared MCP event, flipping the
@@ -858,6 +959,7 @@ impl NostrClientTransport {
         event_id: EventId,
         publishable_event: Event,
         discovery_sent: bool,
+        pending_payment_interaction: Option<PaymentInteractionMode>,
     ) -> Result<()> {
         if let JsonRpcMessage::Request(ref req) = message {
             let is_initialize = req.method == INITIALIZE_METHOD;
@@ -882,6 +984,7 @@ impl NostrClientTransport {
         if discovery_sent {
             self.has_sent_discovery_tags.store(true, Ordering::Relaxed);
         }
+        self.mark_payment_interaction_sent(pending_payment_interaction);
 
         tracing::debug!(
             target: LOG_TARGET,
@@ -899,6 +1002,7 @@ impl NostrClientTransport {
     /// [`send_oversized_transfer`] sequencer, and registers the pending request
     /// against the **end** frame's event id (the value the server correlates its
     /// response to). One-shot discovery tags ride the `start` frame only.
+    #[allow(clippy::too_many_arguments)]
     async fn send_oversized_request(
         &self,
         message: &JsonRpcMessage,
@@ -907,6 +1011,7 @@ impl NostrClientTransport {
         base_tags: Vec<Tag>,
         start_tags: Vec<Tag>,
         discovery_sent: bool,
+        pending_payment_interaction: Option<PaymentInteractionMode>,
     ) -> Result<()> {
         // The handshake is required until the server is known to support oversized
         // transfer; once learned, chunks start immediately (no accept slot).
@@ -1022,6 +1127,10 @@ impl NostrClientTransport {
         if discovery_sent {
             self.has_sent_discovery_tags.store(true, Ordering::Relaxed);
         }
+        // The negotiation tags rode the `start` frame, so the latch flips here too.
+        // Missing this site would re-send `payment_interaction` on every later request
+        // once a first request happened to be oversized.
+        self.mark_payment_interaction_sent(pending_payment_interaction);
 
         tracing::debug!(
             target: LOG_TARGET,
@@ -1163,6 +1272,7 @@ impl NostrClientTransport {
         gift_wrap_mode: GiftWrapMode,
         discovered_caps: Arc<Mutex<PeerCapabilities>>,
         init_event: Arc<Mutex<Option<Event>>>,
+        negotiation: Arc<Mutex<ClientNegotiationState>>,
         server_supports_ephemeral: Arc<AtomicBool>,
         seen_gift_wrap_ids: Arc<Mutex<LruCache<EventId, ()>>>,
         oversized_receiver: Arc<Mutex<OversizedTransferReceiver>>,
@@ -1212,6 +1322,7 @@ impl NostrClientTransport {
                         gift_wrap_mode,
                         &discovered_caps,
                         &init_event,
+                        &negotiation,
                         &server_supports_ephemeral,
                         &seen_gift_wrap_ids,
                         &oversized_receiver,
@@ -1322,10 +1433,69 @@ impl NostrClientTransport {
         }
     }
 
+    /// CEP-8: the negotiation tags pending for the next outbound request, paired with
+    /// the payment interaction mode they carry (`None` when no `payment_interaction`
+    /// tag was included).
+    ///
+    /// Three separate rules, written out rather than folded into one condition
+    /// because they have three different lifetimes:
+    ///
+    /// 1. `pmi` tags ride *every* negotiation-bearing request and are never latched.
+    /// 2. `payment_interaction` is emitted only when the requested mode differs from
+    ///    the one last published, so routine invocations carry no tag while a
+    ///    mid-session change still reaches the server.
+    /// 3. Nothing at all is emitted when neither is configured.
+    ///
+    /// A requested `transparent` is emitted explicitly: a downgrade intent has to stay
+    /// distinguishable from an absent tag (which means "no preference").
+    ///
+    /// Deliberately synchronous, which is what structurally guarantees the mutex guard
+    /// cannot be alive at the `.await` that immediately follows the call in `send`.
+    fn get_pending_negotiation_tags(&self) -> (Vec<Tag>, Option<PaymentInteractionMode>) {
+        let state = match self.negotiation.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+
+        // Rule 1: never latched.
+        let mut tags = pmi_tags(&state.pmis);
+
+        // Rule 2: latched until the requested mode changes.
+        let pending_mode = match state.requested {
+            Some(mode) if Some(mode) != state.last_sent => Some(mode),
+            _ => None,
+        };
+        if let Some(mode) = pending_mode {
+            tags.push(payment_interaction_tag(mode));
+        }
+
+        // Rule 3 needs no branch: with no PMIs and no requested mode both of the above
+        // produce nothing.
+        (tags, pending_mode)
+    }
+
+    /// CEP-8: record the payment interaction mode a successful publish carried.
+    ///
+    /// Keyed on the mode that was actually emitted and threaded here by value rather
+    /// than re-read from the state: a second read would be a separate critical
+    /// section, and a `set_payment_interaction` landing between the two would latch a
+    /// mode that never went on the wire.
+    fn mark_payment_interaction_sent(&self, sent: Option<PaymentInteractionMode>) {
+        let Some(mode) = sent else {
+            return;
+        };
+        let mut state = match self.negotiation.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        state.last_sent = Some(mode);
+    }
+
     /// Parses inbound event tags and updates learned server capabilities.
     fn learn_server_discovery(
         discovered_caps: &Mutex<PeerCapabilities>,
         init_event: &Mutex<Option<Event>>,
+        negotiation: &Mutex<ClientNegotiationState>,
         event: &Event,
     ) {
         let tag_vec: Vec<Tag> = event.tags.clone().to_vec();
@@ -1345,6 +1515,38 @@ impl NostrClientTransport {
             caps.supports_oversized_transfer |= discovered.capabilities.supports_oversized_transfer;
             // CEP-41: OR-learn the server's open-stream support (never downgrades).
             caps.supports_open_stream |= discovered.capabilities.supports_open_stream;
+        }
+
+        // CEP-8: record the effective payment interaction mode the server disclosed.
+        //
+        // Placement is load-bearing, so do not move this block. Above the
+        // `discovery_tags.is_empty()` early return it would be redundant (a
+        // `payment_interaction` tag is itself a discovery tag, so an event carrying one
+        // can never take that return), and below the baseline logic it would tangle
+        // with the initialize-upgrade branch.
+        //
+        // The value is authoritative only when *this* client requested
+        // `explicit_gating`. On any other session an inbound tag is a server
+        // availability advertisement, and recording it would leave a transparent client
+        // believing it is on the explicit-gating lifecycle. Note the gate is on
+        // `ExplicitGating` specifically, not merely on a mode having been requested: a
+        // client that explicitly requested `transparent` also ignores the tag.
+        {
+            let mut state = match negotiation.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            if state.requested == Some(PaymentInteractionMode::ExplicitGating) {
+                // The first tag wins, and an unrecognized value parses to `None`, which
+                // leaves any previously recorded mode intact. The *observed* value is
+                // recorded, never the requested one, so a disclosed downgrade to
+                // `transparent` is stored as `transparent`.
+                if let Some(value) = extract_payment_interaction(&tag_vec) {
+                    if let Some(mode) = parse_payment_interaction_value(&value) {
+                        state.effective = Some(mode);
+                    }
+                }
+            }
         }
 
         let mut stored = match init_event.lock() {
@@ -1398,6 +1600,76 @@ impl NostrClientTransport {
             Err(p) => p.into_inner(),
         };
         *guard
+    }
+
+    // ── CEP-8 payment interaction ─────────────────────────────────
+
+    /// CEP-8: request a payment interaction mode for this session.
+    ///
+    /// The tag rides the next outbound request and is then latched: it is re-emitted
+    /// only when the requested mode differs from the one most recently **published**,
+    /// so routine invocations stay clean. Setting a mode and setting it back with no
+    /// request published in between therefore emits nothing, because nothing changed
+    /// on the wire.
+    ///
+    /// Deliberately `&self` and usable after [`start`](Self::start), unlike the
+    /// server's [`set_supported_payment_interaction`][srv], which must be called
+    /// before the server starts. Mid-session upsert is the point of the client side:
+    /// a later tag establishes or changes the session's mode.
+    ///
+    /// Overrides [`NostrClientTransportConfig::payment_interaction`]; there is no
+    /// merge.
+    ///
+    /// **Caller contract.** CEP-8 asks clients to keep `payment_interaction`
+    /// consistent across concurrently in-flight requests. Two requests composed on
+    /// either side of a mode change carry different modes, and which one the session
+    /// ends on depends on relay delivery order. Quiesce in-flight requests before
+    /// changing the mode mid-session; the transport deliberately does not serialize
+    /// sends to enforce this, since that would hold state across a publish.
+    ///
+    /// [srv]: crate::transport::server::NostrServerTransport::set_supported_payment_interaction
+    pub fn set_payment_interaction(&self, mode: PaymentInteractionMode) {
+        let mut state = match self.negotiation.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        state.requested = Some(mode);
+    }
+
+    /// CEP-8: advertise payment method identifiers, in preference order.
+    ///
+    /// Replaces any previously configured list, including one set through
+    /// [`NostrClientTransportConfig::pmis`]; there is no merge. The tags are not
+    /// latched, so they ride every subsequent request. An empty list emits no tags.
+    pub fn set_client_pmis(&self, pmis: Vec<String>) {
+        let mut state = match self.negotiation.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        state.pmis = pmis;
+    }
+
+    /// CEP-8: the effective payment interaction mode the server disclosed, if any.
+    ///
+    /// Only recorded when this client itself requested `explicit_gating`. An inbound
+    /// `payment_interaction` tag on any other session is a server *availability
+    /// advertisement*, not this session's negotiated mode, and recording it would
+    /// leave a transparent client believing it is on the explicit-gating lifecycle.
+    /// The value is therefore authoritative only for a session in which this client
+    /// requested gating.
+    ///
+    /// It can read stale in two ways. After this client downgrades itself with
+    /// [`set_payment_interaction`](Self::set_payment_interaction), the gate above blocks
+    /// further updates, so the value freezes at whatever was last observed. And a server
+    /// transition to `transparent` is signalled by the *absence* of the tag, which a
+    /// present-tag-only reader cannot see at all. Both match the TypeScript SDK, so the
+    /// two implementations agree on the same wire trace.
+    pub fn get_effective_payment_interaction(&self) -> Option<PaymentInteractionMode> {
+        let state = match self.negotiation.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        state.effective
     }
 
     // ── CEP-41 open-stream ────────────────────────────────────────
@@ -1677,6 +1949,7 @@ impl NostrClientTransport {
         gift_wrap_mode: GiftWrapMode,
         discovered_caps: &Arc<Mutex<PeerCapabilities>>,
         init_event: &Arc<Mutex<Option<Event>>>,
+        negotiation: &Arc<Mutex<ClientNegotiationState>>,
         server_supports_ephemeral: &Arc<AtomicBool>,
         seen_gift_wrap_ids: &Arc<Mutex<LruCache<EventId, ()>>>,
         oversized_receiver: &Arc<Mutex<OversizedTransferReceiver>>,
@@ -1816,7 +2089,7 @@ impl NostrClientTransport {
         }
 
         // CEP-35: learn server capabilities from discovery tags
-        Self::learn_server_discovery(discovered_caps, init_event, &source_event);
+        Self::learn_server_discovery(discovered_caps, init_event, negotiation, &source_event);
 
         // CEP-19: learn ephemeral support from server
         if Self::should_learn_ephemeral_support(
@@ -2361,6 +2634,7 @@ mod tests {
             server_initialize_event: Arc::new(Mutex::new(None)),
             server_supports_ephemeral: Arc::new(AtomicBool::new(false)),
             seen_gift_wrap_ids: Arc::new(Mutex::new(LruCache::new(NonZeroUsize::new(10).unwrap()))),
+            negotiation: Arc::new(Mutex::new(ClientNegotiationState::default())),
             oversized_receiver: Arc::new(Mutex::new(OversizedTransferReceiver::new())),
             accept_waiters: Arc::new(Mutex::new(HashMap::new())),
             original_progress_tokens: Arc::new(Mutex::new(LruCache::new(
@@ -2486,9 +2760,81 @@ mod tests {
     fn client_learn_server_discovery_learns_open_stream() {
         let caps = Mutex::new(PeerCapabilities::default());
         let init = Mutex::new(None);
+        let negotiation = Mutex::new(ClientNegotiationState::default());
         let event = make_event_with_tags(&[&["support_open_stream"]]);
-        NostrClientTransport::learn_server_discovery(&caps, &init, &event);
+        NostrClientTransport::learn_server_discovery(&caps, &init, &negotiation, &event);
         assert!(caps.lock().unwrap().supports_open_stream);
+    }
+
+    // ── CEP-8 client negotiation ─────────────────────────────────
+
+    /// Pins the "nothing configured" rule. This is a claim about the getter only; the
+    /// matching claim about the *wire* belongs to the integration test
+    /// `unconfigured_client_emits_the_same_tags_as_before`, which asserts a published
+    /// event's whole tag list.
+    #[test]
+    fn negotiation_tags_empty_when_nothing_configured() {
+        let t = make_transport_for_tags(EncryptionMode::Optional, GiftWrapMode::Optional);
+        let (tags, mode) = t.get_pending_negotiation_tags();
+        assert!(tags.is_empty(), "no PMIs and no mode means no tags");
+        assert_eq!(mode, None, "and nothing for the latch to record");
+    }
+
+    /// A requested `transparent` is emitted explicitly: a downgrade intent must stay
+    /// distinguishable from an absent tag.
+    #[test]
+    fn negotiation_tags_emit_transparent_explicitly() {
+        let t = make_transport_for_tags(EncryptionMode::Optional, GiftWrapMode::Optional);
+        t.set_payment_interaction(PaymentInteractionMode::Transparent);
+        let (tags, mode) = t.get_pending_negotiation_tags();
+        assert_eq!(
+            tags.iter().map(|t| t.clone().to_vec()).collect::<Vec<_>>(),
+            vec![vec![
+                tags::PAYMENT_INTERACTION.to_string(),
+                "transparent".to_string()
+            ]],
+        );
+        assert_eq!(mode, Some(PaymentInteractionMode::Transparent));
+    }
+
+    /// An unrecognized value leaves a previously recorded mode intact.
+    #[test]
+    fn learner_ignores_an_unknown_mode_value() {
+        let caps = Mutex::new(PeerCapabilities::default());
+        let init = Mutex::new(None);
+        let negotiation = Mutex::new(ClientNegotiationState {
+            requested: Some(PaymentInteractionMode::ExplicitGating),
+            effective: Some(PaymentInteractionMode::ExplicitGating),
+            ..Default::default()
+        });
+        let event = make_event_with_tags(&[&[tags::PAYMENT_INTERACTION, "bogus"]]);
+        NostrClientTransport::learn_server_discovery(&caps, &init, &negotiation, &event);
+        assert_eq!(
+            negotiation.lock().unwrap().effective,
+            Some(PaymentInteractionMode::ExplicitGating),
+            "an unparseable value must not clobber the recorded mode"
+        );
+    }
+
+    /// Two conflicting tags: the first wins, matching both SDKs' readers.
+    #[test]
+    fn learner_takes_the_first_tag_of_many() {
+        let caps = Mutex::new(PeerCapabilities::default());
+        let init = Mutex::new(None);
+        let negotiation = Mutex::new(ClientNegotiationState {
+            requested: Some(PaymentInteractionMode::ExplicitGating),
+            ..Default::default()
+        });
+        let event = make_event_with_tags(&[
+            &[tags::PAYMENT_INTERACTION, "transparent"],
+            &[tags::PAYMENT_INTERACTION, "explicit_gating"],
+        ]);
+        NostrClientTransport::learn_server_discovery(&caps, &init, &negotiation, &event);
+        assert_eq!(
+            negotiation.lock().unwrap().effective,
+            Some(PaymentInteractionMode::Transparent),
+            "the first payment_interaction tag wins"
+        );
     }
 
     #[test]
@@ -2699,9 +3045,10 @@ mod tests {
     fn client_learn_server_discovery_sets_baseline() {
         let caps = Mutex::new(PeerCapabilities::default());
         let init = Mutex::new(None);
+        let negotiation = Mutex::new(ClientNegotiationState::default());
         let event = make_event_with_tags(&[&["support_encryption"], &["name", "TestServer"]]);
 
-        NostrClientTransport::learn_server_discovery(&caps, &init, &event);
+        NostrClientTransport::learn_server_discovery(&caps, &init, &negotiation, &event);
 
         let c = caps.lock().unwrap();
         assert!(c.supports_encryption);
@@ -2716,13 +3063,14 @@ mod tests {
     fn client_learn_server_discovery_or_assigns() {
         let caps = Mutex::new(PeerCapabilities::default());
         let init = Mutex::new(None);
+        let negotiation = Mutex::new(ClientNegotiationState::default());
 
         let event1 = make_event_with_tags(&[&["support_encryption"]]);
-        NostrClientTransport::learn_server_discovery(&caps, &init, &event1);
+        NostrClientTransport::learn_server_discovery(&caps, &init, &negotiation, &event1);
 
         // Second event with different caps does NOT downgrade
         let event2 = make_event_with_tags(&[&["support_encryption_ephemeral"]]);
-        NostrClientTransport::learn_server_discovery(&caps, &init, &event2);
+        NostrClientTransport::learn_server_discovery(&caps, &init, &negotiation, &event2);
 
         let c = caps.lock().unwrap();
         assert!(c.supports_encryption, "must not downgrade");
@@ -2733,14 +3081,15 @@ mod tests {
     fn client_baseline_not_replaced_on_later_events() {
         let caps = Mutex::new(PeerCapabilities::default());
         let init = Mutex::new(None);
+        let negotiation = Mutex::new(ClientNegotiationState::default());
 
         let event1 = make_event_with_tags(&[&["support_encryption"], &["name", "First"]]);
-        NostrClientTransport::learn_server_discovery(&caps, &init, &event1);
+        NostrClientTransport::learn_server_discovery(&caps, &init, &negotiation, &event1);
         let first_id = event1.id;
 
         let event2 =
             make_event_with_tags(&[&["support_encryption_ephemeral"], &["name", "Second"]]);
-        NostrClientTransport::learn_server_discovery(&caps, &init, &event2);
+        NostrClientTransport::learn_server_discovery(&caps, &init, &negotiation, &event2);
 
         let stored = init.lock().unwrap();
         assert_eq!(
@@ -2754,10 +3103,11 @@ mod tests {
     fn client_baseline_upgraded_to_initialize_result() {
         let caps = Mutex::new(PeerCapabilities::default());
         let init = Mutex::new(None);
+        let negotiation = Mutex::new(ClientNegotiationState::default());
 
         // First discovery tags arrive on a non-initialize event (e.g. a notification).
         let baseline = make_event_with_tags(&[&["support_encryption"]]);
-        NostrClientTransport::learn_server_discovery(&caps, &init, &baseline);
+        NostrClientTransport::learn_server_discovery(&caps, &init, &negotiation, &baseline);
         assert_eq!(init.lock().unwrap().as_ref().unwrap().id, baseline.id);
 
         // A later event carries a full InitializeResult → baseline is upgraded.
@@ -2765,7 +3115,7 @@ mod tests {
             &initialize_result_content(),
             &[&["support_encryption"]],
         );
-        NostrClientTransport::learn_server_discovery(&caps, &init, &init_event);
+        NostrClientTransport::learn_server_discovery(&caps, &init, &negotiation, &init_event);
         assert_eq!(
             init.lock().unwrap().as_ref().unwrap().id,
             init_event.id,
@@ -2774,7 +3124,7 @@ mod tests {
 
         // A still-later non-initialize event must NOT downgrade the baseline.
         let later = make_event_with_tags(&[&["support_encryption_ephemeral"]]);
-        NostrClientTransport::learn_server_discovery(&caps, &init, &later);
+        NostrClientTransport::learn_server_discovery(&caps, &init, &negotiation, &later);
         assert_eq!(
             init.lock().unwrap().as_ref().unwrap().id,
             init_event.id,

@@ -79,14 +79,29 @@ pub fn parse_pmi_tag(tag: &Tag) -> Option<String> {
 }
 
 /// Parse a `payment_interaction` tag into a mode; unknown values yield `None`.
+///
+/// Note for readers of the inbound paths: neither the client nor the server learner calls
+/// this. Both select the tag first with `extract_payment_interaction` (which takes the
+/// **first** `payment_interaction` tag) and only then interpret its value. Scanning a tag
+/// list with this function instead, via `find_map`, would silently skip a first tag whose
+/// value is unrecognized and pick up a later one, breaking "the first tag wins".
 pub fn parse_payment_interaction_tag(tag: &Tag) -> Option<PaymentInteractionMode> {
     let parts = tag.clone().to_vec();
     if parts.first().map(String::as_str) != Some(tags::PAYMENT_INTERACTION) {
         return None;
     }
-    match parts.get(1).map(String::as_str) {
-        Some("transparent") => Some(PaymentInteractionMode::Transparent),
-        Some("explicit_gating") => Some(PaymentInteractionMode::ExplicitGating),
+    parse_payment_interaction_value(parts.get(1)?)
+}
+
+/// Parse a `payment_interaction` tag *value* into a mode; unknown values yield `None`.
+///
+/// The value half of [`parse_payment_interaction_tag`], for callers that already
+/// extracted it (`extract_payment_interaction` returns the raw first value, which is
+/// what keeps "the first tag wins" separable from "an unrecognized value is ignored").
+pub(crate) fn parse_payment_interaction_value(value: &str) -> Option<PaymentInteractionMode> {
+    match value {
+        "transparent" => Some(PaymentInteractionMode::Transparent),
+        "explicit_gating" => Some(PaymentInteractionMode::ExplicitGating),
         _ => None,
     }
 }
