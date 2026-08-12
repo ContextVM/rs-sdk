@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use futures::future::BoxFuture;
 use lru::LruCache;
 use nostr_sdk::prelude::*;
 use tokio_util::sync::CancellationToken;
@@ -252,6 +253,24 @@ struct ResponseTagSources {
     /// CEP-8 `cap` pricing tags, appended to capability-list results.
     pricing: Vec<Tag>,
 }
+
+/// An injected targeted-response publish, for callers that have no `&self`.
+///
+/// The arguments are the recipient's public key in hex, the hex id of the request event to
+/// correlate against, and the response to publish. Both strings are owned because the returned
+/// future is `'static` and so cannot borrow the caller's buffers.
+///
+/// Cheaply clonable (`Arc`), so the transport can hand one to a middleware and keep handing out
+/// more. Obtained from
+/// [`targeted_response_sender`](NostrServerTransport::targeted_response_sender), which is also
+/// where the construction-order rule is documented.
+///
+/// It looks the request's gift-wrap kind up itself, so it works for any caller. A middleware
+/// already holds that value on its inbound context, so for that caller the lookup is redundant
+/// and nothing depends on it.
+pub type TargetedResponseSender = Arc<
+    dyn Fn(String, String, JsonRpcMessage) -> BoxFuture<'static, crate::Result<()>> + Send + Sync,
+>;
 
 /// CEP-8: the outcome of one payment-interaction negotiation.
 #[derive(Debug, PartialEq)]
@@ -1043,39 +1062,18 @@ impl NostrServerTransport {
         })?;
 
         let base_tags = BaseTransport::create_response_tags(&client_pubkey, &event_id_parsed);
-        let mut tags = BaseTransport::compose_outbound_tags(&base_tags, &discovery_tags, &[]);
-
-        // CEP-8: disclose the effective mode. The server's availability advertisement can already
-        // be riding this same first response with the same value, in which case it satisfies the
-        // disclosure on its own and a second tag would be redundant.
-        if let Some(effective) = disclose_effective {
-            // The comparison is derived from the builder, not a second hand-written mapping, so the
-            // two can never drift apart. Name and value only, matching how both SDKs read the tag.
-            let disclosure = crate::payments::tags::payment_interaction_tag(effective);
-            let expected = disclosure.clone().to_vec();
-            let already_present = tags.iter().any(|tag| {
-                let parts = tag.clone().to_vec();
-                parts.first() == expected.first() && parts.get(1) == expected.get(1)
-            });
-            if !already_present {
-                tags.push(disclosure);
-            }
-        }
-
-        // CEP-8: attach the pricing tags to capability-list responses so clients can read prices
-        // without waiting for a payment_required error.
-        //
-        // Both this and the disclosure above ride the single composed tag list, so they reach the
-        // start frame of an oversized response too. That is deliberate: the spec requires disclosure
-        // on the first response, the client reads the tag off any inbound event, and the appends
-        // happen before the published-size measurement below, so an added tag can never push a
-        // response over the fragmentation threshold unmeasured. Continuation frames carry only the
-        // base routing tags, as before.
-        if let JsonRpcMessage::Response(ref r) = response {
-            if Self::is_capability_list_result(&r.result) {
-                tags.extend(self.announcement_manager.get_pricing_tags().iter().cloned());
-            }
-        }
+        // The whole composed list rides the CEP-22 start frame of an oversized response, and this
+        // call sits above the published-size measurement below, so no tag the composer adds can
+        // push a response over the fragmentation threshold unmeasured. The binding is deliberately
+        // immutable: appending here after the measurement, or moving this call below it, is a
+        // compile error rather than a silent ordering regression.
+        let tags = Self::compose_response_tags(
+            &base_tags,
+            &discovery_tags,
+            disclose_effective,
+            self.announcement_manager.get_pricing_tags(),
+            &response,
+        );
 
         let gift_wrap_kind = Self::select_outbound_gift_wrap_kind(
             self.config.gift_wrap_mode,
@@ -1144,6 +1142,8 @@ impl NostrServerTransport {
         // Both paths converge on the cleanup tail below — neither early-returns on
         // success.
         let send_result: Result<()> = if fragment {
+            // CEP-22: the composed list rides the start frame; the continuation frames get
+            // `base_tags`, so they carry only the routing tags.
             self.send_oversized_response(
                 &serialized,
                 progress_token.as_deref().unwrap_or_default(),
@@ -1219,6 +1219,120 @@ impl NostrServerTransport {
             "Sent server response and cleaned correlation state"
         );
         Ok(())
+    }
+
+    /// Publish a response to a specific client and request event **without consuming the
+    /// request's correlation route**, so the request is not ended and a later
+    /// [`send_response`](Self::send_response) for the same event still succeeds. That is what
+    /// makes it usable by a transport-level gate that answers a request it does not own.
+    ///
+    /// Unlike [`send_response`](Self::send_response) it does not restore the original request
+    /// id: the caller supplies the response with its id already set, which for a caller running
+    /// ahead of the rmcp worker is the id the client sent.
+    ///
+    /// It composes the same tags every other server response carries, and therefore consumes
+    /// the session's one-shot discovery-replay and effective-mode-disclosure latches like any
+    /// other first response. Those latches are **not restored if the publish fails**, so a
+    /// caller that retries gets a response carrying neither the discovery replay nor the
+    /// disclosure. It also mirrors the request's gift-wrap kind (CEP-19).
+    ///
+    /// When the client has no session (an eviction race, say) this warns and returns `Ok(())`
+    /// having published nothing.
+    ///
+    /// It does **not** fragment an over-threshold response (CEP-22). An `Err` is a malformed
+    /// recipient or event id, a publish failure, or a response too large to send as one event; it
+    /// is never a partial or abandoned fragmentation attempt, because this path never fragments.
+    /// A malformed id is reported before the session is touched, so it costs neither latch.
+    pub async fn send_targeted_response(
+        &self,
+        client_pubkey_hex: &str,
+        event_id: &str,
+        response: JsonRpcMessage,
+    ) -> Result<()> {
+        let mirrored_wrap_kind = self
+            .request_wrap_kinds
+            .read()
+            .await
+            .get(event_id)
+            .copied()
+            .flatten();
+        Self::publish_targeted_response(
+            &self.base,
+            self.config.gift_wrap_mode,
+            &self.sessions,
+            &ResponseTagSources {
+                common: self.announcement_manager.get_common_tags(),
+                pricing: self.announcement_manager.get_pricing_tags().to_vec(),
+            },
+            client_pubkey_hex,
+            event_id,
+            mirrored_wrap_kind,
+            response,
+        )
+        .await
+    }
+
+    /// The same publish as [`send_targeted_response`](Self::send_targeted_response), as an
+    /// injectable closure for callers that have no `&self`, such as a middleware running on a
+    /// detached task. Both forms delegate to one publish, so the tag-composition policy, the
+    /// latch handling and the wrap-kind mirroring cannot diverge between them.
+    ///
+    /// Where the announcement tag sets come from does differ. The method reads them live on every
+    /// call; this closure captures them once, here. A caller that sets those tags before building
+    /// the sender gets identical output from both, which is the supported order; a caller that
+    /// sets them afterwards gets tags from the method that the closure will never emit.
+    ///
+    /// **Call this after the announcement extra tags and pricing tags are set.** The returned
+    /// sender captures those two tag sets at the moment it is built, and it is built earlier
+    /// than [`start`](Self::start), so the weaker "set them before `start()`" rule the tag
+    /// setters carry is not enough here: a caller that obeys only that rule still ships an empty
+    /// discovery replay and empty pricing on every targeted response, which costs a stateless
+    /// client the server's identity for the whole session and defeats the disclosure dedup.
+    /// Nothing enforces the order at compile time, because the setters take `&mut self` and this
+    /// closure holds owned clones.
+    pub fn targeted_response_sender(&self) -> TargetedResponseSender {
+        let relay_pool = Arc::clone(&self.base.relay_pool);
+        let encryption_mode = self.base.encryption_mode;
+        let gift_wrap_mode = self.config.gift_wrap_mode;
+        let sessions = self.sessions.clone();
+        let request_wrap_kinds = Arc::clone(&self.request_wrap_kinds);
+        let tag_sources = ResponseTagSources {
+            common: self.announcement_manager.get_common_tags(),
+            pricing: self.announcement_manager.get_pricing_tags().to_vec(),
+        };
+
+        Arc::new(move |client_pubkey_hex, event_id, response| {
+            let relay_pool = Arc::clone(&relay_pool);
+            let sessions = sessions.clone();
+            let request_wrap_kinds = Arc::clone(&request_wrap_kinds);
+            let tag_sources = tag_sources.clone();
+            Box::pin(async move {
+                // The same local `BaseTransport` construction the other `&self`-less publishes
+                // in this transport use.
+                let base = BaseTransport {
+                    relay_pool,
+                    encryption_mode,
+                    is_connected: true,
+                };
+                let mirrored_wrap_kind = request_wrap_kinds
+                    .read()
+                    .await
+                    .get(&event_id)
+                    .copied()
+                    .flatten();
+                Self::publish_targeted_response(
+                    &base,
+                    gift_wrap_mode,
+                    &sessions,
+                    &tag_sources,
+                    &client_pubkey_hex,
+                    &event_id,
+                    mirrored_wrap_kind,
+                    response,
+                )
+                .await
+            })
+        })
     }
 
     /// CEP-41: clone the active writer for `event_id` so the rmcp worker can inject
@@ -1325,7 +1439,7 @@ impl NostrServerTransport {
         })?;
         // Correlate via the `e` tag exactly like a normal response so the client's
         // correlation gate accepts it.
-        let mut tags =
+        let base_tags =
             BaseTransport::create_response_tags(&snapshot.client_pubkey, &event_id_parsed);
 
         // A deferred response is still a server-to-client response, so it carries the same
@@ -1347,30 +1461,21 @@ impl NostrServerTransport {
                 None => (false, None),
             }
         };
-        if send_discovery {
-            tags.extend(tag_sources.common.iter().cloned());
-        }
-        // The discovery set can carry the server's availability advertisement, which may already
-        // name this mode, so dedup on the value exactly as the normal response path does.
-        if let Some(effective) = disclose_effective {
-            let disclosure = crate::payments::tags::payment_interaction_tag(effective);
-            let expected = disclosure.clone().to_vec();
-            let already_present = tags.iter().any(|tag| {
-                let parts = tag.clone().to_vec();
-                parts.first() == expected.first() && parts.get(1) == expected.get(1)
-            });
-            if !already_present {
-                tags.push(disclosure);
-            }
-        }
-
-        // CEP-8: price a capability-list result here too. A streaming tool is free to return one,
-        // and the normal response path tags it, so the deferred path must not differ.
-        if let JsonRpcMessage::Response(ref r) = response {
-            if Self::is_capability_list_result(&r.result) {
-                tags.extend(tag_sources.pricing.iter().cloned());
-            }
-        }
+        // The discovery set can carry the server's availability advertisement, and a streaming tool
+        // is free to return a capability list, so this path composes through the same policy the
+        // normal response path does rather than restating it.
+        let discovery: &[Tag] = if send_discovery {
+            &tag_sources.common
+        } else {
+            &[]
+        };
+        let tags = Self::compose_response_tags(
+            &base_tags,
+            discovery,
+            disclose_effective,
+            &tag_sources.pricing,
+            &response,
+        );
 
         let gift_wrap_kind = Self::select_outbound_gift_wrap_kind(
             gift_wrap_mode,
@@ -1383,6 +1488,103 @@ impl NostrServerTransport {
             CTXVM_MESSAGES_KIND,
             tags,
             Some(snapshot.is_encrypted),
+            gift_wrap_kind,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// The targeted-response publish itself, shared by the `&self` method and the injected
+    /// closure so the two forms cannot drift apart. Static for the same reason the deferred
+    /// publish is: a detached caller has no `self` in scope.
+    ///
+    /// The caller supplies the recipient and the request event to correlate against, so this
+    /// never touches the correlation route.
+    // Eight parameters is what a `&self`-less publish needs: the two transport handles, the
+    // session store, the captured tag sources, the two routing values, the mirrored wrap kind,
+    // and the payload.
+    #[allow(clippy::too_many_arguments)]
+    async fn publish_targeted_response(
+        base: &BaseTransport,
+        gift_wrap_mode: GiftWrapMode,
+        sessions: &SessionStore,
+        tag_sources: &ResponseTagSources,
+        client_pubkey_hex: &str,
+        event_id: &str,
+        mirrored_wrap_kind: Option<u16>,
+        response: JsonRpcMessage,
+    ) -> Result<()> {
+        // Both routing values are validated before the session is touched. Unlike the normal
+        // response path, which reads them back out of its own correlation store, these arrive
+        // from an external caller and are therefore reachable bad input; parsing first keeps a
+        // malformed argument from consuming the session's one-shot latches for a response that
+        // is never published.
+        let client_pubkey = PublicKey::from_hex(client_pubkey_hex).map_err(|error| {
+            tracing::error!(
+                target: LOG_TARGET,
+                error = %error,
+                client_pubkey = %client_pubkey_hex,
+                "Invalid client pubkey for targeted response"
+            );
+            Error::Other(error.to_string())
+        })?;
+        let event_id_parsed = EventId::from_hex(event_id).map_err(|error| {
+            tracing::error!(
+                target: LOG_TARGET,
+                error = %error,
+                event_id = %event_id,
+                "Invalid event id for targeted response"
+            );
+            Error::Other(error.to_string())
+        })?;
+
+        // Answering a client that has since been evicted costs one read and publishes nothing.
+        // Both one-shot latches are read and flipped under a single guard, and the tags are
+        // composed after it drops.
+        let resolved = {
+            let mut sessions_w = sessions.write().await;
+            sessions_w.get_mut(client_pubkey_hex).map(|session| {
+                let send_discovery = !session.has_sent_common_tags;
+                session.has_sent_common_tags = true;
+                (
+                    session.is_encrypted,
+                    send_discovery,
+                    Self::take_payment_interaction_disclosure(session),
+                )
+            })
+        };
+        let Some((is_encrypted, send_discovery, disclose_effective)) = resolved else {
+            tracing::warn!(
+                target: LOG_TARGET,
+                client_pubkey = %client_pubkey_hex,
+                event_id = %event_id,
+                "No session for targeted response; dropping it"
+            );
+            return Ok(());
+        };
+
+        let base_tags = BaseTransport::create_response_tags(&client_pubkey, &event_id_parsed);
+        let discovery: &[Tag] = if send_discovery {
+            &tag_sources.common
+        } else {
+            &[]
+        };
+        let tags = Self::compose_response_tags(
+            &base_tags,
+            discovery,
+            disclose_effective,
+            &tag_sources.pricing,
+            &response,
+        );
+
+        let gift_wrap_kind =
+            Self::select_outbound_gift_wrap_kind(gift_wrap_mode, is_encrypted, mirrored_wrap_kind);
+        base.send_mcp_message(
+            &response,
+            &client_pubkey,
+            CTXVM_MESSAGES_KIND,
+            tags,
+            Some(is_encrypted),
             gift_wrap_kind,
         )
         .await
@@ -1757,6 +1959,90 @@ impl NostrServerTransport {
         }
         session.has_sent_common_tags = true;
         self.announcement_manager.get_common_tags()
+    }
+
+    /// Compose an outbound response's tags in the canonical order: routing, then the CEP-35
+    /// discovery replay, then the CEP-8 effective-mode disclosure, then CEP-8 `cap` pricing.
+    ///
+    /// Every server response path composes its tags here, so the four steps and their order are
+    /// written down once and every path inherits them.
+    ///
+    /// Pure and synchronous: it takes values the caller has already resolved and holds
+    /// no lock and performs no I/O. Each caller reads its session's one-shot discovery and
+    /// disclosure latches under its own session guard and drops that guard before calling this, so
+    /// no lock is ever held across the publish that follows.
+    ///
+    /// `disclose` is the effective mode to advertise, or `None` when the obligation is already
+    /// discharged. A disclosure is skipped when the discovery set already carries the server's
+    /// availability advertisement for the same mode, which satisfies it on its own.
+    ///
+    /// When the advertisement names a *different* mode the dedup does not fire, so the event
+    /// carries two `payment_interaction` tags and the **advertisement wins**, because it is
+    /// ordered first and both SDKs' readers take the first tag. That combination is a server
+    /// misconfiguration rather than a protocol state, so it is logged here rather than repaired:
+    /// the availability advertisement must either name the mode the session negotiated or be
+    /// absent.
+    ///
+    /// The `cap` gate is shape-based rather than method-based, because the request method is gone
+    /// by response time: pricing rides a result that looks like a capability list, and therefore
+    /// never rides an error response.
+    fn compose_response_tags(
+        base_tags: &[Tag],
+        discovery: &[Tag],
+        disclose: Option<PaymentInteractionMode>,
+        pricing: &[Tag],
+        response: &JsonRpcMessage,
+    ) -> Vec<Tag> {
+        let mut tags = BaseTransport::compose_outbound_tags(base_tags, discovery, &[]);
+
+        // CEP-8: disclose the effective mode. The server's availability advertisement can already
+        // be riding this same first response with the same value, in which case it satisfies the
+        // disclosure on its own and a second tag would be redundant.
+        if let Some(effective) = disclose {
+            // The comparison is derived from the builder, not a second hand-written mapping, so the
+            // two can never drift apart. Name and value only, matching how both SDKs read the tag.
+            let disclosure = crate::payments::tags::payment_interaction_tag(effective);
+            let expected = disclosure.clone().to_vec();
+            let already_present = tags.iter().any(|tag| {
+                let parts = tag.clone().to_vec();
+                parts.first() == expected.first() && parts.get(1) == expected.get(1)
+            });
+            if !already_present {
+                // A same-name tag that survived the dedup carries a different value, so the
+                // advertisement and the disclosure disagree and the reader takes the
+                // advertisement. Warn rather than rewrite: the tag list stays exactly what every
+                // other response path produces, and the fix belongs to whatever set the
+                // advertisement.
+                if let Some(conflicting) = tags.iter().find_map(|tag| {
+                    let parts = tag.clone().to_vec();
+                    match (parts.first(), parts.get(1)) {
+                        (Some(name), Some(value)) if Some(name) == expected.first() => {
+                            Some(value.clone())
+                        }
+                        _ => None,
+                    }
+                }) {
+                    tracing::warn!(
+                        target: LOG_TARGET,
+                        advertised = %conflicting,
+                        effective = ?effective,
+                        "Server availability advertisement disagrees with the session's effective \
+                         payment interaction mode; the client will read the advertised value"
+                    );
+                }
+                tags.push(disclosure);
+            }
+        }
+
+        // CEP-8: attach the pricing tags to capability-list responses so clients can read prices
+        // without waiting for a payment_required error.
+        if let JsonRpcMessage::Response(ref r) = response {
+            if Self::is_capability_list_result(&r.result) {
+                tags.extend(pricing.iter().cloned());
+            }
+        }
+
+        tags
     }
 
     // ── CEP-8 payment-interaction negotiation ─────────────────────
@@ -5551,6 +5837,877 @@ mod tests {
         }
 
         transport.close().await.expect("close the server");
+    }
+
+    // ── Targeted response sender ─────────────────────────────────────────────
+
+    /// A server transport wired to `pool`, with the CEP-8 knobs the targeted-send tests need.
+    async fn targeted_fixture(
+        pool: &Arc<MockRelayPool>,
+        encryption_mode: EncryptionMode,
+        gift_wrap_mode: GiftWrapMode,
+        advertise_mode: bool,
+        pricing: bool,
+    ) -> NostrServerTransport {
+        let mut transport = NostrServerTransport::with_relay_pool(
+            NostrServerTransportConfig::default()
+                .with_encryption_mode(encryption_mode)
+                .with_gift_wrap_mode(gift_wrap_mode)
+                .with_server_info(ServerInfo::default().with_name("Targeted-Server")),
+            Arc::clone(pool) as Arc<dyn RelayPoolTrait>,
+        )
+        .await
+        .expect("server transport");
+        if advertise_mode {
+            transport.set_announcement_extra_tags(vec![
+                crate::payments::tags::payment_interaction_tag(
+                    PaymentInteractionMode::ExplicitGating,
+                ),
+            ]);
+        }
+        if pricing {
+            transport.set_announcement_pricing_tags(
+                crate::payments::tags::cap_tags_from_priced_capabilities(&[
+                    crate::payments::types::PricedCapability {
+                        method: "tools/call".to_string(),
+                        name: Some("get_weather".to_string()),
+                        amount: 100,
+                        max_amount: None,
+                        currency_unit: "sats".to_string(),
+                        description: None,
+                    },
+                ]),
+            );
+        }
+        transport
+    }
+
+    /// Insert a session that negotiated `explicit_gating` and still owes the disclosure.
+    async fn seed_gated_session(
+        transport: &NostrServerTransport,
+        client_pubkey_hex: &str,
+        is_encrypted: bool,
+    ) {
+        let mut session = ClientSession::new(is_encrypted);
+        session.requested_payment_interaction = Some(PaymentInteractionMode::ExplicitGating);
+        session.effective_payment_interaction = Some(PaymentInteractionMode::ExplicitGating);
+        let mut sessions_w = transport.sessions.write().await;
+        sessions_w.put(client_pubkey_hex.to_string(), session);
+    }
+
+    /// The shape of a payment-required error a gate answers with.
+    fn gating_error(id: serde_json::Value) -> JsonRpcMessage {
+        JsonRpcMessage::ErrorResponse(JsonRpcErrorResponse {
+            jsonrpc: "2.0".to_string(),
+            id,
+            error: JsonRpcError {
+                code: -32042,
+                message: "Payment required".to_string(),
+                data: None,
+            },
+        })
+    }
+
+    fn server_messages(events: &[Event], server_pubkey: PublicKey) -> Vec<&Event> {
+        events
+            .iter()
+            .filter(|e| e.kind == Kind::Custom(CTXVM_MESSAGES_KIND) && e.pubkey == server_pubkey)
+            .collect()
+    }
+
+    fn tag_vecs(event: &Event) -> Vec<Vec<String>> {
+        event.tags.iter().map(|t| t.clone().to_vec()).collect()
+    }
+
+    #[tokio::test]
+    async fn targeted_response_correlates_to_the_request_event() {
+        // The two routing arguments are both 64-character hex and either parses as the other's
+        // type, so a transposed call site looks valid and then silently no-ops on the session
+        // miss. Asserting both `p` and `e` is what catches that, because nothing is published.
+        let pool = Arc::new(MockRelayPool::new());
+        let transport = targeted_fixture(
+            &pool,
+            EncryptionMode::Disabled,
+            GiftWrapMode::Optional,
+            false,
+            false,
+        )
+        .await;
+        let server_pubkey = pool.mock_public_key();
+
+        let client_pubkey = Keys::generate().public_key();
+        let client_pubkey_hex = client_pubkey.to_hex();
+        seed_gated_session(&transport, &client_pubkey_hex, false).await;
+
+        let event_id = EventId::from_slice(&[7u8; 32]).expect("event id");
+        transport
+            .send_targeted_response(
+                &client_pubkey_hex,
+                &event_id.to_hex(),
+                gating_error(serde_json::json!("client-original-1")),
+            )
+            .await
+            .expect("targeted send");
+
+        let published = pool.stored_events().await;
+        let messages = server_messages(&published, server_pubkey);
+        assert_eq!(messages.len(), 1, "exactly one targeted response");
+        let tags = tag_vecs(messages[0]);
+        assert_eq!(
+            tags.first(),
+            Some(&vec!["p".to_string(), client_pubkey_hex.clone()]),
+            "the response must be addressed to the client"
+        );
+        assert_eq!(
+            tags.get(1),
+            Some(&vec!["e".to_string(), event_id.to_hex()]),
+            "the response must correlate to the request event"
+        );
+
+        // The id is the caller's, not the Nostr event id: this sender runs ahead of the worker
+        // that rewrites ids, so the caller already holds the client's original.
+        let payload: serde_json::Value =
+            serde_json::from_str(&messages[0].content).expect("response is JSON");
+        assert_eq!(payload["id"], serde_json::json!("client-original-1"));
+        assert_eq!(payload["error"]["code"], serde_json::json!(-32042));
+    }
+
+    #[tokio::test]
+    async fn targeted_response_leaves_the_route_intact() {
+        // Answering a request must not end it. If the route were consumed, the eventual real
+        // response would fail correlation and the client would wait forever.
+        let pool = Arc::new(MockRelayPool::new());
+        let transport = targeted_fixture(
+            &pool,
+            EncryptionMode::Disabled,
+            GiftWrapMode::Optional,
+            false,
+            false,
+        )
+        .await;
+
+        let client_pubkey = Keys::generate().public_key();
+        let client_pubkey_hex = client_pubkey.to_hex();
+        seed_gated_session(&transport, &client_pubkey_hex, false).await;
+
+        let event_id = EventId::from_slice(&[9u8; 32]).expect("event id");
+        let event_id_hex = event_id.to_hex();
+        transport
+            .event_routes
+            .register(
+                event_id_hex.clone(),
+                client_pubkey_hex.clone(),
+                serde_json::json!("req-1"),
+                None,
+            )
+            .await;
+
+        transport
+            .send_targeted_response(
+                &client_pubkey_hex,
+                &event_id_hex,
+                gating_error(serde_json::json!("req-1")),
+            )
+            .await
+            .expect("targeted send");
+
+        assert!(
+            transport.event_routes.has_event_route(&event_id_hex).await,
+            "the targeted send must leave the correlation route in place"
+        );
+        // And the consequence of leaving it: the real response still goes out.
+        transport
+            .send_response(
+                &event_id_hex,
+                JsonRpcMessage::Response(JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
+                    id: serde_json::json!("req-1"),
+                    result: serde_json::json!({ "content": [] }),
+                }),
+            )
+            .await
+            .expect("the request must still be answerable normally");
+    }
+
+    #[tokio::test]
+    async fn targeted_response_without_a_session_is_a_noop() {
+        let pool = Arc::new(MockRelayPool::new());
+        let transport = targeted_fixture(
+            &pool,
+            EncryptionMode::Disabled,
+            GiftWrapMode::Optional,
+            false,
+            false,
+        )
+        .await;
+        let server_pubkey = pool.mock_public_key();
+
+        let client_pubkey_hex = Keys::generate().public_key().to_hex();
+        transport
+            .send_targeted_response(
+                &client_pubkey_hex,
+                &EventId::all_zeros().to_hex(),
+                gating_error(serde_json::json!("orphan-1")),
+            )
+            .await
+            .expect("an evicted session is an ordinary race, not a transport failure");
+
+        let published = pool.stored_events().await;
+        assert!(
+            server_messages(&published, server_pubkey).is_empty(),
+            "nothing may be published for a client with no session"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_malformed_routing_argument_costs_neither_latch() {
+        // Both routing values arrive from an external caller, so a malformed one is reachable
+        // input rather than an internal invariant. Validating before the session is touched is
+        // what keeps it from consuming the one-shot latches for a response that is never
+        // published; without that ordering the session silently loses its discovery replay and
+        // its disclosure, and the next response carries neither.
+        let pool = Arc::new(MockRelayPool::new());
+        let transport = targeted_fixture(
+            &pool,
+            EncryptionMode::Disabled,
+            GiftWrapMode::Optional,
+            false,
+            false,
+        )
+        .await;
+        let server_pubkey = pool.mock_public_key();
+
+        let client_pubkey_hex = Keys::generate().public_key().to_hex();
+        seed_gated_session(&transport, &client_pubkey_hex, false).await;
+        let good_event_id = EventId::from_slice(&[13u8; 32]).expect("event id").to_hex();
+
+        // The pubkey is parsed first, so each argument gets its own failing call.
+        transport
+            .send_targeted_response(
+                "not-a-pubkey",
+                &good_event_id,
+                gating_error(serde_json::json!("bad-pubkey-1")),
+            )
+            .await
+            .expect_err("a malformed recipient must be an error, not a silent no-op");
+        transport
+            .send_targeted_response(
+                &client_pubkey_hex,
+                "not-an-event-id",
+                gating_error(serde_json::json!("bad-event-id-1")),
+            )
+            .await
+            .expect_err("a malformed event id must be an error, not a silent no-op");
+
+        assert!(
+            server_messages(&pool.stored_events().await, server_pubkey).is_empty(),
+            "a malformed argument must publish nothing"
+        );
+
+        // Assert the consequence instead of the latch fields: the next well-formed send is
+        // still a first response, so it carries both the discovery replay and the disclosure.
+        transport
+            .send_targeted_response(
+                &client_pubkey_hex,
+                &good_event_id,
+                gating_error(serde_json::json!("good-1")),
+            )
+            .await
+            .expect("targeted send");
+
+        let published = pool.stored_events().await;
+        let messages = server_messages(&published, server_pubkey);
+        assert_eq!(messages.len(), 1);
+        let names: Vec<String> = tag_vecs(messages[0])
+            .into_iter()
+            .filter_map(|t| t.first().cloned())
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "name"),
+            "the failed calls must not have burned the discovery-replay latch: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == tags::PAYMENT_INTERACTION),
+            "the failed calls must not have burned the disclosure latch: {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn targeted_response_discloses_at_most_once() {
+        let pool = Arc::new(MockRelayPool::new());
+        let transport = targeted_fixture(
+            &pool,
+            EncryptionMode::Disabled,
+            GiftWrapMode::Optional,
+            false,
+            false,
+        )
+        .await;
+        let server_pubkey = pool.mock_public_key();
+
+        let client_pubkey_hex = Keys::generate().public_key().to_hex();
+        seed_gated_session(&transport, &client_pubkey_hex, false).await;
+
+        for (n, id) in ["once-1", "once-2"].iter().enumerate() {
+            transport
+                .send_targeted_response(
+                    &client_pubkey_hex,
+                    &EventId::from_slice(&[n as u8 + 1; 32])
+                        .expect("event id")
+                        .to_hex(),
+                    gating_error(serde_json::json!(id)),
+                )
+                .await
+                .expect("targeted send");
+        }
+
+        let published = pool.stored_events().await;
+        let messages = server_messages(&published, server_pubkey);
+        assert_eq!(messages.len(), 2);
+        let disclosed = |e: &Event| {
+            tag_vecs(e)
+                .into_iter()
+                .filter(|t| t.first().map(String::as_str) == Some(tags::PAYMENT_INTERACTION))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            disclosed(messages[0]),
+            vec![vec![
+                tags::PAYMENT_INTERACTION.to_string(),
+                "explicit_gating".to_string()
+            ]],
+            "the first targeted response discloses the effective mode"
+        );
+        assert!(
+            disclosed(messages[1]).is_empty(),
+            "the disclosure is a one-shot per negotiated mode"
+        );
+
+        let snapshot = transport
+            .sessions
+            .get_session(&client_pubkey_hex)
+            .await
+            .expect("session");
+        assert!(snapshot.has_disclosed_payment_interaction);
+    }
+
+    #[tokio::test]
+    async fn targeted_response_mirrors_the_inbound_gift_wrap_kind() {
+        // Without mirroring, an ephemeral request would be answered with a relay-stored wrap,
+        // because the optional mode's fallback is the persistent kind.
+        let pool = Arc::new(MockRelayPool::new());
+        let transport = targeted_fixture(
+            &pool,
+            EncryptionMode::Optional,
+            GiftWrapMode::Optional,
+            false,
+            false,
+        )
+        .await;
+
+        let client_keys = Keys::generate();
+        let client_pubkey_hex = client_keys.public_key().to_hex();
+        seed_gated_session(&transport, &client_pubkey_hex, true).await;
+
+        let event_id_hex = EventId::from_slice(&[3u8; 32]).expect("event id").to_hex();
+        transport
+            .request_wrap_kinds
+            .write()
+            .await
+            .insert(event_id_hex.clone(), Some(EPHEMERAL_GIFT_WRAP_KIND));
+
+        transport
+            .send_targeted_response(
+                &client_pubkey_hex,
+                &event_id_hex,
+                gating_error(serde_json::json!("wrapped-1")),
+            )
+            .await
+            .expect("targeted send");
+
+        let published = pool.stored_events().await;
+        let wrap = published
+            .iter()
+            .find(|e| {
+                e.kind == Kind::Custom(GIFT_WRAP_KIND)
+                    || e.kind == Kind::Custom(EPHEMERAL_GIFT_WRAP_KIND)
+            })
+            .expect("the response must be gift-wrapped");
+        assert_eq!(
+            wrap.kind,
+            Kind::Custom(EPHEMERAL_GIFT_WRAP_KIND),
+            "the targeted response must mirror the request's ephemeral wrap kind"
+        );
+    }
+
+    #[tokio::test]
+    async fn targeted_response_without_a_recorded_wrap_kind_falls_back() {
+        // The map is populated before dispatch in production, so this drives the branch the
+        // mirroring test cannot: no recorded kind, and the mode default applies.
+        let pool = Arc::new(MockRelayPool::new());
+        let transport = targeted_fixture(
+            &pool,
+            EncryptionMode::Optional,
+            GiftWrapMode::Optional,
+            false,
+            false,
+        )
+        .await;
+
+        let client_pubkey_hex = Keys::generate().public_key().to_hex();
+        seed_gated_session(&transport, &client_pubkey_hex, true).await;
+
+        transport
+            .send_targeted_response(
+                &client_pubkey_hex,
+                &EventId::from_slice(&[4u8; 32]).expect("event id").to_hex(),
+                gating_error(serde_json::json!("unwrapped-1")),
+            )
+            .await
+            .expect("targeted send");
+
+        let published = pool.stored_events().await;
+        let wrap = published
+            .iter()
+            .find(|e| {
+                e.kind == Kind::Custom(GIFT_WRAP_KIND)
+                    || e.kind == Kind::Custom(EPHEMERAL_GIFT_WRAP_KIND)
+            })
+            .expect("the response must be gift-wrapped");
+        assert_eq!(
+            wrap.kind,
+            Kind::Custom(GIFT_WRAP_KIND),
+            "with no recorded request wrap kind the mode default applies"
+        );
+    }
+
+    #[tokio::test]
+    async fn targeted_error_response_carries_no_pricing_tags() {
+        // The `cap` gate is shape-based and only fires on a result, so pricing is unobservable
+        // for every error a gate sends. This asserts that.
+        let pool = Arc::new(MockRelayPool::new());
+        let transport = targeted_fixture(
+            &pool,
+            EncryptionMode::Disabled,
+            GiftWrapMode::Optional,
+            false,
+            true,
+        )
+        .await;
+        let server_pubkey = pool.mock_public_key();
+
+        let client_pubkey_hex = Keys::generate().public_key().to_hex();
+        seed_gated_session(&transport, &client_pubkey_hex, false).await;
+
+        transport
+            .send_targeted_response(
+                &client_pubkey_hex,
+                &EventId::from_slice(&[5u8; 32]).expect("event id").to_hex(),
+                gating_error(serde_json::json!("priced-1")),
+            )
+            .await
+            .expect("targeted send");
+
+        let published = pool.stored_events().await;
+        let messages = server_messages(&published, server_pubkey);
+        assert_eq!(messages.len(), 1);
+        assert!(
+            !tag_vecs(messages[0])
+                .iter()
+                .any(|t| t.first().map(String::as_str) == Some(tags::CAPABILITY)),
+            "an error response never reaches the pricing gate"
+        );
+    }
+
+    #[tokio::test]
+    async fn targeted_response_after_a_first_response_replays_no_discovery() {
+        // The discovery replay is one-shot per session and shared across all three response
+        // paths, so whichever response goes out first carries it.
+        let pool = Arc::new(MockRelayPool::new());
+        let transport = targeted_fixture(
+            &pool,
+            EncryptionMode::Disabled,
+            GiftWrapMode::Optional,
+            false,
+            false,
+        )
+        .await;
+        let server_pubkey = pool.mock_public_key();
+
+        let client_pubkey = Keys::generate().public_key();
+        let client_pubkey_hex = client_pubkey.to_hex();
+        seed_gated_session(&transport, &client_pubkey_hex, false).await;
+
+        let first_event_id = EventId::from_slice(&[1u8; 32]).expect("event id").to_hex();
+        transport
+            .event_routes
+            .register(
+                first_event_id.clone(),
+                client_pubkey_hex.clone(),
+                serde_json::json!("normal-1"),
+                None,
+            )
+            .await;
+        transport
+            .send_response(
+                &first_event_id,
+                JsonRpcMessage::Response(JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
+                    id: serde_json::json!("normal-1"),
+                    result: serde_json::json!({ "content": [] }),
+                }),
+            )
+            .await
+            .expect("normal send");
+
+        let second_event_id = EventId::from_slice(&[2u8; 32]).expect("event id").to_hex();
+        transport
+            .send_targeted_response(
+                &client_pubkey_hex,
+                &second_event_id,
+                gating_error(serde_json::json!("targeted-1")),
+            )
+            .await
+            .expect("targeted send");
+
+        let published = pool.stored_events().await;
+        let targeted = server_messages(&published, server_pubkey)
+            .into_iter()
+            .find(|e| e.content.contains("targeted-1"))
+            .expect("targeted response missing");
+        assert_eq!(
+            tag_vecs(targeted),
+            vec![
+                vec!["p".to_string(), client_pubkey_hex.clone()],
+                vec!["e".to_string(), second_event_id],
+            ],
+            "the discovery replay and the disclosure both rode the earlier response"
+        );
+    }
+
+    #[tokio::test]
+    async fn targeted_response_dedups_disclosure_against_the_advertisement() {
+        let pool = Arc::new(MockRelayPool::new());
+        let transport = targeted_fixture(
+            &pool,
+            EncryptionMode::Disabled,
+            GiftWrapMode::Optional,
+            true,
+            false,
+        )
+        .await;
+        let server_pubkey = pool.mock_public_key();
+
+        let client_pubkey = Keys::generate().public_key();
+        let client_pubkey_hex = client_pubkey.to_hex();
+        seed_gated_session(&transport, &client_pubkey_hex, false).await;
+
+        let event_id_hex = EventId::from_slice(&[6u8; 32]).expect("event id").to_hex();
+        transport
+            .send_targeted_response(
+                &client_pubkey_hex,
+                &event_id_hex,
+                gating_error(serde_json::json!("dedup-1")),
+            )
+            .await
+            .expect("targeted send");
+
+        let published = pool.stored_events().await;
+        let messages = server_messages(&published, server_pubkey);
+        assert_eq!(messages.len(), 1);
+        // The whole list: the advertisement rides the discovery set and satisfies the
+        // disclosure on its own, so no second copy is appended.
+        assert_eq!(
+            tag_vecs(messages[0]),
+            vec![
+                vec!["p".to_string(), client_pubkey_hex],
+                vec!["e".to_string(), event_id_hex],
+                vec!["name".to_string(), "Targeted-Server".to_string()],
+                vec![
+                    tags::PAYMENT_INTERACTION.to_string(),
+                    "explicit_gating".to_string()
+                ],
+                vec![tags::SUPPORT_OVERSIZED_TRANSFER.to_string()],
+            ],
+            "advertisement and disclosure must not both emit the same tag"
+        );
+    }
+
+    #[tokio::test]
+    async fn injected_sender_matches_the_method() {
+        // Two forms of one behavior is the shape this sender exists to avoid, so the claim that
+        // they cannot diverge is executable: same inputs, byte-identical tags and the same kind.
+        async fn publish_both(
+            is_encrypted: bool,
+            recorded_wrap_kind: Option<u16>,
+            client_pubkey_hex: &str,
+            event_id_hex: &str,
+        ) -> (Vec<Vec<String>>, Kind, Vec<Vec<String>>, Kind) {
+            let mut out = Vec::new();
+            for via_closure in [false, true] {
+                let pool = Arc::new(MockRelayPool::new());
+                let transport = targeted_fixture(
+                    &pool,
+                    EncryptionMode::Optional,
+                    GiftWrapMode::Optional,
+                    false,
+                    true,
+                )
+                .await;
+                seed_gated_session(&transport, client_pubkey_hex, is_encrypted).await;
+                if let Some(kind) = recorded_wrap_kind {
+                    transport
+                        .request_wrap_kinds
+                        .write()
+                        .await
+                        .insert(event_id_hex.to_string(), Some(kind));
+                }
+
+                let response = gating_error(serde_json::json!("both-1"));
+                if via_closure {
+                    let send = transport.targeted_response_sender();
+                    send(
+                        client_pubkey_hex.to_string(),
+                        event_id_hex.to_string(),
+                        response,
+                    )
+                    .await
+                    .expect("closure send");
+                } else {
+                    transport
+                        .send_targeted_response(client_pubkey_hex, event_id_hex, response)
+                        .await
+                        .expect("method send");
+                }
+
+                let published = pool.stored_events().await;
+                let event = published.first().expect("one published event").clone();
+                out.push((tag_vecs(&event), event.kind));
+            }
+            let (closure_tags, closure_kind) = out.pop().expect("closure result");
+            let (method_tags, method_kind) = out.pop().expect("method result");
+            (method_tags, method_kind, closure_tags, closure_kind)
+        }
+
+        let client_pubkey_hex = Keys::generate().public_key().to_hex();
+        let event_id_hex = EventId::from_slice(&[8u8; 32]).expect("event id").to_hex();
+
+        // Plaintext: the published event carries the composed response tags directly.
+        let (method_tags, method_kind, closure_tags, closure_kind) =
+            publish_both(false, None, &client_pubkey_hex, &event_id_hex).await;
+        assert_eq!(
+            method_tags, closure_tags,
+            "both forms must compose the same tag list"
+        );
+        assert_eq!(
+            method_kind, closure_kind,
+            "both forms must use the same kind"
+        );
+        assert!(
+            method_tags
+                .iter()
+                .any(|t| t.first().map(String::as_str) == Some(tags::PAYMENT_INTERACTION)),
+            "the fixture must arm the disclosure, or the comparison proves nothing about it"
+        );
+        assert!(
+            method_tags
+                .iter()
+                .any(|t| t.first().map(String::as_str) == Some("name")),
+            "the fixture must arm the discovery replay"
+        );
+
+        // Encrypted: the wrap kind is what differs if the closure skips its own lookup.
+        let (_, method_kind, _, closure_kind) = publish_both(
+            true,
+            Some(EPHEMERAL_GIFT_WRAP_KIND),
+            &client_pubkey_hex,
+            &event_id_hex,
+        )
+        .await;
+        assert_eq!(
+            method_kind,
+            Kind::Custom(EPHEMERAL_GIFT_WRAP_KIND),
+            "the method mirrors the request's wrap kind"
+        );
+        assert_eq!(
+            closure_kind, method_kind,
+            "the closure must mirror it too, through its own lookup"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn injected_sender_works_from_a_detached_task() {
+        // The shape a middleware uses: the sender outlives the borrow it came from and runs on a
+        // task of its own, so `Send + 'static` has to hold behaviorally and not only at compile
+        // time.
+        let pool = Arc::new(MockRelayPool::new());
+        let transport = targeted_fixture(
+            &pool,
+            EncryptionMode::Disabled,
+            GiftWrapMode::Optional,
+            false,
+            false,
+        )
+        .await;
+        let server_pubkey = pool.mock_public_key();
+
+        let client_pubkey = Keys::generate().public_key();
+        let client_pubkey_hex = client_pubkey.to_hex();
+        seed_gated_session(&transport, &client_pubkey_hex, false).await;
+        let event_id_hex = EventId::from_slice(&[10u8; 32]).expect("event id").to_hex();
+
+        let send = transport.targeted_response_sender();
+        let spawned_pubkey = client_pubkey_hex.clone();
+        let spawned_event_id = event_id_hex.clone();
+        tokio::spawn(async move {
+            send(
+                spawned_pubkey,
+                spawned_event_id,
+                gating_error(serde_json::json!("detached-1")),
+            )
+            .await
+        })
+        .await
+        .expect("the detached task must not panic")
+        .expect("the detached send must succeed");
+
+        let published = pool.stored_events().await;
+        let messages = server_messages(&published, server_pubkey);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            tag_vecs(messages[0]),
+            vec![
+                vec!["p".to_string(), client_pubkey_hex],
+                vec!["e".to_string(), event_id_hex],
+                vec!["name".to_string(), "Targeted-Server".to_string()],
+                vec![tags::SUPPORT_OVERSIZED_TRANSFER.to_string()],
+                vec![
+                    tags::PAYMENT_INTERACTION.to_string(),
+                    "explicit_gating".to_string()
+                ],
+            ],
+            "a detached send composes the same tags as an inline one"
+        );
+    }
+
+    #[tokio::test]
+    async fn targeted_capability_list_result_carries_pricing_tags() {
+        // The pricing gate is shape-based, so it is unreachable for the error responses a payment
+        // gate sends. This sender is public, though, so a caller may legitimately answer with a
+        // capability-list result, and that is the only way to pin that the targeted path threads
+        // its pricing tags at all.
+        let pool = Arc::new(MockRelayPool::new());
+        let transport = targeted_fixture(
+            &pool,
+            EncryptionMode::Disabled,
+            GiftWrapMode::Optional,
+            false,
+            true,
+        )
+        .await;
+        let server_pubkey = pool.mock_public_key();
+
+        let client_pubkey_hex = Keys::generate().public_key().to_hex();
+        seed_gated_session(&transport, &client_pubkey_hex, false).await;
+
+        transport
+            .send_targeted_response(
+                &client_pubkey_hex,
+                &EventId::from_slice(&[11u8; 32]).expect("event id").to_hex(),
+                JsonRpcMessage::Response(JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
+                    id: serde_json::json!("list-1"),
+                    result: serde_json::json!({ "tools": [] }),
+                }),
+            )
+            .await
+            .expect("targeted send");
+
+        let published = pool.stored_events().await;
+        let messages = server_messages(&published, server_pubkey);
+        assert_eq!(messages.len(), 1);
+        let caps: Vec<Vec<String>> = tag_vecs(messages[0])
+            .into_iter()
+            .filter(|t| t.first().map(String::as_str) == Some(tags::CAPABILITY))
+            .collect();
+        assert_eq!(
+            caps,
+            vec![vec![
+                tags::CAPABILITY.to_string(),
+                "tool:get_weather".to_string(),
+                "100".to_string(),
+                "sats".to_string(),
+            ]],
+            "a capability-list result sent through the targeted path must carry the pricing tags"
+        );
+    }
+
+    #[tokio::test]
+    async fn injected_sender_captures_announcement_tags_when_it_is_built() {
+        // The two forms share one publish, but not one view of the announcement tag sets: the
+        // method reads them live, the closure captures them at construction. A caller that sets
+        // the tags after building the sender therefore gets two different tag lists from what
+        // looks like one behavior, which is the whole reason the constructor documents an
+        // ordering rule the compiler cannot enforce.
+        let pool = Arc::new(MockRelayPool::new());
+        let mut transport = NostrServerTransport::with_relay_pool(
+            NostrServerTransportConfig::default()
+                .with_encryption_mode(EncryptionMode::Disabled)
+                .with_gift_wrap_mode(GiftWrapMode::Optional),
+            Arc::clone(&pool) as Arc<dyn RelayPoolTrait>,
+        )
+        .await
+        .expect("server transport");
+        let server_pubkey = pool.mock_public_key();
+
+        // Built BEFORE the announcement tags exist: this is the unsupported order.
+        let send = transport.targeted_response_sender();
+        transport.set_announcement_extra_tags(vec![Tag::custom(
+            TagKind::Custom("late_tag".into()),
+            vec!["late".to_string()],
+        )]);
+
+        let closure_client = Keys::generate().public_key().to_hex();
+        let method_client = Keys::generate().public_key().to_hex();
+        seed_gated_session(&transport, &closure_client, false).await;
+        seed_gated_session(&transport, &method_client, false).await;
+        let event_id = EventId::from_slice(&[12u8; 32]).expect("event id").to_hex();
+
+        send(
+            closure_client.clone(),
+            event_id.clone(),
+            gating_error(serde_json::json!("stale-1")),
+        )
+        .await
+        .expect("closure send");
+        transport
+            .send_targeted_response(
+                &method_client,
+                &event_id,
+                gating_error(serde_json::json!("fresh-1")),
+            )
+            .await
+            .expect("method send");
+
+        let published = pool.stored_events().await;
+        let messages = server_messages(&published, server_pubkey);
+        let carries_late_tag = |needle: &str| {
+            let event = messages
+                .iter()
+                .find(|e| e.content.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} missing"));
+            tag_vecs(event)
+                .iter()
+                .any(|t| t.first().map(String::as_str) == Some("late_tag"))
+        };
+        assert!(
+            !carries_late_tag("stale-1"),
+            "the closure replays the tag set captured when it was built"
+        );
+        assert!(
+            carries_late_tag("fresh-1"),
+            "the method reads the announcement tags live on every call"
+        );
     }
 
     #[test]

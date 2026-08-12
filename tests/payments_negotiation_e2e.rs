@@ -20,8 +20,8 @@ use contextvm_sdk::transport::server::{
     IncomingRequest, NostrServerTransport, NostrServerTransportConfig,
 };
 use contextvm_sdk::{
-    JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, PaymentInteractionPolicy,
-    RelayPoolTrait,
+    JsonRpcError, JsonRpcErrorResponse, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest,
+    JsonRpcResponse, PaymentInteractionPolicy, RelayPoolTrait, ServerInfo,
 };
 use nostr_sdk::prelude::*;
 
@@ -1168,4 +1168,124 @@ async fn borderline_request_measured_over_threshold_latches() {
         !has_mode_tag(&follow_up),
         "and the borderline path must burn the latch like every other publish site"
     );
+}
+
+// ── Stateless explicit gating ───────────────────────────────────────────────
+
+/// The explicit-gating lifecycle's first step, driven end to end: a stateless client's very
+/// first request is answered with a payment-required error and nothing else.
+///
+/// The error is the only event the client ever sees, so it has to carry both the effective-mode
+/// disclosure (or the client never learns the mode it negotiated) and the CEP-35 discovery set
+/// (or the client latches this thin error as its session baseline and reports no server identity
+/// for the rest of the session, because the baseline only ever upgrades to an event carrying a
+/// full initialize result).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stateless_gating_error_discloses_and_replays_discovery() {
+    let (client_pool, server_pool) = MockRelayPool::create_pair();
+    let server_pubkey = server_pool.mock_public_key();
+    let server_pool = Arc::new(server_pool);
+
+    let mut server = NostrServerTransport::with_relay_pool(
+        NostrServerTransportConfig::default()
+            .with_encryption_mode(EncryptionMode::Disabled)
+            .with_server_info(ServerInfo::default().with_name("Gating-Server".to_string())),
+        Arc::clone(&server_pool) as Arc<dyn RelayPoolTrait>,
+    )
+    .await
+    .expect("create server transport");
+    server.set_supported_payment_interaction(PaymentInteractionPolicy::Optional);
+
+    let mut client = NostrClientTransport::with_relay_pool(
+        NostrClientTransportConfig::default()
+            .with_relay_urls(vec!["wss://mock.relay".to_string()])
+            .with_server_pubkey(server_pubkey.to_hex())
+            .with_encryption_mode(EncryptionMode::Disabled)
+            .with_payment_interaction(PaymentInteractionMode::ExplicitGating),
+        Arc::new(client_pool),
+    )
+    .await
+    .expect("create client transport");
+
+    let mut server_rx = server.take_message_receiver().expect("server rx");
+    server.start().await.expect("server start");
+    client.start().await.expect("client start");
+    let_event_loops_start().await;
+
+    client
+        .send(&request("gated-1", "tools/call"))
+        .await
+        .expect("send the gated request");
+    let incoming = tokio::time::timeout(Duration::from_millis(1000), server_rx.recv())
+        .await
+        .expect("request must reach the server")
+        .expect("server channel closed");
+
+    // The gate answers the request without ending it, exactly as a middleware would.
+    let client_pubkey_hex = incoming.client_pubkey.clone();
+    server
+        .send_targeted_response(
+            &client_pubkey_hex,
+            &incoming.event_id,
+            JsonRpcMessage::ErrorResponse(JsonRpcErrorResponse {
+                jsonrpc: "2.0".to_string(),
+                id: serde_json::json!("gated-1"),
+                error: JsonRpcError {
+                    code: -32042,
+                    message: "Payment required".to_string(),
+                    data: None,
+                },
+            }),
+        )
+        .await
+        .expect("targeted send");
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    // Server side: the whole tag list, in composition order.
+    let published = server_pool.stored_events().await;
+    let error_event = published
+        .iter()
+        .find(|e| {
+            e.kind == Kind::Custom(CTXVM_MESSAGES_KIND)
+                && e.pubkey == server_pubkey
+                && e.content.contains("-32042")
+        })
+        .expect("the gating error must be published");
+    assert_eq!(
+        all_tags(error_event),
+        vec![
+            tag(&["p", &client_pubkey_hex]),
+            tag(&["e", &incoming.event_id]),
+            tag(&["name", "Gating-Server"]),
+            tag(&[tags::SUPPORT_OVERSIZED_TRANSFER]),
+            tag(&[tags::PAYMENT_INTERACTION, "explicit_gating"]),
+        ],
+        "the gating error must carry routing, the discovery replay and the disclosure"
+    );
+
+    // Client side: the consequence of both halves.
+    assert_eq!(
+        client.get_effective_payment_interaction(),
+        Some(PaymentInteractionMode::ExplicitGating),
+        "the client must learn the effective mode from the error"
+    );
+    let baseline = client
+        .get_server_initialize_event()
+        .expect("the error is the client's first discovery-carrying event, so it is the baseline");
+    assert!(
+        all_tags(&baseline)
+            .iter()
+            .any(|t| t.first().map(String::as_str) == Some("name")),
+        "the baseline must carry the server's identity, not just the routing tags: without the \
+         discovery replay this session would report no server name at all"
+    );
+    assert!(
+        client
+            .discovered_server_capabilities()
+            .supports_oversized_transfer,
+        "the discovery set must have been learned from the error event"
+    );
+
+    server.close().await.expect("close server");
+    client.close().await.expect("close client");
 }
