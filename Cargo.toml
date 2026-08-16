@@ -97,6 +97,10 @@ required-features = ["rmcp", "test-utils"]
 name = "payments_negotiation_e2e"
 required-features = ["test-utils"]
 
+[[test]]
+name = "rmcp_handshake_survival"
+required-features = ["rmcp", "test-utils"]
+
 [dev-dependencies]
 # `start_paused` deterministic-time tests (tokio's "full" does not include test-util).
 tokio = { version = "1", features = ["test-util"] }
