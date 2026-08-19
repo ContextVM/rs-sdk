@@ -5847,3 +5847,114 @@ async fn cep8_rejects_explicit_gating_over_gift_wrap() {
 
     server.close().await.expect("close server");
 }
+
+// ── 49. Response tag composition order ───────────────────────────────────────
+
+/// The whole outbound tag list of an ordinary response, in order. Pins the canonical
+/// composition: routing, then the CEP-35 discovery replay, then the CEP-8 effective-mode
+/// disclosure, then the CEP-8 `cap` pricing a capability-list result carries.
+///
+/// The assertion is the entire list rather than a sample, so a dropped, reordered or
+/// duplicated step fails here rather than passing on the tags it happens to check.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn response_tags_are_composed_in_canonical_order() {
+    let (client_pool, server_pool) = MockRelayPool::create_pair();
+    let server_pubkey = server_pool.mock_public_key();
+    let s_pool = Arc::new(server_pool);
+
+    // Encryption disabled and open-stream off keep the discovery set exactly two tags, so the
+    // expected list below can be written out in full.
+    let mut server = NostrServerTransport::with_relay_pool(
+        NostrServerTransportConfig::default()
+            .with_encryption_mode(EncryptionMode::Disabled)
+            .with_server_info(ServerInfo::default().with_name("Composer-Server".to_string())),
+        Arc::clone(&s_pool) as Arc<dyn RelayPoolTrait>,
+    )
+    .await
+    .expect("create server transport");
+    // An optional policy mirrors the client's requested mode, so the response discloses it.
+    server.set_supported_payment_interaction(contextvm_sdk::PaymentInteractionPolicy::Optional);
+    server.set_announcement_pricing_tags(
+        contextvm_sdk::payments::tags::cap_tags_from_priced_capabilities(&[
+            contextvm_sdk::PricedCapability {
+                method: "tools/call".to_string(),
+                name: Some("get_weather".to_string()),
+                amount: 100,
+                max_amount: None,
+                currency_unit: "sats".to_string(),
+                description: None,
+            },
+        ]),
+    );
+
+    let mut server_rx = server
+        .take_message_receiver()
+        .expect("server message receiver");
+    server.start().await.expect("server start");
+    let_event_loops_start().await;
+
+    let client_keys = Keys::generate();
+    let request = cep8_request_event(
+        &client_keys,
+        server_pubkey,
+        serde_json::json!("order-1"),
+        "tools/list",
+        vec![payment_interaction_tag("explicit_gating")],
+    );
+    let request_event_id = request.id;
+    client_pool
+        .publish_event(&request)
+        .await
+        .expect("publish request");
+
+    let incoming = tokio::time::timeout(Duration::from_millis(500), server_rx.recv())
+        .await
+        .expect("request must reach the handler")
+        .expect("channel closed");
+    server
+        .send_response(
+            &incoming.event_id,
+            JsonRpcMessage::Response(JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id: serde_json::json!("order-1"),
+                result: serde_json::json!({ "tools": [] }),
+            }),
+        )
+        .await
+        .expect("send response");
+
+    // The paired pools share one store, so select the server-authored event.
+    let events = s_pool.stored_events().await;
+    let response = events
+        .iter()
+        .find(|e| {
+            e.kind == Kind::Custom(CTXVM_MESSAGES_KIND)
+                && e.pubkey == server_pubkey
+                && e.content.contains("order-1")
+        })
+        .expect("response missing");
+
+    let expected: Vec<Vec<String>> = vec![
+        vec!["p".to_string(), client_keys.public_key().to_hex()],
+        vec!["e".to_string(), request_event_id.to_hex()],
+        vec!["name".to_string(), "Composer-Server".to_string()],
+        vec!["support_oversized_transfer".to_string()],
+        vec![
+            "payment_interaction".to_string(),
+            "explicit_gating".to_string(),
+        ],
+        vec![
+            "cap".to_string(),
+            "tool:get_weather".to_string(),
+            "100".to_string(),
+            "sats".to_string(),
+        ],
+    ];
+    assert_eq!(
+        event_tag_vecs(response),
+        expected,
+        "response tags must be composed as routing, discovery, disclosure, pricing"
+    );
+
+    server.close().await.expect("close server");
+}

@@ -16,4 +16,6 @@ pub use open_stream::{
     OpenStreamConfig, OpenStreamError, OpenStreamFrame, OpenStreamRegistry,
     OpenStreamRegistryPolicy, OpenStreamSession, OpenStreamWriter,
 };
-pub use server::{NostrServerTransport, NostrServerTransportConfig, ServerEventRouteStore};
+pub use server::{
+    NostrServerTransport, NostrServerTransportConfig, ServerEventRouteStore, TargetedResponseSender,
+};
