@@ -12,7 +12,6 @@ use crate::transport::server::{
 };
 use rmcp::model::GetExtensions;
 use rmcp::transport::worker::{Worker, WorkerContext, WorkerQuitReason};
-use std::collections::HashSet;
 
 use super::convert::{
     internal_to_rmcp_client_rx, internal_to_rmcp_server_rx, rmcp_client_tx_to_internal,
@@ -44,27 +43,6 @@ fn synthetic_initialized_notification() -> JsonRpcMessage {
         method: "notifications/initialized".to_string(),
         params: None,
     })
-}
-
-fn should_inject_stateless_bootstrap(
-    initialized_clients: &HashSet<String>,
-    client_pubkey: &str,
-    message: &JsonRpcMessage,
-) -> bool {
-    if initialized_clients.contains(client_pubkey) {
-        return false;
-    }
-
-    matches!(message, JsonRpcMessage::Request(req) if req.method != "initialize")
-}
-
-fn is_synthetic_initialize_message(message: &JsonRpcMessage) -> bool {
-    matches!(
-        message,
-        JsonRpcMessage::Request(req)
-            if req.method == "initialize"
-                && req.id == serde_json::json!(STATELESS_SYNTHETIC_EVENT_ID)
-    )
 }
 
 /// rmcp server worker wrapper for ContextVM Nostr server transport.
@@ -133,8 +111,48 @@ impl Worker for NostrServerWorker {
             )
         })?;
 
+        // Satisfy rmcp's pre-init handshake worker-locally, before any relay-sourced
+        // message can be drained. The handler channel has one producer (this task) and
+        // is FIFO, so a synthetic initialize + initialized sent here reaches the service
+        // ahead of every inbound event, for every peer and ordering.
+        let startup: std::result::Result<(), WorkerQuitReason<Self::Error>> = async {
+            let init = synthetic_initialize_message();
+            let rmcp_init = internal_to_rmcp_server_rx(&init).ok_or_else(|| {
+                WorkerQuitReason::fatal(
+                    Self::Error::Validation(
+                        "failed converting synthetic initialize request to rmcp format".to_string(),
+                    ),
+                    "converting synthetic initialize request",
+                )
+            })?;
+            context.send_to_handler(rmcp_init).await?;
+
+            let initialized = synthetic_initialized_notification();
+            let rmcp_initialized = internal_to_rmcp_server_rx(&initialized).ok_or_else(|| {
+                WorkerQuitReason::fatal(
+                    Self::Error::Validation(
+                        "failed converting synthetic initialized notification to rmcp format"
+                            .to_string(),
+                    ),
+                    "converting synthetic initialized notification",
+                )
+            })?;
+            context.send_to_handler(rmcp_initialized).await
+        }
+        .await;
+        // Share the loop's close-on-exit path: a send failure here means the
+        // WorkerTransport was already dropped (e.g. a serve()-vs-timeout race). Without
+        // this close, the transport's own tasks (event loop, cleanup, relay
+        // subscription) leak for the process lifetime, because nothing else runs between
+        // `take_message_receiver()` and the loop.
+        if let Err(reason) = startup {
+            if let Err(e) = self.transport.close().await {
+                tracing::warn!(target: LOG_TARGET, error = %e, "Failed to close server transport cleanly");
+            }
+            return Err(reason);
+        }
+
         let cancellation_token = context.cancellation_token.clone();
-        let mut initialized_clients = HashSet::new();
 
         let quit_reason = loop {
             tokio::select! {
@@ -154,58 +172,12 @@ impl Worker for NostrServerWorker {
                         ..
                     } = incoming;
 
-                    let should_inject_bootstrap = should_inject_stateless_bootstrap(
-                        &initialized_clients,
-                        &client_pubkey,
-                        &message,
-                    );
-
-                    if should_inject_bootstrap {
-                        let synthetic_init = synthetic_initialize_message();
-                        let Some(rmcp_init) = internal_to_rmcp_server_rx(&synthetic_init) else {
-                            break WorkerQuitReason::fatal(
-                                Self::Error::Validation(
-                                    "failed converting synthetic initialize request to rmcp format".to_string(),
-                                ),
-                                "converting synthetic initialize request",
-                            );
-                        };
-
-                        if let Err(reason) = context.send_to_handler(rmcp_init).await {
-                            break reason;
-                        }
-
-                        let initialized = synthetic_initialized_notification();
-                        let Some(rmcp_initialized) = internal_to_rmcp_server_rx(&initialized) else {
-                            break WorkerQuitReason::fatal(
-                                Self::Error::Validation(
-                                    "failed converting synthetic initialized notification to rmcp format".to_string(),
-                                ),
-                                "converting synthetic initialized notification",
-                            );
-                        };
-
-                        if let Err(reason) = context.send_to_handler(rmcp_initialized).await {
-                            break reason;
-                        }
-
-                        initialized_clients.insert(client_pubkey.clone());
-                    }
-
-                    if matches!(&message, JsonRpcMessage::Request(req) if req.method == "initialize")
-                        || matches!(&message, JsonRpcMessage::Notification(n) if n.method == "notifications/initialized")
-                    {
-                        initialized_clients.insert(client_pubkey.clone());
-                    }
-
-                    // Rewrite real wire requests to the Nostr event_id.
-                    // Synthetic stateless bootstrap messages must retain their
-                    // sentinel ID so their responses can be dropped before they
-                    // ever touch transport correlation.
-                    if !is_synthetic_initialize_message(&message) {
-                        if let JsonRpcMessage::Request(ref mut req) = message {
+                    // Rewrite wire requests to the Nostr event_id. Every message
+                    // reaching this loop came off the relay; the worker's own
+                    // synthetic handshake pair goes straight to the handler at
+                    // startup and never traverses it.
+                    if let JsonRpcMessage::Request(ref mut req) = message {
                         req.id = serde_json::json!(event_id);
-                        }
                     }
 
                     if let Some(mut rmcp_msg) = internal_to_rmcp_server_rx(&message) {
@@ -485,40 +457,6 @@ mod tests {
     use crate::core::types::JsonRpcResponse;
 
     #[test]
-    fn test_should_inject_stateless_bootstrap_for_first_non_initialize_request() {
-        let initialized_clients = HashSet::new();
-        let message = JsonRpcMessage::Request(JsonRpcRequest {
-            jsonrpc: "2.0".to_string(),
-            id: serde_json::json!(1),
-            method: "tools/list".to_string(),
-            params: Some(serde_json::json!({})),
-        });
-
-        assert!(should_inject_stateless_bootstrap(
-            &initialized_clients,
-            "client-a",
-            &message,
-        ));
-    }
-
-    #[test]
-    fn test_should_not_inject_stateless_bootstrap_for_real_initialize() {
-        let initialized_clients = HashSet::new();
-        let message = JsonRpcMessage::Request(JsonRpcRequest {
-            jsonrpc: "2.0".to_string(),
-            id: serde_json::json!(1),
-            method: "initialize".to_string(),
-            params: Some(serde_json::json!({})),
-        });
-
-        assert!(!should_inject_stateless_bootstrap(
-            &initialized_clients,
-            "client-a",
-            &message,
-        ));
-    }
-
-    #[test]
     fn test_synthetic_initialize_keeps_sentinel_id() {
         let message = synthetic_initialize_message();
 
@@ -580,13 +518,6 @@ mod tests {
     }
 
     #[test]
-    fn test_is_synthetic_initialize_message_detects_sentinel() {
-        assert!(is_synthetic_initialize_message(
-            &synthetic_initialize_message()
-        ));
-    }
-
-    #[test]
     fn test_announcement_sentinel_differs_from_stateless_sentinel() {
         assert_ne!(ANNOUNCEMENT_REQUEST_ID, STATELESS_SYNTHETIC_EVENT_ID);
     }
@@ -606,8 +537,9 @@ mod tests {
         if let JsonRpcMessage::Response(ref resp) = response {
             let event_id = resp.id.as_str().unwrap();
             assert_eq!(event_id, ANNOUNCEMENT_REQUEST_ID);
-            // Must not be confused with the stateless synthetic sentinel
-            assert!(!is_synthetic_initialize_message(&response));
+            // Must not be confused with the stateless synthetic sentinel, whose
+            // response takes the drop path in `forward_server_internal`.
+            assert_ne!(event_id, STATELESS_SYNTHETIC_EVENT_ID);
         }
     }
 }

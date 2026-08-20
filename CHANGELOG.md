@@ -40,6 +40,17 @@
 
 ### Fixed
 
+- rmcp server worker: a single inbound message that was not an `initialize` request could
+  permanently stop the server for every client. All Nostr clients are multiplexed through one
+  rmcp service, and rmcp's pre-service handshake accepts only an `initialize` request as its
+  first message; anything else (a `notifications/initialized`, any other typed notification, a
+  response, or an error response) terminated the service, which cancelled the worker and closed
+  the transport. Nothing recovered it: every later client hung. Reaching it needed no
+  authentication, no allowlisted key, and no honest client, and an honest client could trigger it
+  on itself whenever the relay delivered its `notifications/initialized` before its `initialize`,
+  which Nostr does not order. The worker now satisfies the handshake itself at startup, before it
+  drains any relay-sourced message, so no inbound message can reach the pre-service handshake.
+
 - CEP-41 open-stream: a deferred final response (one held back while a stream was
   still open) went out with routing tags only, so it carried neither the CEP-35
   discovery tags nor the CEP-8 effective-mode disclosure. A client whose first server
@@ -50,6 +61,17 @@
   capability-list result.
 
 ### Changed
+
+- rmcp server worker: every client now receives the handler's declared `protocolVersion` in its
+  `InitializeResult`. Because the worker satisfies the pre-service handshake itself, no client's
+  `initialize` runs rmcp's version negotiation any more, so the first client is answered with the
+  declared version rather than an echo of the version it requested. Clients after the first
+  already behaved this way, so the change makes all clients uniform, in the less conformant
+  direction: the multiplexed adapter no longer negotiates the protocol version per client. A
+  server announcement is unaffected for a handler that does not override the version, and
+  reflects the declared version for one that does. The per-client synthetic bootstrap that used
+  to inject an `initialize` ahead of a new client's first request is removed, since the handshake
+  is now satisfied before any client is served.
 
 - The server transport's two response paths (the normal path and the CEP-41 deferred
   stream path) now compose their outbound tags through a single shared function
