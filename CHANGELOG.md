@@ -25,6 +25,18 @@
     `payment_interaction` tag when it did not itself request `explicit_gating`, since such
     a tag is a server availability advertisement rather than this session's negotiated
     mode.
+  - A targeted server response sender: `send_targeted_response` publishes a JSON-RPC
+    response to a specific client and request event without consuming the request's
+    correlation route, so a transport-level gate can answer a request without ending
+    it. It composes the same tags every other server response carries (discovery
+    replay on the first response, the CEP-8 effective-mode disclosure, and `cap`
+    pricing on capability-list results), mirrors the inbound gift-wrap kind, and
+    no-ops with a warning when the client has no session. `targeted_response_sender`
+    returns the same publish as an injectable closure for callers that have no
+    `&self`, such as a detached middleware. That closure captures the announcement
+    tag sets when it is built, so build it after those tags are set.
+    Both `send_targeted_response` and the `TargetedResponseSender` alias are
+    re-exported from `contextvm_sdk::transport`.
 
 ### Fixed
 
@@ -61,6 +73,10 @@
   to inject an `initialize` ahead of a new client's first request is removed, since the handshake
   is now satisfied before any client is served.
 
+- The server transport's two response paths (the normal path and the CEP-41 deferred
+  stream path) now compose their outbound tags through a single shared function
+  instead of each writing the same routing, discovery, disclosure and pricing policy
+  by hand. Internal refactor with no behavior or wire-format change.
 - **Breaking:** `ClientSession` and `SessionSnapshot` are now `#[non_exhaustive]`. Both
   gain fields as new CEPs land (CEP-8 adds three to each), so downstream code must
   construct `ClientSession` via `ClientSession::new` and destructure either struct with
