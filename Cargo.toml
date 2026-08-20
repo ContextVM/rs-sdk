@@ -98,6 +98,10 @@ name = "payments_negotiation_e2e"
 required-features = ["test-utils"]
 
 [[test]]
+name = "payments_transparent_e2e"
+required-features = ["test-utils"]
+
+[[test]]
 name = "rmcp_handshake_survival"
 required-features = ["rmcp", "test-utils"]
 

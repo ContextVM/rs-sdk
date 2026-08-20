@@ -19,6 +19,8 @@ pub mod authorization_store;
 pub mod canonical;
 pub mod constants;
 pub mod errors;
+pub mod server_payments;
+pub(crate) mod server_payments_utils;
 pub mod tags;
 pub mod traits;
 pub mod types;
@@ -32,6 +34,9 @@ pub use canonical::{
     CanonicalInvocationIdentity,
 };
 pub use errors::PaymentError;
+pub use server_payments::{
+    create_server_payments_middleware, ServerPaymentsMiddlewareParams, ServerPaymentsOptions,
+};
 pub use traits::{PaymentHandler, PaymentProcessor, ResolvePrice};
 pub use types::{
     Meta, PaymentAcceptedParams, PaymentHandlerRequest, PaymentInteractionPolicy, PaymentOption,

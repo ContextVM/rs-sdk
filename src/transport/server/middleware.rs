@@ -14,8 +14,9 @@ use async_trait::async_trait;
 use futures::future::FutureExt; // .catch_unwind()
 use nostr_sdk::prelude::Event;
 use tokio::sync::mpsc::UnboundedSender;
+use tokio_util::sync::CancellationToken;
 
-use super::{IncomingRequest, ServerEventRouteStore, LOG_TARGET};
+use super::{IncomingRequest, ServerEventRouteStore, ServerOpenStreamState, LOG_TARGET};
 use crate::core::types::{JsonRpcMessage, PaymentInteractionMode};
 
 /// Per-event context handed to every inbound middleware.
@@ -44,6 +45,13 @@ pub struct InboundContext {
     /// Unlike [`client_pmis`](Self::client_pmis) this persists across the session, and an
     /// unnegotiated session resolves to [`PaymentInteractionMode::Transparent`] rather than `None`.
     pub payment_interaction: Option<PaymentInteractionMode>,
+    /// Per-event cancellation token, a child of the transport's shutdown token.
+    ///
+    /// A middleware doing long-running work (e.g. a payment verification) should derive its own
+    /// child from this and select on it, so closing the transport aborts the work instead of
+    /// leaving it running against cleared state. Cancelling a child never propagates upward, so
+    /// aborting one event's work cannot tear down the transport.
+    pub cancel: CancellationToken,
 }
 
 /// A general-purpose inbound middleware, run as the final inbound stage before delivery to the MCP
@@ -124,6 +132,8 @@ pub(crate) fn dispatch_inbound(
     middlewares: &Arc<[Arc<dyn InboundMiddleware>]>,
     tx: &UnboundedSender<IncomingRequest>,
     event_routes: &ServerEventRouteStore,
+    open_stream: &ServerOpenStreamState,
+    cancel: &CancellationToken,
     message: JsonRpcMessage,
     client_pubkey: String,
     event_id: String,
@@ -152,12 +162,16 @@ pub(crate) fn dispatch_inbound(
         mirrored_wrap_kind,
         client_pmis,
         payment_interaction,
+        // A per-event child of the transport's shutdown token: closing the transport cancels
+        // every in-flight event's work, while cancelling one event's token affects nothing else.
+        cancel: cancel.child_token(),
     });
     spawn_inbound_chain(
         Arc::clone(middlewares),
         ctx,
         tx.clone(),
         event_routes.clone(),
+        open_stream.clone(),
         message,
         event,
     );
@@ -170,6 +184,7 @@ fn spawn_inbound_chain(
     ctx: Arc<InboundContext>,
     tx: UnboundedSender<IncomingRequest>,
     event_routes: ServerEventRouteStore,
+    open_stream: ServerOpenStreamState,
     message: JsonRpcMessage,
     event: Option<Event>,
 ) {
@@ -178,17 +193,19 @@ fn spawn_inbound_chain(
         ctx,
         tx,
         event_routes,
+        open_stream,
         message,
         event,
     ));
 }
 
 /// The awaitable chain runner. Awaited directly in tests; spawned in production.
-async fn run_inbound_chain(
+pub(crate) async fn run_inbound_chain(
     chain: Arc<[Arc<dyn InboundMiddleware>]>,
     ctx: Arc<InboundContext>,
     tx: UnboundedSender<IncomingRequest>,
     event_routes: ServerEventRouteStore,
+    open_stream: ServerOpenStreamState,
     message: JsonRpcMessage,
     event: Option<Event>,
 ) {
@@ -229,6 +246,22 @@ async fn run_inbound_chain(
     // there `pop` is a real (harmless) removal.
     if !reached.load(Ordering::SeqCst) {
         event_routes.pop(&event_id).await;
+
+        // A gated (dropped) request also releases the open-stream slot the transport reserved for
+        // it before dispatch: `send_response` never runs for a dropped request, so no arm of its
+        // deferral decision can release the slot, the keepalive sweep cannot reap a never-started
+        // writer, and the slots map is unbounded. The token index is keyed by
+        // `(client_pubkey, progress_token)`, not by event id, so both keys are recovered from the
+        // slot itself before it is dropped.
+        let slot = open_stream.lock_slots().remove(&event_id);
+        if let Some(slot) = slot {
+            let token = slot.writer.progress_token().to_string();
+            let client = slot.snapshot.client_pubkey.to_hex();
+            open_stream
+                .lock_token_index()
+                .remove(&ServerOpenStreamState::client_token_key(&client, &token));
+            slot.writer.dispose();
+        }
     }
 }
 
@@ -236,8 +269,13 @@ async fn run_inbound_chain(
 mod tests {
     use super::*;
     use crate::core::types::{JsonRpcNotification, JsonRpcRequest};
+    use crate::transport::open_stream::OpenStreamConfig;
     use std::sync::Mutex;
     use tokio::sync::mpsc;
+
+    fn open_stream_state() -> ServerOpenStreamState {
+        ServerOpenStreamState::new(&OpenStreamConfig::default(), 10)
+    }
 
     fn req(id: &str, method: &str) -> JsonRpcMessage {
         JsonRpcMessage::Request(JsonRpcRequest {
@@ -276,8 +314,18 @@ mod tests {
             mirrored_wrap_kind: None,
             client_pmis: None,
             payment_interaction: None,
+            cancel: CancellationToken::new(),
         });
-        run_inbound_chain(chain_of(mws), ctx, tx, event_routes.clone(), message, None).await;
+        run_inbound_chain(
+            chain_of(mws),
+            ctx,
+            tx,
+            event_routes.clone(),
+            open_stream_state(),
+            message,
+            None,
+        )
+        .await;
         rx.try_recv().ok()
     }
 
@@ -372,6 +420,8 @@ mod tests {
             &empty,
             &tx,
             &routes,
+            &open_stream_state(),
+            &CancellationToken::new(),
             req("1", "tools/call"),
             "client_pk".to_string(),
             "e1".to_string(),
