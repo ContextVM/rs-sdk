@@ -31,7 +31,9 @@ use crate::core::error::{Error, Result};
 use crate::core::types::*;
 use crate::core::validation;
 use crate::encryption;
-use crate::payments::constants::UNSUPPORTED_PAYMENT_INTERACTION_ERROR_CODE;
+use crate::payments::constants::{
+    PAYMENT_REQUIRED_METHOD, UNSUPPORTED_PAYMENT_INTERACTION_ERROR_CODE,
+};
 use crate::payments::{PaymentInteractionPolicy, UnsupportedPaymentInteractionData};
 use crate::relay::{RelayPool, RelayPoolTrait};
 use crate::transport::base::BaseTransport;
@@ -129,6 +131,15 @@ struct RouteSnapshot {
     mirrored_wrap_kind: Option<u16>,
 }
 
+/// CEP-8: a [`RouteSnapshot`] captured for a payment-gated request, plus its expiry stamp.
+///
+/// `expires_at` is a [`std::time::Instant`] because the purge runs on the real-time cleanup
+/// task, alongside the stale-route sweep.
+struct PaymentRouteSnapshot {
+    snapshot: RouteSnapshot,
+    expires_at: Instant,
+}
+
 /// CEP-41: the per-stream coordination slot for a server→client writer, keyed by
 /// request `event_id` in [`ServerOpenStreamState::slots`].
 ///
@@ -149,8 +160,10 @@ struct OpenStreamSlot {
 
 /// CEP-41: the open-stream runtime state shared between the server transport and
 /// its spawned event loop. Bundled so the event-loop signature stays manageable.
+/// `pub(crate)` because the inbound middleware seam's drop-cleanup releases a
+/// gated request's writer slot, and the seam lives in a sibling module.
 #[derive(Clone)]
-struct ServerOpenStreamState {
+pub(crate) struct ServerOpenStreamState {
     /// Master gate (`config.open_stream.enabled`).
     enabled: bool,
     /// Reader admission/buffering/keepalive policy projected from config.
@@ -169,7 +182,7 @@ struct ServerOpenStreamState {
 }
 
 impl ServerOpenStreamState {
-    fn new(config: &OpenStreamConfig, max_sessions: usize) -> Self {
+    pub(crate) fn new(config: &OpenStreamConfig, max_sessions: usize) -> Self {
         Self {
             enabled: config.enabled,
             policy: config.into(),
@@ -270,6 +283,32 @@ struct ResponseTagSources {
 /// and nothing depends on it.
 pub type TargetedResponseSender = Arc<
     dyn Fn(String, String, JsonRpcMessage) -> BoxFuture<'static, crate::Result<()>> + Send + Sync,
+>;
+
+/// An injected CEP-8 payment-notification publish, for callers that have no `&self`.
+///
+/// The arguments are the recipient's public key in hex, the hex id of the request event the
+/// notification correlates to, the request's mirrored gift-wrap kind, and the notification to
+/// publish. Every CEP-8 payment notification MUST carry the correlating `e` tag, so unlike
+/// [`send_notification`](NostrServerTransport::send_notification) the event id here is not
+/// optional. The wrap kind is threaded from the inbound context (`None` for a plaintext
+/// request) rather than looked up, because this sender outlives the request's route: a map
+/// lookup after the stale-route sweep falls back to session state and can select a different
+/// wrap kind than the request used.
+///
+/// When the notification is `notifications/payment_required`, the publish also captures the
+/// request's routing fields while the route is still fresh, so the eventual result of a payment
+/// that outlives the sweep is delivered from that capture. That side effect is keyed on the
+/// notification method and exists only on this sender, which is why it is named for payment
+/// notifications rather than as a general correlated-notification sender.
+///
+/// Cheaply clonable (`Arc`). Obtained from
+/// [`payment_notification_sender`](NostrServerTransport::payment_notification_sender), which is
+/// also where the construction-order rule is documented.
+pub type PaymentNotificationSender = Arc<
+    dyn Fn(String, String, Option<u16>, JsonRpcMessage) -> BoxFuture<'static, crate::Result<()>>
+        + Send
+        + Sync,
 >;
 
 /// CEP-8: the outcome of one payment-interaction negotiation.
@@ -390,6 +429,14 @@ pub struct NostrServerTransport {
     event_routes: ServerEventRouteStore,
     /// CEP-19: Track the incoming gift-wrap kind per request for mirroring.
     request_wrap_kinds: Arc<RwLock<HashMap<String, Option<u16>>>>,
+    /// CEP-8: routing snapshots for requests whose payment can outlive the 60 s stale-route
+    /// sweep. Written by the injected payment-notification sender when it publishes
+    /// `payment_required` (while the request's route is still fresh); taken by
+    /// [`send_response`](Self::send_response), which delivers from the snapshot when the route
+    /// is gone. Entries are stamped with an expiry at capture and dropped by the cleanup task's
+    /// tick, so a timed-out payment's snapshot lingers until that tick (or LRU eviction at the
+    /// 5000-entry bound) rather than being removed the moment the payment fails.
+    payment_route_snapshots: Arc<Mutex<LruCache<String, PaymentRouteSnapshot>>>,
     /// Outer gift-wrap event IDs successfully decrypted and verified (inner `verify()`).
     /// Duplicate outer ids are skipped before decrypt; ids are inserted only after success
     /// so failed decrypt/verify can be retried on redelivery.
@@ -651,6 +698,9 @@ impl NostrServerTransport {
             config,
             event_routes: ServerEventRouteStore::new(),
             request_wrap_kinds: Arc::new(RwLock::new(HashMap::new())),
+            payment_route_snapshots: Arc::new(Mutex::new(LruCache::new(
+                NonZeroUsize::new(DEFAULT_LRU_SIZE).expect("DEFAULT_LRU_SIZE must be non-zero"),
+            ))),
             seen_gift_wrap_ids,
             inbound_middlewares: Vec::new(),
             supported_payment_interaction: None,
@@ -705,6 +755,9 @@ impl NostrServerTransport {
             open_stream: ServerOpenStreamState::new(&config.open_stream, config.max_sessions),
             config,
             request_wrap_kinds: Arc::new(RwLock::new(HashMap::new())),
+            payment_route_snapshots: Arc::new(Mutex::new(LruCache::new(
+                NonZeroUsize::new(DEFAULT_LRU_SIZE).expect("DEFAULT_LRU_SIZE must be non-zero"),
+            ))),
             event_routes: ServerEventRouteStore::new(),
             seen_gift_wrap_ids,
             inbound_middlewares: Vec::new(),
@@ -869,6 +922,7 @@ impl NostrServerTransport {
         let sessions_cleanup = self.sessions.clone();
         let event_routes_cleanup = self.event_routes.clone();
         let request_wrap_kinds_cleanup = self.request_wrap_kinds.clone();
+        let payment_snapshots_cleanup = Arc::clone(&self.payment_route_snapshots);
         let cleanup_interval = self.config.cleanup_interval;
         let session_timeout = self.config.session_timeout;
         let request_timeout = self.config.request_timeout;
@@ -920,6 +974,24 @@ impl NostrServerTransport {
                         "Swept stale event routes (rmcp handles timeout errors)"
                     );
                 }
+
+                // CEP-8: drop expired payment route snapshots (stamped at capture). Unlike
+                // `event_routes`, this map's entries must OUTLIVE ordinary traffic for the
+                // whole payment, so age-based expiry here is the intended lifetime and the
+                // LRU bound is only a memory backstop.
+                {
+                    let mut snapshots =
+                        Self::lock_payment_route_snapshots(&payment_snapshots_cleanup);
+                    let now = Instant::now();
+                    let expired: Vec<String> = snapshots
+                        .iter()
+                        .filter(|(_, entry)| entry.expires_at <= now)
+                        .map(|(key, _)| key.clone())
+                        .collect();
+                    for key in expired {
+                        snapshots.pop(&key);
+                    }
+                }
             }
         });
 
@@ -961,11 +1033,37 @@ impl NostrServerTransport {
             slot.writer.dispose();
         }
         self.open_stream.lock_token_index().clear();
+        // CEP-8: drop any remaining payment route snapshots.
+        Self::lock_payment_route_snapshots(&self.payment_route_snapshots).clear();
         Ok(())
     }
 
+    /// Whether a live response route exists for `event_id`.
+    ///
+    /// Test-only: lets a test assert the stale-route sweep (or a drop-cleanup) has really
+    /// removed the route before a response is sent, so a delivery observed afterwards is
+    /// attributable to the snapshot path rather than the ordinary one.
+    #[cfg(feature = "test-utils")]
+    pub async fn has_event_route(&self, event_id: &str) -> bool {
+        self.event_routes.has_event_route(event_id).await
+    }
+
     /// Send a response back to the client that sent the original request.
+    ///
+    /// Call this at most once per request. For an unpaid request the consumed route makes a
+    /// second concurrent call fail cleanly; for a payment-gated request the route and the payment
+    /// snapshot are two separate one-shot authorities, so two responders racing for the same
+    /// event id in the narrow window where both are live can each win one and publish twice. The
+    /// client's correlation consumes only the first, but the duplicate still reaches the relay.
     pub async fn send_response(&self, event_id: &str, mut response: JsonRpcMessage) -> Result<()> {
+        // CEP-8: take the payment route snapshot up front, unconditionally. For a request that
+        // was never payment-gated the map has no entry, the take yields `None`, and everything
+        // below behaves exactly as it did before payments existed. When both a payments snapshot
+        // and an open-stream slot exist, the open-stream arm wins (it returns from this
+        // function), and this take has already dropped the payments snapshot, so the two owners
+        // can never both deliver.
+        let payment_snapshot = self.take_payment_route_snapshot(event_id);
+
         // CEP-41: response deferral. Decide BEFORE consuming the route — for a
         // started stream the final response rides the captured snapshot, not the
         // (possibly-swept) event route.
@@ -986,14 +1084,35 @@ impl NostrServerTransport {
 
         // Consume the route up-front so only one concurrent responder can proceed
         // for a given event_id.
-        let route = self.event_routes.pop(event_id).await.ok_or_else(|| {
-            tracing::error!(
-                target: LOG_TARGET,
-                event_id = %event_id,
-                "No client found for response correlation"
-            );
-            Error::Other(format!("No client found for event {event_id}"))
-        })?;
+        let route = match self.event_routes.pop(event_id).await {
+            Some(route) => route,
+            None => {
+                // CEP-8: the route is gone (swept during a long payment, or popped by a
+                // duplicate delivery's chain run) but a payment route snapshot was captured
+                // when `payment_required` was published; deliver from it, the same way a
+                // deferred open-stream response is delivered.
+                if let Some(entry) = payment_snapshot {
+                    let result = self
+                        .send_open_stream_deferred_response(event_id, &entry.snapshot, response)
+                        .await;
+                    if result.is_err() {
+                        // Keep a PAID delivery retryable: the normal path re-registers the
+                        // route on a publish failure, so this path re-inserts the snapshot
+                        // (with its original expiry) for the same reason.
+                        self.reinsert_payment_route_snapshot(event_id, entry);
+                    }
+                    return result;
+                }
+                tracing::error!(
+                    target: LOG_TARGET,
+                    event_id = %event_id,
+                    "No client found for response correlation"
+                );
+                return Err(Error::Other(format!(
+                    "No client found for event {event_id}"
+                )));
+            }
+        };
 
         let client_pubkey_hex = route.client_pubkey;
         let original_request_id = route.original_request_id;
@@ -1344,6 +1463,82 @@ impl NostrServerTransport {
             return None;
         }
         self.open_stream.writer_for(event_id)
+    }
+
+    /// Lock-poison-tolerant access to the payment route snapshot map. An associated function
+    /// (not `&self`) so the injected sender's detached closure can share it.
+    fn lock_payment_route_snapshots(
+        map: &Mutex<LruCache<String, PaymentRouteSnapshot>>,
+    ) -> std::sync::MutexGuard<'_, LruCache<String, PaymentRouteSnapshot>> {
+        match map.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    /// CEP-8: remove and return the payment route snapshot for `event_id`, if any.
+    /// A single-lock map operation; called unconditionally at the top of `send_response`.
+    fn take_payment_route_snapshot(&self, event_id: &str) -> Option<PaymentRouteSnapshot> {
+        Self::lock_payment_route_snapshots(&self.payment_route_snapshots).pop(event_id)
+    }
+
+    /// CEP-8: put a taken snapshot back after a failed delivery, keeping its original expiry so
+    /// the failed publish does not extend the entry's life. The key was popped moments ago, so
+    /// the plain `put` cannot evict anything at capacity.
+    fn reinsert_payment_route_snapshot(&self, event_id: &str, entry: PaymentRouteSnapshot) {
+        Self::lock_payment_route_snapshots(&self.payment_route_snapshots)
+            .put(event_id.to_string(), entry);
+    }
+
+    /// CEP-8: record a payment route snapshot when `payment_required` is published.
+    ///
+    /// First write wins for the routing fields: a redelivery that re-runs the lifecycle
+    /// captures identical fields, so only the expiry is extended, and the entry can never be
+    /// clobbered mid-payment. At capacity the insert pops one expired entry first and refuses
+    /// (logging at `warn`) when every entry is live: `LruCache::put`'s recency eviction must
+    /// never remove a live snapshot, because a live snapshot is the only thing standing between
+    /// a multi-minute payment and a lost response.
+    fn record_payment_route_snapshot(
+        map: &Mutex<LruCache<String, PaymentRouteSnapshot>>,
+        event_id: &str,
+        snapshot: RouteSnapshot,
+        expires_at: Instant,
+    ) {
+        let mut cache = Self::lock_payment_route_snapshots(map);
+        if let Some(existing) = cache.peek_mut(event_id) {
+            if expires_at > existing.expires_at {
+                existing.expires_at = expires_at;
+            }
+            return;
+        }
+        if cache.len() == cache.cap().get() {
+            let now = Instant::now();
+            let expired_key = cache
+                .iter()
+                .find(|(_, entry)| entry.expires_at <= now)
+                .map(|(key, _)| key.clone());
+            match expired_key {
+                Some(key) => {
+                    cache.pop(&key);
+                }
+                None => {
+                    tracing::warn!(
+                        target: LOG_TARGET,
+                        event_id = %event_id,
+                        "payment route snapshot capacity reached with every entry live; \
+                         skipping this capture"
+                    );
+                    return;
+                }
+            }
+        }
+        cache.put(
+            event_id.to_string(),
+            PaymentRouteSnapshot {
+                snapshot,
+                expires_at,
+            },
+        );
     }
 
     /// CEP-41: decide how `send_response` should handle the final response for a
@@ -1714,22 +1909,78 @@ impl NostrServerTransport {
     }
 
     /// Send a notification to a specific client.
+    ///
+    /// A thin wrapper over the shared notification publish: it performs the wrap-kind map
+    /// lookup itself, then delegates, so this method and the injected
+    /// [`PaymentNotificationSender`] cannot drift on tag composition or wrap-kind policy.
     pub async fn send_notification(
         &self,
         client_pubkey_hex: &str,
         notification: &JsonRpcMessage,
         correlated_event_id: Option<&str>,
     ) -> Result<()> {
-        let mut sessions = self.sessions.write().await;
-        let session = sessions
-            .get_mut(client_pubkey_hex)
-            .ok_or_else(|| Error::Other(format!("No session for {client_pubkey_hex}")))?;
-        let is_encrypted = session.is_encrypted;
-        let supports_ephemeral = session.supports_ephemeral_gift_wrap;
+        // CEP-19: Look up mirrored wrap kind from correlated request
+        let correlated_wrap_kind = if let Some(event_id) = correlated_event_id {
+            self.request_wrap_kinds
+                .read()
+                .await
+                .get(event_id)
+                .copied()
+                .flatten()
+        } else {
+            None
+        };
+        Self::publish_payment_notification(
+            &self.base,
+            self.config.gift_wrap_mode,
+            &self.sessions,
+            correlated_wrap_kind,
+            &self.announcement_manager.get_common_tags(),
+            client_pubkey_hex,
+            correlated_event_id,
+            notification,
+        )
+        .await
+    }
 
-        // CEP-35: include discovery tags on first message to this client
-        let discovery_tags = self.take_pending_server_discovery_tags(session);
-        drop(sessions);
+    /// The notification publish itself, shared by [`send_notification`](Self::send_notification)
+    /// and the injected [`PaymentNotificationSender`] so the two forms cannot drift apart.
+    /// Static for the same reason the deferred and targeted publishes are: a detached caller has
+    /// no `self` in scope. The caller supplies the mirrored wrap kind; the `&self` wrapper looks
+    /// it up in the wrap-kind map, while the injected sender threads the value captured on the
+    /// inbound context, which stays correct after the stale-route sweep has reaped the map entry.
+    // Eight parameters is what a `&self`-less publish needs: the two transport handles, the
+    // session store, the threaded wrap kind, the captured discovery tag set, the two routing
+    // values, and the payload.
+    #[allow(clippy::too_many_arguments)]
+    async fn publish_payment_notification(
+        base: &BaseTransport,
+        gift_wrap_mode: GiftWrapMode,
+        sessions: &SessionStore,
+        correlated_wrap_kind: Option<u16>,
+        common_tags: &[Tag],
+        client_pubkey_hex: &str,
+        correlated_event_id: Option<&str>,
+        notification: &JsonRpcMessage,
+    ) -> Result<()> {
+        let (is_encrypted, supports_ephemeral, discovery_tags) = {
+            let mut sessions_w = sessions.write().await;
+            let session = sessions_w
+                .get_mut(client_pubkey_hex)
+                .ok_or_else(|| Error::Other(format!("No session for {client_pubkey_hex}")))?;
+            let is_encrypted = session.is_encrypted;
+            let supports_ephemeral = session.supports_ephemeral_gift_wrap;
+
+            // CEP-35: include discovery tags on first message to this client (one-shot latch,
+            // read and flipped under the same session guard the other fields are read under).
+            let discovery_tags = if session.has_sent_common_tags {
+                Vec::new()
+            } else {
+                session.has_sent_common_tags = true;
+                common_tags.to_vec()
+            };
+            (is_encrypted, supports_ephemeral, discovery_tags)
+        };
 
         let client_pubkey =
             PublicKey::from_hex(client_pubkey_hex).map_err(|e| Error::Other(e.to_string()))?;
@@ -1742,35 +1993,129 @@ impl NostrServerTransport {
 
         let tags = BaseTransport::compose_outbound_tags(&base_tags, &discovery_tags, &[]);
 
-        // CEP-19: Look up mirrored wrap kind from correlated request
-        let correlated_wrap_kind = if let Some(event_id) = correlated_event_id {
-            self.request_wrap_kinds
-                .read()
-                .await
-                .get(event_id)
-                .copied()
-                .flatten()
-        } else {
-            None
-        };
-
-        self.base
-            .send_mcp_message(
-                notification,
-                &client_pubkey,
-                CTXVM_MESSAGES_KIND,
-                tags,
-                Some(is_encrypted),
-                Self::select_outbound_notification_gift_wrap_kind(
-                    self.config.gift_wrap_mode,
-                    is_encrypted,
-                    correlated_wrap_kind,
-                    supports_ephemeral,
-                ),
-            )
-            .await?;
+        base.send_mcp_message(
+            notification,
+            &client_pubkey,
+            CTXVM_MESSAGES_KIND,
+            tags,
+            Some(is_encrypted),
+            Self::select_outbound_notification_gift_wrap_kind(
+                gift_wrap_mode,
+                is_encrypted,
+                correlated_wrap_kind,
+                supports_ephemeral,
+            ),
+        )
+        .await?;
 
         Ok(())
+    }
+
+    /// The same publish as [`send_notification`](Self::send_notification), as an injectable
+    /// closure for callers that have no `&self`, such as a payment middleware running on a
+    /// detached task. Both forms delegate to one publish, so the tag-composition policy and the
+    /// wrap-kind selection cannot diverge between them.
+    ///
+    /// When the notification is `notifications/payment_required`, the returned sender also
+    /// captures the request's routing fields (while the route is still fresh) into the payment
+    /// snapshot map, so the eventual result of a payment that outlives the 60 s stale-route
+    /// sweep is still delivered. If the route is already gone at capture time it logs at `warn`
+    /// and captures nothing; the request then fails exactly as an unpaid swept request does.
+    ///
+    /// `snapshot_ttl` is how long a captured snapshot stays deliverable: pass the same payment
+    /// TTL the middleware holding this sender is configured with, so the snapshot outlives every
+    /// payment that middleware can still be waiting on. Snapshot delivery does not need a live
+    /// session (a missing session only skips the one-shot discovery/disclosure latches), so a TTL
+    /// above the transport's session timeout still delivers the paid result; only the acceptance
+    /// notification dies with the session.
+    ///
+    /// **Call this after the announcement extra tags are set.** The returned sender captures
+    /// the server's discovery tag set at the moment it is built (the `&self` method reads it
+    /// live), so a sender built before those tags exist ships an empty discovery replay on a
+    /// session's first outbound event. Nothing enforces the order at compile time.
+    pub fn payment_notification_sender(&self, snapshot_ttl: Duration) -> PaymentNotificationSender {
+        let relay_pool = Arc::clone(&self.base.relay_pool);
+        let encryption_mode = self.base.encryption_mode;
+        let gift_wrap_mode = self.config.gift_wrap_mode;
+        let sessions = self.sessions.clone();
+        let event_routes = self.event_routes.clone();
+        let snapshots = Arc::clone(&self.payment_route_snapshots);
+        let common_tags = self.announcement_manager.get_common_tags();
+
+        Arc::new(
+            move |client_pubkey_hex, event_id, mirrored_wrap_kind, notification| {
+                let relay_pool = Arc::clone(&relay_pool);
+                let sessions = sessions.clone();
+                let event_routes = event_routes.clone();
+                let snapshots = Arc::clone(&snapshots);
+                let common_tags = common_tags.clone();
+                Box::pin(async move {
+                    let base = BaseTransport {
+                        relay_pool,
+                        encryption_mode,
+                        is_connected: true,
+                    };
+
+                    // CEP-8: capture the route snapshot at the moment of first emission, so the
+                    // eventual result survives the stale-route sweep (and a duplicate
+                    // delivery's route pop).
+                    if notification.method() == Some(PAYMENT_REQUIRED_METHOD) {
+                        match event_routes.get_route(&event_id).await {
+                            Some(route) => {
+                                let session_encrypted = sessions
+                                    .get_session(&client_pubkey_hex)
+                                    .await
+                                    .map(|s| s.is_encrypted);
+                                match (PublicKey::from_hex(&client_pubkey_hex), session_encrypted) {
+                                    (Ok(client_pubkey), Some(is_encrypted)) => {
+                                        Self::record_payment_route_snapshot(
+                                            &snapshots,
+                                            &event_id,
+                                            RouteSnapshot {
+                                                client_pubkey,
+                                                original_request_id: route.original_request_id,
+                                                is_encrypted,
+                                                mirrored_wrap_kind,
+                                            },
+                                            Instant::now() + snapshot_ttl,
+                                        );
+                                    }
+                                    _ => {
+                                        tracing::warn!(
+                                            target: LOG_TARGET,
+                                            event_id = %event_id,
+                                            "cannot capture payment route snapshot \
+                                             (invalid pubkey or no session)"
+                                        );
+                                    }
+                                }
+                            }
+                            None => {
+                                tracing::warn!(
+                                    target: LOG_TARGET,
+                                    event_id = %event_id,
+                                    "request route already gone when payment_required was \
+                                     published; no snapshot captured, the response will not \
+                                     survive the sweep"
+                                );
+                            }
+                        }
+                    }
+
+                    Self::publish_payment_notification(
+                        &base,
+                        gift_wrap_mode,
+                        &sessions,
+                        mirrored_wrap_kind,
+                        &common_tags,
+                        &client_pubkey_hex,
+                        Some(&event_id),
+                        &notification,
+                    )
+                    .await
+                })
+            },
+        )
     }
 
     /// Broadcast a notification to all initialized clients.
@@ -2695,6 +3040,7 @@ impl NostrServerTransport {
                                 effective_payment_interaction,
                                 &sessions,
                                 &tag_sources,
+                                &cancel,
                             )
                             .await;
                             continue;
@@ -2825,6 +3171,8 @@ impl NostrServerTransport {
                     &middlewares,
                     &tx,
                     &event_routes,
+                    &open_stream,
+                    &cancel,
                     mcp_msg,
                     sender_pubkey,
                     event_id,
@@ -2873,6 +3221,7 @@ impl NostrServerTransport {
         payment_interaction: Option<PaymentInteractionMode>,
         sessions: &SessionStore,
         tag_sources: &ResponseTagSources,
+        cancel: &CancellationToken,
     ) {
         // The outer progressToken keys the transfer (needed for accept + route).
         // String or number — defensive only: every known sender stringifies
@@ -2997,6 +3346,8 @@ impl NostrServerTransport {
                     chain,
                     tx,
                     event_routes,
+                    open_stream,
+                    cancel,
                     message,
                     sender_pubkey.to_string(),
                     event_id.to_string(),
@@ -5837,6 +6188,491 @@ mod tests {
         }
 
         transport.close().await.expect("close the server");
+    }
+
+    #[tokio::test]
+    async fn a_gated_request_releases_its_open_stream_slot() {
+        // A `tools/call` carrying a progressToken gets a writer slot created BEFORE dispatch, and
+        // `send_response` (whose deferral decision is the only other place that releases it) never
+        // runs for a request a middleware drops. The chain's drop-cleanup must therefore release
+        // the slot and its `(client, token)` index entry, or every gated streaming call leaks one
+        // of each until `close()`.
+        //
+        // The middleware records that it ran, and the test waits on that flag BEFORE inspecting
+        // the maps: without the gate, a poll racing ahead of the event loop sees the maps empty
+        // for the trivial reason that nothing has been processed yet, and the test proves nothing.
+        struct DropAll(Arc<std::sync::atomic::AtomicBool>);
+        #[async_trait::async_trait]
+        impl InboundMiddleware for DropAll {
+            async fn handle(
+                &self,
+                _message: JsonRpcMessage,
+                _ctx: &InboundContext,
+                _next: middleware::Next,
+            ) -> bool {
+                self.0.store(true, Ordering::SeqCst);
+                false
+            }
+        }
+
+        let (client_pool, server_pool) = MockRelayPool::create_pair();
+        let server_pubkey = server_pool.mock_public_key();
+        let s_pool = Arc::new(server_pool);
+
+        let mut transport = NostrServerTransport::with_relay_pool(
+            NostrServerTransportConfig::default()
+                .with_encryption_mode(EncryptionMode::Disabled)
+                .with_open_stream(OpenStreamConfig::default().with_enabled(true)),
+            Arc::clone(&s_pool) as Arc<dyn RelayPoolTrait>,
+        )
+        .await
+        .expect("server transport");
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        transport.add_inbound_middleware(Arc::new(DropAll(Arc::clone(&dropped))));
+
+        let mut server_rx = transport
+            .take_message_receiver()
+            .expect("server message receiver");
+        transport.start().await.expect("server start");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let client_keys = Keys::generate();
+        let call_event = streaming_call_event(
+            &client_keys,
+            server_pubkey,
+            serde_json::json!("gated-1"),
+            "gated-tok",
+            Vec::new(),
+        );
+        let call_event_id = call_event.id.to_hex();
+        client_pool
+            .publish_event(&call_event)
+            .await
+            .expect("publish the streaming call");
+
+        // Positive control first: wait until the middleware has really run (and dropped).
+        // The writer slot is created before dispatch, so once this flag is up the slot HAD
+        // existed and an empty map below can only mean the drop-cleanup released it.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !dropped.load(Ordering::SeqCst) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the gating middleware must have processed the request"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // The chain runs on a detached task; poll until the drop-cleanup has run.
+        let token_key = ServerOpenStreamState::client_token_key(
+            &client_keys.public_key().to_hex(),
+            "gated-tok",
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let slots_empty = transport.open_stream.lock_slots().is_empty();
+            let token_gone = !transport
+                .open_stream
+                .lock_token_index()
+                .contains_key(&token_key);
+            if slots_empty && token_gone {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the dropped request's writer slot / token-index entry must be released \
+                 (slots_empty={slots_empty}, token_gone={token_gone})"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        // The request never reached the handler.
+        assert!(
+            server_rx.try_recv().is_err(),
+            "a dropped request must not reach the handler"
+        );
+        // The cleanup pops the route before the slot, so by this point it must be gone.
+        assert!(
+            !transport.event_routes.has_event_route(&call_event_id).await,
+            "a dropped request must not keep a live route"
+        );
+
+        transport.close().await.expect("close the server");
+    }
+
+    /// The open-stream arm wins over the payments snapshot when a paid stream really
+    /// streams: the first responder delivers through the slot, the payments snapshot is
+    /// consumed unused, and a second responder for the same event id errors instead of
+    /// publishing a duplicate. Needs the `test-utils` fake processor.
+    #[cfg(feature = "test-utils")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_paid_stream_request_that_streams_delivers_through_the_open_stream_path() {
+        let (client_pool, server_pool) = MockRelayPool::create_pair();
+        let server_pubkey = server_pool.mock_public_key();
+        let s_pool = Arc::new(server_pool);
+
+        let mut transport = NostrServerTransport::with_relay_pool(
+            NostrServerTransportConfig::default()
+                .with_encryption_mode(EncryptionMode::Disabled)
+                .with_request_timeout(Duration::from_millis(100))
+                .with_cleanup_interval(Duration::from_millis(50))
+                .with_open_stream(OpenStreamConfig::default().with_enabled(true)),
+            Arc::clone(&s_pool) as Arc<dyn RelayPoolTrait>,
+        )
+        .await
+        .expect("server transport");
+        let sender = transport.payment_notification_sender(Duration::from_secs(300));
+        let options = crate::payments::ServerPaymentsOptions::new(
+            vec![Arc::new(
+                crate::payments::fakes::FakePaymentProcessor::with_options(
+                    crate::payments::fakes::FakePaymentProcessorOptions {
+                        pmi: "fake".to_string(),
+                        verify_delay_ms: 300,
+                        create_delay_ms: 0,
+                        ttl: None,
+                    },
+                ),
+            )],
+            vec![crate::payments::types::PricedCapability {
+                method: "tools/call".to_string(),
+                name: Some("streamer".to_string()),
+                amount: 21,
+                max_amount: None,
+                currency_unit: "sats".to_string(),
+                description: None,
+            }],
+        );
+        transport.add_inbound_middleware(crate::payments::create_server_payments_middleware(
+            crate::payments::ServerPaymentsMiddlewareParams::new(options, sender),
+        ));
+
+        let mut server_rx = transport
+            .take_message_receiver()
+            .expect("server message receiver");
+        transport.start().await.expect("server start");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let client_keys = Keys::generate();
+        client_pool
+            .publish_event(&streaming_call_event(
+                &client_keys,
+                server_pubkey,
+                serde_json::json!("paid-stream-1"),
+                "tok-17",
+                Vec::new(),
+            ))
+            .await
+            .expect("publish the paid streaming call");
+
+        // The request reaches the handler only after the 300 ms payment; the route was
+        // swept at 100 ms, but the writer slot (created before dispatch) survives.
+        let incoming = tokio::time::timeout(Duration::from_secs(3), server_rx.recv())
+            .await
+            .expect("the paid streaming request must reach the handler")
+            .expect("channel closed");
+        let event_id = incoming.event_id.clone();
+
+        let writer = transport
+            .get_open_stream_writer(&event_id)
+            .expect("the writer slot must survive the payment");
+        writer.start().await.expect("start the stream");
+        writer.write("chunk".to_string()).await.expect("stream");
+        writer.close().await.expect("close the stream");
+
+        // The route must be gone before the first response, or either responder below
+        // could take the ordinary path and the precedence claim would go untested.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while transport.event_routes.has_event_route(&event_id).await {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the sweep must reap the route during the payment"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        transport
+            .send_response(
+                &event_id,
+                list_result_response(serde_json::json!("paid-stream-1")),
+            )
+            .await
+            .expect("the streamed response delivers through the open-stream slot");
+
+        let delivered = s_pool
+            .stored_events()
+            .await
+            .into_iter()
+            .filter(|e| {
+                e.kind == Kind::Custom(CTXVM_MESSAGES_KIND)
+                    && e.pubkey == server_pubkey
+                    && e.content.contains("paid-stream-1")
+            })
+            .count();
+        assert_eq!(delivered, 1, "exactly one response delivery");
+
+        // A second responder finds no slot, no route, and no payments snapshot (it was
+        // consumed by the first call): it must error, never publish a duplicate.
+        let second = transport
+            .send_response(
+                &event_id,
+                list_result_response(serde_json::json!("paid-stream-1")),
+            )
+            .await;
+        assert!(
+            second.is_err(),
+            "a second responder must not double-deliver"
+        );
+        let delivered_after = s_pool
+            .stored_events()
+            .await
+            .into_iter()
+            .filter(|e| {
+                e.kind == Kind::Custom(CTXVM_MESSAGES_KIND)
+                    && e.pubkey == server_pubkey
+                    && e.content.contains("paid-stream-1")
+            })
+            .count();
+        assert_eq!(delivered_after, 1, "still exactly one response delivery");
+
+        transport.close().await.expect("close the server");
+    }
+
+    /// A failed snapshot delivery re-inserts the snapshot (with its original expiry),
+    /// keeping a PAID delivery retryable the same way the normal path's route
+    /// re-registration keeps an unpaid one retryable.
+    #[tokio::test]
+    async fn a_failed_snapshot_delivery_reinserts_the_snapshot() {
+        let pool: Arc<dyn RelayPoolTrait> = Arc::new(MockRelayPool::new());
+        let transport = NostrServerTransport::with_relay_pool(
+            NostrServerTransportConfig::default().with_encryption_mode(EncryptionMode::Disabled),
+            pool,
+        )
+        .await
+        .expect("server transport");
+
+        // A snapshot stored under a non-hex event id makes the delivery's own id parse
+        // fail, which is the only publish-adjacent failure reachable without a relay
+        // that can fail on command.
+        NostrServerTransport::record_payment_route_snapshot(
+            &transport.payment_route_snapshots,
+            "not-a-hex-event-id",
+            RouteSnapshot {
+                client_pubkey: Keys::generate().public_key(),
+                original_request_id: serde_json::json!("orig-1"),
+                is_encrypted: false,
+                mirrored_wrap_kind: None,
+            },
+            Instant::now() + Duration::from_secs(60),
+        );
+
+        let result = transport
+            .send_response(
+                "not-a-hex-event-id",
+                list_result_response(serde_json::json!("orig-1")),
+            )
+            .await;
+        assert!(result.is_err(), "the delivery must fail");
+        assert!(
+            transport
+                .take_payment_route_snapshot("not-a-hex-event-id")
+                .is_some(),
+            "the snapshot must be re-inserted so a paid delivery stays retryable"
+        );
+    }
+
+    /// A correlated notification mirrors the wrap kind of the request it answers, not the
+    /// session's learned capabilities. The fixture is the one case where the two disagree:
+    /// a mixed-wrap client, whose session learned ephemeral support while this particular
+    /// request arrived on a persistent wrap. Falling back to session state would pick the ephemeral
+    /// kind, and an ephemeral wrap to a briefly-offline client is silently lost (relays do
+    /// not store it), so the mirror is load-bearing, not cosmetic.
+    #[tokio::test]
+    async fn a_correlated_notification_mirrors_the_requests_wrap_kind() {
+        let pool = Arc::new(MockRelayPool::new());
+        let transport = NostrServerTransport::with_relay_pool(
+            NostrServerTransportConfig::default(),
+            Arc::clone(&pool) as Arc<dyn RelayPoolTrait>,
+        )
+        .await
+        .expect("server transport");
+
+        let client_keys = Keys::generate();
+        let client_hex = client_keys.public_key().to_hex();
+        {
+            let mut sessions_w = transport.sessions.write().await;
+            let mut session = ClientSession::new(true);
+            session.supports_ephemeral_gift_wrap = true;
+            sessions_w.put(client_hex.clone(), session);
+        }
+        let mirrored_id = "ab".repeat(32);
+        {
+            let mut kinds_w = transport.request_wrap_kinds.write().await;
+            kinds_w.insert(mirrored_id.clone(), Some(GIFT_WRAP_KIND));
+        }
+
+        let notification = JsonRpcMessage::Notification(JsonRpcNotification {
+            jsonrpc: "2.0".to_string(),
+            method: "notifications/progress".to_string(),
+            params: None,
+        });
+
+        // Correlated to a persistent-wrap request: the notification must mirror 1059.
+        transport
+            .send_notification(&client_hex, &notification, Some(&mirrored_id))
+            .await
+            .expect("send the correlated notification");
+        let mirrored_kind = pool
+            .stored_events()
+            .await
+            .last()
+            .expect("published")
+            .kind
+            .as_u16();
+        assert_eq!(
+            mirrored_kind, GIFT_WRAP_KIND,
+            "a correlated notification must mirror the request's own wrap kind"
+        );
+
+        // Control: with no correlated request to mirror, the session's learned ephemeral
+        // support decides, so a wrapper that dropped the lookup is distinguishable.
+        transport
+            .send_notification(&client_hex, &notification, Some(&"cd".repeat(32)))
+            .await
+            .expect("send the uncorrelated notification");
+        let fallback_kind = pool
+            .stored_events()
+            .await
+            .last()
+            .expect("published")
+            .kind
+            .as_u16();
+        assert_eq!(
+            fallback_kind, EPHEMERAL_GIFT_WRAP_KIND,
+            "without a mirrored kind the learned-ephemeral fallback applies"
+        );
+    }
+
+    /// A snapshot re-capture (a redelivery whose pending entry expired re-runs the
+    /// lifecycle) keeps the first capture's routing fields but extends the expiry to the
+    /// later stamp, so a re-run near the original expiry cannot have its snapshot purged
+    /// mid-payment. An earlier stamp never shortens it.
+    #[tokio::test]
+    async fn a_snapshot_recapture_extends_the_expiry() {
+        let pool: Arc<dyn RelayPoolTrait> = Arc::new(MockRelayPool::new());
+        let transport =
+            NostrServerTransport::with_relay_pool(NostrServerTransportConfig::default(), pool)
+                .await
+                .expect("server transport");
+        let snapshot = || RouteSnapshot {
+            client_pubkey: Keys::generate().public_key(),
+            original_request_id: serde_json::json!("re-1"),
+            is_encrypted: false,
+            mirrored_wrap_kind: None,
+        };
+        let event_id = "ef".repeat(32);
+        let base = Instant::now();
+        NostrServerTransport::record_payment_route_snapshot(
+            &transport.payment_route_snapshots,
+            &event_id,
+            snapshot(),
+            base + Duration::from_secs(60),
+        );
+        NostrServerTransport::record_payment_route_snapshot(
+            &transport.payment_route_snapshots,
+            &event_id,
+            snapshot(),
+            base + Duration::from_secs(120),
+        );
+        {
+            let cache = NostrServerTransport::lock_payment_route_snapshots(
+                &transport.payment_route_snapshots,
+            );
+            assert_eq!(
+                cache.peek(&event_id).expect("entry").expires_at,
+                base + Duration::from_secs(120),
+                "a later re-capture must extend the expiry"
+            );
+        }
+        NostrServerTransport::record_payment_route_snapshot(
+            &transport.payment_route_snapshots,
+            &event_id,
+            snapshot(),
+            base + Duration::from_secs(30),
+        );
+        {
+            let cache = NostrServerTransport::lock_payment_route_snapshots(
+                &transport.payment_route_snapshots,
+            );
+            assert_eq!(
+                cache.peek(&event_id).expect("entry").expires_at,
+                base + Duration::from_secs(120),
+                "an earlier re-capture must never shorten the expiry"
+            );
+        }
+    }
+
+    /// The snapshot map shares the crate's LRU default. The bound is a memory backstop
+    /// only (entries are meant to outlive traffic for the whole payment window), so it
+    /// is pinned by value; no test drives real eviction at this size.
+    #[tokio::test]
+    async fn payment_snapshot_map_bound_matches_the_shared_lru_default() {
+        let pool: Arc<dyn RelayPoolTrait> = Arc::new(MockRelayPool::new());
+        let transport =
+            NostrServerTransport::with_relay_pool(NostrServerTransportConfig::default(), pool)
+                .await
+                .expect("server transport");
+        assert_eq!(
+            NostrServerTransport::lock_payment_route_snapshots(&transport.payment_route_snapshots)
+                .cap()
+                .get(),
+            DEFAULT_LRU_SIZE
+        );
+    }
+
+    /// A snapshot whose payment window has passed is dropped by the cleanup task's
+    /// tick, so a timed-out payment's residue does not sit until LRU eviction.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_timed_out_payments_snapshot_is_purged_on_a_cleanup_tick() {
+        let pool: Arc<dyn RelayPoolTrait> = Arc::new(MockRelayPool::new());
+        let mut transport = NostrServerTransport::with_relay_pool(
+            NostrServerTransportConfig::default()
+                .with_encryption_mode(EncryptionMode::Disabled)
+                .with_cleanup_interval(Duration::from_millis(50)),
+            pool,
+        )
+        .await
+        .expect("server transport");
+
+        let expired_id = "ab".repeat(32);
+        NostrServerTransport::record_payment_route_snapshot(
+            &transport.payment_route_snapshots,
+            &expired_id,
+            RouteSnapshot {
+                client_pubkey: Keys::generate().public_key(),
+                original_request_id: serde_json::json!("stale-1"),
+                is_encrypted: false,
+                mirrored_wrap_kind: None,
+            },
+            Instant::now() - Duration::from_secs(1),
+        );
+
+        transport.start().await.expect("start");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let present = NostrServerTransport::lock_payment_route_snapshots(
+                &transport.payment_route_snapshots,
+            )
+            .peek(&expired_id)
+            .is_some();
+            if !present {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the cleanup tick must purge an expired snapshot"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        transport.close().await.expect("close");
     }
 
     // ── Targeted response sender ─────────────────────────────────────────────

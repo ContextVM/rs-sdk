@@ -17,5 +17,6 @@ pub use open_stream::{
     OpenStreamRegistryPolicy, OpenStreamSession, OpenStreamWriter,
 };
 pub use server::{
-    NostrServerTransport, NostrServerTransportConfig, ServerEventRouteStore, TargetedResponseSender,
+    NostrServerTransport, NostrServerTransportConfig, PaymentNotificationSender,
+    ServerEventRouteStore, TargetedResponseSender,
 };

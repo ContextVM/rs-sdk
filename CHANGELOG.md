@@ -37,6 +37,21 @@
     tag sets when it is built, so build it after those tags are set.
     Both `send_targeted_response` and the `TargetedResponseSender` alias are
     re-exported from `contextvm_sdk::transport`.
+  - Transparent-lifecycle payment gating on the server transport: a priced invocation now
+    triggers `notifications/payment_required` and reaches the MCP handler only after the
+    configured payment processor verifies settlement, with `notifications/payment_accepted`
+    sent on the way. A dynamic pricing callback can reject the invocation (emitting
+    `notifications/payment_rejected`) or waive payment (forwarding it untouched). Duplicate
+    deliveries of the same request event share one payment rather than charging twice, and
+    once an invoice has been issued a later failure never re-charges a client who already
+    paid: a verified payment is delivered even if the acceptance notification cannot be
+    published. Because a payment can outlast the 60 s stale-route sweep, the transport now
+    captures the request's routing fields when it emits `payment_required` and delivers the
+    eventual result from that capture when the route is gone.
+    `payment_notification_sender` returns the payment-notification publish as an injectable
+    closure for a detached middleware, alongside the existing `targeted_response_sender`.
+    The middleware is not registered by default; registration arrives with the payments
+    configuration entry point.
 
 ### Fixed
 
@@ -82,6 +97,11 @@
   construct `ClientSession` via `ClientSession::new` and destructure either struct with
   `..` rather than exhaustively. This matches `InboundContext`, which is already
   `#[non_exhaustive]`, and makes future field additions non-breaking.
+- The server transport's inbound middleware context now carries a per-event cancellation
+  token derived from the transport's shutdown token, so a middleware doing long-running
+  work stops when the transport closes. `send_notification`'s body moved into a shared
+  publish that both it and the new injectable sender use, so the two cannot drift. A
+  gated (dropped) request now releases the open-stream slot it reserved.
 
 ## [0.2.2] - 2026-07-29
 
