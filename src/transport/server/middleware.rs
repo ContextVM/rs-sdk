@@ -6,6 +6,7 @@
 //! registered: with an empty chain, `dispatch_inbound` reproduces today's direct
 //! `tx.send(IncomingRequest)`.
 
+use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -14,6 +15,7 @@ use async_trait::async_trait;
 use futures::future::FutureExt; // .catch_unwind()
 use nostr_sdk::prelude::Event;
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use super::{IncomingRequest, ServerEventRouteStore, ServerOpenStreamState, LOG_TARGET};
@@ -142,6 +144,7 @@ pub(crate) fn dispatch_inbound(
     tx: &UnboundedSender<IncomingRequest>,
     event_routes: &ServerEventRouteStore,
     open_stream: &ServerOpenStreamState,
+    request_wrap_kinds: &Arc<RwLock<HashMap<String, Option<u16>>>>,
     cancel: &CancellationToken,
     message: JsonRpcMessage,
     client_pubkey: String,
@@ -187,6 +190,7 @@ pub(crate) fn dispatch_inbound(
         tx.clone(),
         event_routes.clone(),
         open_stream.clone(),
+        Arc::clone(request_wrap_kinds),
         message,
         event,
     );
@@ -194,12 +198,14 @@ pub(crate) fn dispatch_inbound(
 
 /// Detach the chain onto its own task so a slow middleware (e.g. a payment verification) never
 /// blocks the single event-loop task that also drains the relay subscription.
+#[allow(clippy::too_many_arguments)]
 fn spawn_inbound_chain(
     chain: Arc<[Arc<dyn InboundMiddleware>]>,
     ctx: Arc<InboundContext>,
     tx: UnboundedSender<IncomingRequest>,
     event_routes: ServerEventRouteStore,
     open_stream: ServerOpenStreamState,
+    request_wrap_kinds: Arc<RwLock<HashMap<String, Option<u16>>>>,
     message: JsonRpcMessage,
     event: Option<Event>,
 ) {
@@ -209,18 +215,21 @@ fn spawn_inbound_chain(
         tx,
         event_routes,
         open_stream,
+        request_wrap_kinds,
         message,
         event,
     ));
 }
 
 /// The awaitable chain runner. Awaited directly in tests; spawned in production.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_inbound_chain(
     chain: Arc<[Arc<dyn InboundMiddleware>]>,
     ctx: Arc<InboundContext>,
     tx: UnboundedSender<IncomingRequest>,
     event_routes: ServerEventRouteStore,
     open_stream: ServerOpenStreamState,
+    request_wrap_kinds: Arc<RwLock<HashMap<String, Option<u16>>>>,
     message: JsonRpcMessage,
     event: Option<Event>,
 ) {
@@ -261,7 +270,20 @@ pub(crate) async fn run_inbound_chain(
     // no-op; the oversized re-inject path registers a route even for a reassembled notification, so
     // there `pop` is a real (harmless) removal.
     if !reached.load(Ordering::SeqCst) {
-        event_routes.pop(&event_id).await;
+        let popped_route = event_routes.pop(&event_id).await;
+
+        // Release the wrap-kind entry the transport reserved before dispatch (CEP-19),
+        // but ONLY when this cleanup's own pop returned the route. A returned route
+        // proves no concurrent responder consumed it, so no `send_response` for this
+        // event can be between its route pop and its wrap-kind read; removing
+        // unconditionally would race that pop-then-read and degrade wrap-kind mirroring
+        // on the response. When the pop returns `None`, whoever consumed the route
+        // (a responder, the stale-route sweep, session cleanup, or another duplicate's
+        // cleanup) reclaims the wrap-kind entry itself, or no entry was ever inserted
+        // (a dropped notification on the primary path).
+        if popped_route.is_some() {
+            request_wrap_kinds.write().await.remove(&event_id);
+        }
     }
 
     // A gated (dropped) request also releases the open-stream slot the transport reserved for it
@@ -345,6 +367,7 @@ mod tests {
             tx,
             event_routes.clone(),
             open_stream_state(),
+            Arc::new(RwLock::new(HashMap::new())),
             message,
             None,
         )
@@ -444,6 +467,7 @@ mod tests {
             &tx,
             &routes,
             &open_stream_state(),
+            &Arc::new(RwLock::new(HashMap::new())),
             &CancellationToken::new(),
             req("1", "tools/call"),
             "client_pk".to_string(),
@@ -608,6 +632,128 @@ mod tests {
         assert!(
             routes.has_event_route("e1").await,
             "a delivered request's route must survive a wrong return value"
+        );
+    }
+
+    /// Run the chain with an explicit wrap-kind map (the [`drive`] helper hides it).
+    async fn drive_with_wrap_kinds(
+        mws: Vec<Arc<dyn InboundMiddleware>>,
+        message: JsonRpcMessage,
+        event_id: &str,
+        event_routes: &ServerEventRouteStore,
+        wrap_kinds: &Arc<RwLock<HashMap<String, Option<u16>>>>,
+    ) {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let ctx = Arc::new(InboundContext {
+            client_pubkey: "client_pk".to_string(),
+            request_event_id: event_id.to_string(),
+            is_encrypted: false,
+            mirrored_wrap_kind: None,
+            client_pmis: None,
+            payment_interaction: None,
+            cancel: CancellationToken::new(),
+        });
+        run_inbound_chain(
+            chain_of(mws),
+            ctx,
+            tx,
+            event_routes.clone(),
+            open_stream_state(),
+            Arc::clone(wrap_kinds),
+            message,
+            None,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn gated_drop_releases_request_wrap_kinds() {
+        let routes = ServerEventRouteStore::new();
+        let wrap_kinds: Arc<RwLock<HashMap<String, Option<u16>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+
+        // A dropped request whose route is still present at cleanup: the entry the
+        // transport reserved before dispatch must be released.
+        routes
+            .register(
+                "e1".to_string(),
+                "client_pk".to_string(),
+                serde_json::json!("1"),
+                None,
+            )
+            .await;
+        wrap_kinds
+            .write()
+            .await
+            .insert("e1".to_string(), Some(1059));
+        drive_with_wrap_kinds(
+            vec![Arc::new(DropAll)],
+            req("1", "tools/call"),
+            "e1",
+            &routes,
+            &wrap_kinds,
+        )
+        .await;
+        assert!(
+            !wrap_kinds.read().await.contains_key("e1"),
+            "a dropped request must release its wrap-kind entry"
+        );
+
+        // Positive control: the same probe sees a delivered request's entry SURVIVE
+        // (cleanup never runs when the terminal was reached), proving the assertion
+        // above can observe insertions at all.
+        routes
+            .register(
+                "e2".to_string(),
+                "client_pk".to_string(),
+                serde_json::json!("2"),
+                None,
+            )
+            .await;
+        wrap_kinds
+            .write()
+            .await
+            .insert("e2".to_string(), Some(1059));
+        drive_with_wrap_kinds(
+            vec![Arc::new(ForwardAll)],
+            req("2", "tools/call"),
+            "e2",
+            &routes,
+            &wrap_kinds,
+        )
+        .await;
+        assert!(
+            wrap_kinds.read().await.contains_key("e2"),
+            "a delivered request's entry belongs to send_response, not the cleanup"
+        );
+    }
+
+    #[tokio::test]
+    async fn drop_cleanup_with_a_consumed_route_leaves_the_wrap_kind_entry() {
+        // The guard: when the cleanup's own route pop returns None (a concurrent
+        // responder consumed the route first), the wrap-kind entry must SURVIVE, since
+        // that responder may be between its route pop and its wrap-kind read, and its
+        // own cleanup reclaims the entry after publish. No route is registered here,
+        // which deterministically models the consumed-route case.
+        let routes = ServerEventRouteStore::new();
+        let wrap_kinds: Arc<RwLock<HashMap<String, Option<u16>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        wrap_kinds
+            .write()
+            .await
+            .insert("e3".to_string(), Some(1059));
+
+        drive_with_wrap_kinds(
+            vec![Arc::new(DropAll)],
+            req("3", "tools/call"),
+            "e3",
+            &routes,
+            &wrap_kinds,
+        )
+        .await;
+        assert!(
+            wrap_kinds.read().await.contains_key("e3"),
+            "a consumed route means another party owns (and reclaims) the entry"
         );
     }
 

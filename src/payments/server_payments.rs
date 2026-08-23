@@ -1042,6 +1042,7 @@ mod lifecycle_tests {
                 self.tx.clone(),
                 self.routes.clone(),
                 self.open_stream.clone(),
+                Arc::new(tokio::sync::RwLock::new(HashMap::new())),
                 message,
                 None,
             )
