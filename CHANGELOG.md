@@ -56,8 +56,30 @@
     configuration entry point.
     Setting `max_pending_payments` to zero refuses every priced request, rather than running
     the server's payments through room for one.
+  - Explicit-gating payment lifecycle on the server transport: in an `explicit_gating`
+    session a priced invocation is now answered immediately with a JSON-RPC `-32042`
+    Payment Required error carrying one payment option, and the request is dropped
+    rather than held. A detached task verifies the payment and records a single-use
+    grant in the authorization store, keyed by canonical invocation identity; a repeat
+    invocation during verification draws `-32043` Payment Pending, and a later retry
+    with the same method and params claims the grant atomically and reaches the MCP
+    handler. A pricing-callback rejection answers `-32000` with the policy message; a
+    waiver forwards for free. The store gains one composed operation,
+    `claim_or_set_pending` (returning the new `ClaimOrPending`), which checks the grant
+    and the pending slot in a single critical section so a settlement landing between
+    the two checks can never mint a second invoice against an unclaimed paid grant.
+    Registration arrives with the payments configuration entry point, alongside the
+    transparent middleware's.
 
 ### Fixed
+
+- Server transport: a request dropped by the inbound middleware chain (a gated priced
+  invocation, a rejected payment, a chain panic) leaked its CEP-19 wrap-kind tracking
+  entry. On the primary request path the entry lingered until session cleanup; on the
+  CEP-22 oversized re-inject path nothing ever reclaimed it. The seam's drop-cleanup
+  now releases the entry on both paths, and only when its own route pop confirms no
+  concurrent responder owns the event, so response wrap-kind mirroring is never
+  degraded by the release.
 
 - rmcp server worker: a single inbound message that was not an `initialize` request could
   permanently stop the server for every client. All Nostr clients are multiplexed through one

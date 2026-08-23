@@ -19,6 +19,7 @@ pub mod authorization_store;
 pub mod canonical;
 pub mod constants;
 pub mod errors;
+pub mod server_explicit_gating;
 pub mod server_payments;
 pub(crate) mod server_payments_utils;
 pub mod tags;
@@ -28,12 +29,15 @@ pub mod types;
 #[cfg(feature = "test-utils")]
 pub mod fakes;
 
-pub use authorization_store::AuthorizationStore;
+pub use authorization_store::{AuthorizationStore, ClaimOrPending};
 pub use canonical::{
     compute_canonical_invocation_hash, compute_canonical_invocation_identity,
     CanonicalInvocationIdentity,
 };
 pub use errors::PaymentError;
+pub use server_explicit_gating::{
+    create_explicit_gating_middleware, ExplicitGatingMiddlewareParams,
+};
 pub use server_payments::{
     create_server_payments_middleware, ServerPaymentsMiddlewareParams, ServerPaymentsOptions,
 };
