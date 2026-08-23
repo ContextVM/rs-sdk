@@ -46,6 +46,27 @@ struct Inner {
     pending: LruCache<String, Instant>,
 }
 
+/// The outcome of [`AuthorizationStore::claim_or_set_pending`], the explicit-gating
+/// middleware's entry sequence.
+///
+/// `#[non_exhaustive]`: CEP-8 leaves room for policies granting a different number of
+/// executions per payment, so a future variant must not be a breaking change.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimOrPending {
+    /// A live grant was consumed (single-use): the caller forwards the invocation.
+    Claimed,
+    /// No grant and no live pending existed; this call transitioned the identity to
+    /// pending and the caller now owns the offer cycle (emits `-32042`).
+    PendingSet,
+    /// A payment is already pending and still active: the caller emits `-32043`.
+    AlreadyPending {
+        /// Milliseconds until the live pending entry expires, measured at the same
+        /// instant the pending check ran (so it cannot race to a stale read).
+        remaining_ms: u64,
+    },
+}
+
 /// A bounded, TTL-aware store for explicit-gating authorizations (pending + granted).
 ///
 /// Cheap to clone (`Arc`-backed) and `Send + Sync`: the explicit-gating middleware and
@@ -197,6 +218,49 @@ impl AuthorizationStore {
     pub fn clear_pending(&self, id: &CanonicalInvocationIdentity) {
         let key = Self::key(id);
         self.lock().pending.pop(&key);
+    }
+
+    /// Atomically claim a live grant for `id`, or else transition it to pending: the
+    /// explicit-gating middleware's entry sequence, composed into one critical section.
+    ///
+    /// In order, under one lock: a live grant is consumed ([`ClaimOrPending::Claimed`];
+    /// any pending entry is left intact, since it belongs to another offer cycle); an
+    /// expired grant is dropped; a live pending entry parks the caller
+    /// ([`ClaimOrPending::AlreadyPending`] with the remaining TTL computed from the same
+    /// instant); otherwise pending is set for `ttl_ms` ([`ClaimOrPending::PendingSet`]).
+    ///
+    /// The composition exists because the two-call sequence (`claim` then
+    /// `try_set_pending`) is atomic in ts-sdk only through JavaScript run-to-completion.
+    /// Here the detached verify task grants from another thread, and a grant landing
+    /// between the two calls would mint a spurious second invoice while a paid grant
+    /// sits unclaimed. One critical section removes that interleaving entirely.
+    pub fn claim_or_set_pending(
+        &self,
+        id: &CanonicalInvocationIdentity,
+        ttl_ms: u64,
+    ) -> ClaimOrPending {
+        let now = Instant::now();
+        let expires_at = now + Duration::from_millis(ttl_ms);
+        let key = Self::key(id);
+
+        let mut inner = self.lock();
+        // Grant first (the ts order): a found grant is popped unconditionally and judged
+        // on the returned expiry, exactly like `claim`. An expired grant falls through.
+        if let Some(grant_expires) = inner.authorizations.pop(&key) {
+            if now <= grant_expires {
+                return ClaimOrPending::Claimed;
+            }
+        }
+        // Then pending, exactly like `try_set_pending`, except the remaining TTL is
+        // computed from the same `now` inside the same critical section.
+        if let Some(existing) = inner.pending.get(&key).copied() {
+            if now <= existing {
+                let remaining_ms = existing.saturating_duration_since(now).as_millis() as u64;
+                return ClaimOrPending::AlreadyPending { remaining_ms };
+            }
+        }
+        inner.pending.put(key, expires_at);
+        ClaimOrPending::PendingSet
     }
 }
 
@@ -461,6 +525,181 @@ mod tests {
         store.grant(&id_a, 10_000);
         assert!(!store.claim(&id_c)); // a different invocation has no grant
         assert!(store.claim(&id_a));
+    }
+
+    // ── the composed claim-or-set-pending entry sequence ───────────────────────────────
+
+    #[test]
+    fn claim_or_set_pending_claims_a_live_grant() {
+        let store = AuthorizationStore::new();
+        let id = default_id();
+
+        store.grant(&id, 10_000);
+        assert_eq!(
+            store.claim_or_set_pending(&id, 10_000),
+            ClaimOrPending::Claimed,
+            "a live grant must be consumed, not re-offered"
+        );
+        // Single-use survives the composition: the second call finds no grant and
+        // starts a fresh offer cycle.
+        assert_eq!(
+            store.claim_or_set_pending(&id, 10_000),
+            ClaimOrPending::PendingSet
+        );
+    }
+
+    #[test]
+    fn claim_or_set_pending_parks_a_live_pending() {
+        // Live half: a not-yet-expired assertion, so the TTL stays well above the
+        // scheduler-stall flake floor (>= 100 ms).
+        let store = AuthorizationStore::new();
+        let id = default_id();
+        assert_eq!(
+            store.claim_or_set_pending(&id, 10_000),
+            ClaimOrPending::PendingSet
+        );
+        match store.claim_or_set_pending(&id, 10_000) {
+            ClaimOrPending::AlreadyPending { remaining_ms } => {
+                assert!(remaining_ms > 0, "a live pending has time left");
+                assert!(
+                    remaining_ms <= 10_000,
+                    "remaining cannot exceed the set TTL"
+                );
+            }
+            other => panic!("expected AlreadyPending, got {other:?}"),
+        }
+
+        // Expired half: an expired-direction assertion, so a tiny TTL plus a real
+        // sleep is flake-free (a sleep only oversleeps).
+        let store = AuthorizationStore::new();
+        assert_eq!(
+            store.claim_or_set_pending(&id, 20),
+            ClaimOrPending::PendingSet
+        );
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            store.claim_or_set_pending(&id, 10_000),
+            ClaimOrPending::PendingSet,
+            "an expired pending is overwritten, not parked behind"
+        );
+    }
+
+    #[test]
+    fn claim_or_set_pending_prefers_grant_over_pending() {
+        // Populate BOTH maps: grant first (grant() clears pending for the key, so the
+        // pending write must come second, simulating a second offer cycle in flight).
+        let store = AuthorizationStore::new();
+        let id = default_id();
+        store.grant(&id, 10_000);
+        assert!(store.try_set_pending(&id, 10_000));
+
+        assert_eq!(
+            store.claim_or_set_pending(&id, 10_000),
+            ClaimOrPending::Claimed,
+            "the grant wins over a coexisting pending (claim-then-pending order)"
+        );
+        assert!(
+            store.get_pending_remaining_ms(&id) > 0,
+            "the claim must not clear another cycle's pending"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_claim_or_set_pending_yields_one_claim() {
+        const N: usize = 64;
+        const ROUNDS: usize = 50;
+        let id = default_id();
+
+        for _ in 0..ROUNDS {
+            let store = AuthorizationStore::new();
+            store.grant(&id, 10_000);
+
+            let barrier = Arc::new(Barrier::new(N));
+            let mut set = JoinSet::new();
+            for _ in 0..N {
+                let store = store.clone();
+                let barrier = barrier.clone();
+                let id = id.clone();
+                set.spawn(async move {
+                    barrier.wait().await;
+                    store.claim_or_set_pending(&id, 10_000)
+                });
+            }
+
+            let (mut claimed, mut pending_set, mut already) = (0usize, 0usize, 0usize);
+            while let Some(res) = set.join_next().await {
+                match res.unwrap() {
+                    ClaimOrPending::Claimed => claimed += 1,
+                    ClaimOrPending::PendingSet => pending_set += 1,
+                    ClaimOrPending::AlreadyPending { .. } => already += 1,
+                }
+            }
+            assert_eq!(claimed, 1, "exactly one caller consumes the single grant");
+            assert_eq!(pending_set, 1, "exactly one loser wins the pending slot");
+            assert_eq!(already, N - 2, "everyone else parks behind the pending");
+        }
+    }
+
+    // Real threads and real time (no async): two OS threads rendezvous on a reused
+    // std barrier per round, which is what makes the interleaving genuinely parallel.
+    #[test]
+    fn grant_between_ops_cannot_be_missed() {
+        // The composition invariant: with a live pending pre-set and one concurrent
+        // grant, the composed op must NEVER answer PendingSet: at any serialization
+        // point it sees either the live pending (parks) or the landed grant (claims).
+        // A sequential claim-then-set-pending port loses this on the schedule where
+        // the grant lands between its two critical sections (popping the pending on
+        // the way in), minting a spurious second invoice while a paid grant sits
+        // unclaimed. That window is nanoseconds wide, so this probe hammers it: one
+        // shared store, a fresh identity per round, and a reused two-thread barrier
+        // whose wake jitter scatters the granter across the caller's whole window.
+        // Kill margin: against the sequential port this trips a handful of times per
+        // 100k rounds (machine- and load-dependent), so it can never fail on correct
+        // code but a single suspicious GREEN under a refactor of this operation is not
+        // proof; re-run it a few times before trusting one.
+        const ROUNDS: usize = 100_000;
+        let store = AuthorizationStore::new();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let round_id = |i: usize| id("client", &format!("h{i}"));
+
+        let granter = {
+            let store = store.clone();
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                for i in 0..ROUNDS {
+                    let id = round_id(i);
+                    barrier.wait();
+                    store.grant(&id, 10_000);
+                    barrier.wait();
+                }
+            })
+        };
+
+        let mut violations = Vec::new();
+        for i in 0..ROUNDS {
+            let id = round_id(i);
+            assert!(store.try_set_pending(&id, 10_000));
+            barrier.wait();
+            let outcome = store.claim_or_set_pending(&id, 10_000);
+            barrier.wait();
+            match outcome {
+                // The op ran after the grant: it consumed it, nothing is claimable.
+                ClaimOrPending::Claimed => assert!(!store.claim(&id)),
+                // The op ran before the grant (the live pending parked it): the grant
+                // landed afterwards and must still be claimable, not shadowed.
+                ClaimOrPending::AlreadyPending { .. } => assert!(store.claim(&id)),
+                // The spurious-invoice cell: the grant popped the pending between the
+                // two halves and the op started a fresh offer cycle anyway.
+                ClaimOrPending::PendingSet => {
+                    violations.push((i, store.claim(&id), store.get_pending_remaining_ms(&id)))
+                }
+            }
+        }
+        granter.join().expect("granter thread");
+        assert!(
+            violations.is_empty(),
+            "the composed op must never answer PendingSet under a concurrent grant: {violations:?}"
+        );
     }
 
     #[test]
