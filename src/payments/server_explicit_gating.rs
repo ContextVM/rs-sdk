@@ -63,8 +63,9 @@ pub struct ExplicitGatingMiddlewareParams {
     /// ([`NostrServerTransport::targeted_response_sender`](crate::transport::server::NostrServerTransport::targeted_response_sender)).
     pub sender: TargetedResponseSender,
     /// The store of pending and granted payment authorizations. Injected, not constructed
-    /// here, so the configuration entry point can share one store across registrations and
-    /// tests can observe lifecycle state.
+    /// here, so tests can observe lifecycle state and a hand-wiring caller that takes on
+    /// the composition itself may share a store (the configuration entry point constructs
+    /// a fresh one and registers at most once).
     pub authorization_store: AuthorizationStore,
     /// Pre-built PMI-to-processor map, shared across middlewares. Built locally when `None`.
     pub processors_by_pmi: Option<Arc<HashMap<String, Arc<dyn PaymentProcessor>>>>,
