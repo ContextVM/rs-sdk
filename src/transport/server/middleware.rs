@@ -81,6 +81,9 @@ pub struct Next {
     index: usize,
     ctx: Arc<InboundContext>,
     tx: UnboundedSender<IncomingRequest>,
+    // Carried so the terminal can record the forward on the request's writer slot, in the same
+    // step as the send rather than after the whole chain returns.
+    open_stream: ServerOpenStreamState,
     // Carried to rebuild `IncomingRequest` at the terminal (not on `InboundContext`).
     event: Option<Event>,
     // Set true only at the terminal; the single source of truth for drop-cleanup.
@@ -107,6 +110,11 @@ impl Next {
                     })
                     .is_ok();
                 self.reached.store(delivered, Ordering::SeqCst);
+                if delivered {
+                    // From here the request belongs to the handler and its response, so a later
+                    // delivery's drop-cleanup must leave its open-stream writer alone.
+                    self.open_stream.mark_forwarded(&self.ctx.request_event_id);
+                }
                 delivered
             }
             Some(mw) => {
@@ -116,6 +124,7 @@ impl Next {
                     index: self.index + 1,
                     ctx: Arc::clone(&self.ctx),
                     tx: self.tx.clone(),
+                    open_stream: self.open_stream.clone(),
                     event: self.event, // moved forward
                     reached: Arc::clone(&self.reached),
                 };
@@ -154,6 +163,12 @@ pub(crate) fn dispatch_inbound(
         });
         return;
     }
+
+    // Register this delivery's chain run against the request's writer slot BEFORE the chain is
+    // spawned. This runs on the event-loop task, so a redelivery whose chain drops it without
+    // waiting for this delivery cannot observe a zero count and reclaim the slot from under a
+    // request that is about to forward.
+    open_stream.enter_chain(&event_id);
 
     let ctx = Arc::new(InboundContext {
         client_pubkey,
@@ -216,6 +231,7 @@ pub(crate) async fn run_inbound_chain(
         index: 0,
         ctx,
         tx,
+        open_stream: open_stream.clone(),
         event,
         reached: Arc::clone(&reached),
     };
@@ -246,22 +262,29 @@ pub(crate) async fn run_inbound_chain(
     // there `pop` is a real (harmless) removal.
     if !reached.load(Ordering::SeqCst) {
         event_routes.pop(&event_id).await;
+    }
 
-        // A gated (dropped) request also releases the open-stream slot the transport reserved for
-        // it before dispatch: `send_response` never runs for a dropped request, so no arm of its
-        // deferral decision can release the slot, the keepalive sweep cannot reap a never-started
-        // writer, and the slots map is unbounded. The token index is keyed by
-        // `(client_pubkey, progress_token)`, not by event id, so both keys are recovered from the
-        // slot itself before it is dropped.
-        let slot = open_stream.lock_slots().remove(&event_id);
-        if let Some(slot) = slot {
-            let token = slot.writer.progress_token().to_string();
-            let client = slot.snapshot.client_pubkey.to_hex();
-            open_stream
-                .lock_token_index()
-                .remove(&ServerOpenStreamState::client_token_key(&client, &token));
-            slot.writer.dispose();
-        }
+    // A gated (dropped) request also releases the open-stream slot the transport reserved for it
+    // before dispatch: `send_response` never runs for a dropped request, so no arm of its
+    // deferral decision can release the slot, the keepalive sweep cannot reap a never-started
+    // writer, and the slots map is unbounded. The token index is keyed by
+    // `(client_pubkey, progress_token)`, not by event id, so both keys are recovered from the slot
+    // itself before it is dropped.
+    //
+    // Every chain run ends its registration here, delivered or not, and takes the slot with it
+    // only when it was the last run for this request AND no delivery of the request ever reached
+    // the handler. Relays redeliver, so two shapes must not reclaim it: a redelivery dropped while
+    // the first delivery is still in the chain (the count is still non-zero), and one dropped
+    // after that delivery forwarded (the slot is marked, and from the forward onwards it belongs
+    // to `send_response`). Releasing in either case takes the writer away from a live request,
+    // which the worker fetches only after the forward.
+    if let Some(slot) = open_stream.leave_chain(&event_id) {
+        let token = slot.writer.progress_token().to_string();
+        let client = slot.snapshot.client_pubkey.to_hex();
+        open_stream
+            .lock_token_index()
+            .remove(&ServerOpenStreamState::client_token_key(&client, &token));
+        slot.writer.dispose();
     }
 }
 

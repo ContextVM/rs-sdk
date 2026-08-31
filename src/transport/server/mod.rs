@@ -147,7 +147,9 @@ struct PaymentRouteSnapshot {
 /// final response — `send_response` (the worker task) and the writer's
 /// close/abort hook (the tool task) — against the [`terminated`](Self::terminated)
 /// flag, so the response is never both stashed *and* dropped under a race.
-struct OpenStreamSlot {
+/// `pub(crate)` for the same reason [`ServerOpenStreamState`] is: the inbound seam lives in a
+/// sibling module and reclaims a dropped request's slot through it. Never re-exported.
+pub(crate) struct OpenStreamSlot {
     writer: OpenStreamWriter,
     snapshot: RouteSnapshot,
     /// The final response, stashed by `send_response` when it arrives before the
@@ -156,6 +158,17 @@ struct OpenStreamSlot {
     /// Set by the writer's close/abort hook once the stream is terminal. When
     /// `send_response` arrives after this (ordering B), it delivers immediately.
     terminated: bool,
+    /// Set when a delivery of this request reached the MCP handler, which is the moment the
+    /// slot stops being reclaimable state and becomes `send_response`'s to release. A later
+    /// delivery of the same request event (relays redeliver) can be dropped by a middleware,
+    /// and its drop-cleanup reads this before releasing anything.
+    forwarded: bool,
+    /// How many inbound chain runs for this request event are still in flight.
+    ///
+    /// A middleware that drops a redelivery without waiting for the first delivery unwinds
+    /// before that delivery reaches the terminal. `forwarded` is still false at that instant,
+    /// so it alone would let the duplicate reclaim the slot of a live request.
+    live_chains: usize,
 }
 
 /// CEP-41: the open-stream runtime state shared between the server transport and
@@ -231,6 +244,42 @@ impl ServerOpenStreamState {
     /// unique) is unaffected.
     fn client_token_key(client_pubkey_hex: &str, token: &str) -> String {
         format!("{client_pubkey_hex}:{token}")
+    }
+
+    /// Record that a delivery of `event_id` reached the MCP handler, so the slot is now the
+    /// responding path's to release. A no-op when the request has no writer slot.
+    pub(crate) fn mark_forwarded(&self, event_id: &str) {
+        if let Some(slot) = self.lock_slots().get_mut(event_id) {
+            slot.forwarded = true;
+        }
+    }
+
+    /// Register one inbound chain run against `event_id`'s writer slot.
+    ///
+    /// Called from the seam's dispatch, on the event-loop task and before the chain is spawned,
+    /// so a redelivery's chain can never observe a zero count for a delivery that is already
+    /// queued and about to forward. A no-op when the request has no writer slot.
+    pub(crate) fn enter_chain(&self, event_id: &str) {
+        if let Some(slot) = self.lock_slots().get_mut(event_id) {
+            slot.live_chains += 1;
+        }
+    }
+
+    /// End one inbound chain run and reclaim the writer slot when this was the last run for the
+    /// request and no delivery of it ever reached the handler. Returns the slot to release.
+    ///
+    /// One critical section, so a terminal marking the slot forwarded cannot slip between the
+    /// decision and the removal. The decrement saturates: a chain driven directly (tests) never
+    /// registered, and must still be able to reclaim the slot it is responsible for.
+    pub(crate) fn leave_chain(&self, event_id: &str) -> Option<OpenStreamSlot> {
+        let mut slots = self.lock_slots();
+        let slot = slots.get_mut(event_id)?;
+        slot.live_chains = slot.live_chains.saturating_sub(1);
+        if slot.live_chains == 0 && !slot.forwarded {
+            slots.remove(event_id)
+        } else {
+            None
+        }
     }
 
     /// Resolve `(client_pubkey, progress_token) → event_id`.
@@ -3578,15 +3627,34 @@ impl NostrServerTransport {
             is_encrypted,
             mirrored_wrap_kind,
         };
-        state.lock_slots().insert(
-            event_id.to_string(),
-            OpenStreamSlot {
-                writer,
-                snapshot,
-                pending_response: None,
-                terminated: false,
-            },
-        );
+        {
+            // First writer wins per request event. A redelivery re-runs this path, and the
+            // handler may already be holding (and streaming on) the writer from the first
+            // delivery: replacing the slot would leave `send_response`'s deferral decision
+            // reading a fresh, never-started writer while a live stream is mid-flight, and
+            // answer on the plain path instead of the stream's.
+            //
+            // The early return also skips the token-index insert, which is right for the
+            // redelivery itself (same key, same event id) and gives up one accidental repair:
+            // a redelivery no longer restores an index entry that a LATER request reusing the
+            // same `(client, token)` pair overwrote and then removed. That costs inbound
+            // control-frame correlation for the lingering older stream, never the response.
+            let mut slots = state.lock_slots();
+            if slots.contains_key(event_id) {
+                return;
+            }
+            slots.insert(
+                event_id.to_string(),
+                OpenStreamSlot {
+                    writer,
+                    snapshot,
+                    pending_response: None,
+                    terminated: false,
+                    forwarded: false,
+                    live_chains: 0,
+                },
+            );
+        }
         state.lock_token_index().insert(
             ServerOpenStreamState::client_token_key(client_pubkey_hex, progress_token),
             event_id.to_string(),
@@ -4847,6 +4915,8 @@ mod tests {
                 snapshot,
                 pending_response: None,
                 terminated,
+                forwarded: false,
+                live_chains: 0,
             },
         );
         state.lock_token_index().insert(
@@ -6432,6 +6502,670 @@ mod tests {
             })
             .count();
         assert_eq!(delivered_after, 1, "still exactly one response delivery");
+
+        transport.close().await.expect("close the server");
+    }
+
+    /// Build a server transport with the transparent payment middleware gating
+    /// `tools/call` on the `streamer` tool, for the redelivery tests below. `verify_delay_ms`
+    /// sets how long the fake processor takes to "settle", and `payment_ttl` bounds both the
+    /// redelivery dedup window and the settlement wait.
+    #[cfg(feature = "test-utils")]
+    async fn paid_streaming_transport(
+        s_pool: &Arc<MockRelayPool>,
+        verify_delay_ms: u64,
+        payment_ttl: Duration,
+    ) -> NostrServerTransport {
+        let mut transport = NostrServerTransport::with_relay_pool(
+            NostrServerTransportConfig::default()
+                .with_encryption_mode(EncryptionMode::Disabled)
+                .with_open_stream(OpenStreamConfig::default().with_enabled(true)),
+            Arc::clone(s_pool) as Arc<dyn RelayPoolTrait>,
+        )
+        .await
+        .expect("server transport");
+        let sender = transport.payment_notification_sender(Duration::from_secs(300));
+        let options = crate::payments::ServerPaymentsOptions::new(
+            vec![Arc::new(
+                crate::payments::fakes::FakePaymentProcessor::with_options(
+                    crate::payments::fakes::FakePaymentProcessorOptions {
+                        pmi: "fake".to_string(),
+                        verify_delay_ms,
+                        create_delay_ms: 0,
+                        ttl: None,
+                    },
+                ),
+            )],
+            vec![crate::payments::types::PricedCapability {
+                method: "tools/call".to_string(),
+                name: Some("streamer".to_string()),
+                amount: 21,
+                max_amount: None,
+                currency_unit: "sats".to_string(),
+                description: None,
+            }],
+        )
+        .with_payment_ttl(payment_ttl);
+        transport.add_inbound_middleware(crate::payments::create_server_payments_middleware(
+            crate::payments::ServerPaymentsMiddlewareParams::new(options, sender),
+        ));
+        transport
+    }
+
+    /// Poll until `predicate` holds, panicking with `what` after two seconds. The maps these
+    /// tests read are written from a detached chain task, so every read of them is a poll.
+    async fn settle_until<F, Fut>(what: &str, mut predicate: F)
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if predicate().await {
+                return;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "{what}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A redelivery of a paid streaming request must not take the writer slot away from the
+    /// delivery that owns the payment.
+    ///
+    /// The duplicate re-runs the pipeline, joins the in-flight payment, and returns without
+    /// forwarding (its own `Next` went to the inert lifecycle future), so its chain reaches the
+    /// drop-cleanup. Releasing the writer slot there strands the paid request: the worker
+    /// fetches the writer AFTER the forward, so it finds nothing and streaming for that request
+    /// is silently gone.
+    #[cfg(feature = "test-utils")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_redelivery_during_the_payment_keeps_the_open_stream_writer() {
+        let (client_pool, server_pool) = MockRelayPool::create_pair();
+        let server_pubkey = server_pool.mock_public_key();
+        let s_pool = Arc::new(server_pool);
+
+        let mut transport = paid_streaming_transport(&s_pool, 300, Duration::from_secs(300)).await;
+        let mut server_rx = transport
+            .take_message_receiver()
+            .expect("server message receiver");
+        transport.start().await.expect("server start");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let client_keys = Keys::generate();
+        let call_event = streaming_call_event(
+            &client_keys,
+            server_pubkey,
+            serde_json::json!("paid-redelivered-1"),
+            "tok-redeliver",
+            Vec::new(),
+        );
+        let event_id = call_event.id.to_hex();
+        client_pool
+            .publish_event(&call_event)
+            .await
+            .expect("publish the paid streaming call");
+
+        // Redeliver only once the payment is really in flight, so the duplicate takes the
+        // join path rather than starting a lifecycle of its own.
+        settle_until(
+            "the invoice must be published before the redelivery",
+            || {
+                let pool = Arc::clone(&s_pool);
+                async move {
+                    pool.stored_events()
+                        .await
+                        .iter()
+                        .any(|e| e.content.contains("payment_required"))
+                }
+            },
+        )
+        .await;
+        client_pool
+            .publish_event(&call_event)
+            .await
+            .expect("redeliver the same request event");
+
+        // The owning delivery forwards once its payment settles.
+        let incoming = tokio::time::timeout(Duration::from_secs(3), server_rx.recv())
+            .await
+            .expect("the paid streaming request must reach the handler")
+            .expect("channel closed");
+        assert_eq!(incoming.event_id, event_id);
+
+        // The duplicate joins the same payment, so its drop-cleanup runs right after that
+        // forward. Its route pop is the settle signal: no sweep can fire at the default
+        // 60 s request timeout, so the route going away means that cleanup has run.
+        settle_until("the duplicate's drop-cleanup must run", || {
+            let routes = transport.event_routes.clone();
+            let event_id = event_id.clone();
+            async move { !routes.has_event_route(&event_id).await }
+        })
+        .await;
+
+        let writer = transport
+            .get_open_stream_writer(&event_id)
+            .expect("the duplicate's cleanup must not take the paid request's writer");
+        writer.start().await.expect("start the stream");
+        writer.write("chunk".to_string()).await.expect("stream");
+        writer.close().await.expect("close the stream");
+
+        transport
+            .send_response(
+                &event_id,
+                list_result_response(serde_json::json!("paid-redelivered-1")),
+            )
+            .await
+            .expect("the streamed response must deliver");
+        let delivered = s_pool
+            .stored_events()
+            .await
+            .into_iter()
+            .filter(|e| {
+                e.kind == Kind::Custom(CTXVM_MESSAGES_KIND)
+                    && e.pubkey == server_pubkey
+                    && e.content.contains("paid-redelivered-1")
+            })
+            .count();
+        assert_eq!(delivered, 1, "exactly one response delivery");
+
+        transport.close().await.expect("close the server");
+    }
+
+    /// A redelivery that lands AFTER the forward must not pull an active stream's slot out
+    /// from under the handler, and must not replace the writer the handler is already holding:
+    /// the slot the transport keeps has to stay the started one, or `send_response` reads
+    /// `has_started() == false` on a live stream and answers on the plain path instead.
+    #[cfg(feature = "test-utils")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_redelivery_after_the_forward_keeps_the_started_writer() {
+        let (client_pool, server_pool) = MockRelayPool::create_pair();
+        let server_pubkey = server_pool.mock_public_key();
+        let s_pool = Arc::new(server_pool);
+
+        let mut transport = paid_streaming_transport(&s_pool, 20, Duration::from_secs(300)).await;
+        let mut server_rx = transport
+            .take_message_receiver()
+            .expect("server message receiver");
+        transport.start().await.expect("server start");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let client_keys = Keys::generate();
+        let call_event = streaming_call_event(
+            &client_keys,
+            server_pubkey,
+            serde_json::json!("paid-redelivered-2"),
+            "tok-late",
+            Vec::new(),
+        );
+        let event_id = call_event.id.to_hex();
+        client_pool
+            .publish_event(&call_event)
+            .await
+            .expect("publish the paid streaming call");
+
+        let incoming = tokio::time::timeout(Duration::from_secs(3), server_rx.recv())
+            .await
+            .expect("the paid streaming request must reach the handler")
+            .expect("channel closed");
+        assert_eq!(incoming.event_id, event_id);
+        let writer = transport
+            .get_open_stream_writer(&event_id)
+            .expect("the forwarded request must have a writer");
+        writer.start().await.expect("start the stream");
+        writer.write("chunk".to_string()).await.expect("stream");
+
+        // The stream is live when the redelivery lands.
+        client_pool
+            .publish_event(&call_event)
+            .await
+            .expect("redeliver the same request event");
+        settle_until("the duplicate's drop-cleanup must run", || {
+            let routes = transport.event_routes.clone();
+            let event_id = event_id.clone();
+            async move { !routes.has_event_route(&event_id).await }
+        })
+        .await;
+
+        let held = transport
+            .get_open_stream_writer(&event_id)
+            .expect("a live stream's slot must survive a redelivery");
+        assert!(
+            held.has_started(),
+            "the slot must still hold the writer the handler is streaming on"
+        );
+
+        writer.close().await.expect("close the stream");
+        transport
+            .send_response(
+                &event_id,
+                list_result_response(serde_json::json!("paid-redelivered-2")),
+            )
+            .await
+            .expect("the streamed response must deliver");
+        let delivered = s_pool
+            .stored_events()
+            .await
+            .into_iter()
+            .filter(|e| {
+                e.kind == Kind::Custom(CTXVM_MESSAGES_KIND)
+                    && e.pubkey == server_pubkey
+                    && e.content.contains("paid-redelivered-2")
+            })
+            .count();
+        assert_eq!(delivered, 1, "exactly one response delivery");
+
+        transport.close().await.expect("close the server");
+    }
+
+    /// The same protection without any payments in play: a redelivery that a gating middleware
+    /// drops must not disturb the request the first delivery forwarded. This covers the two
+    /// windows AFTER that forward, because relays redeliver at either moment: while the tool is
+    /// streaming, and before its first frame (where "is a stream live?" cannot tell that request
+    /// apart from one that was never forwarded at all). The window BEFORE the forward is a
+    /// different mechanism and has its own test,
+    /// `a_redelivery_dropped_before_the_owner_forwards_keeps_the_writer`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_redelivery_dropped_by_a_middleware_leaves_a_forwarded_request_alone() {
+        /// Forwards the first delivery of each request event and drops every redelivery of it,
+        /// which is the shape any dedup-by-event-id middleware has.
+        struct ForwardOnce(std::sync::Mutex<std::collections::HashSet<String>>);
+        #[async_trait::async_trait]
+        impl InboundMiddleware for ForwardOnce {
+            async fn handle(
+                &self,
+                message: JsonRpcMessage,
+                ctx: &InboundContext,
+                next: middleware::Next,
+            ) -> bool {
+                if !self.0.lock().unwrap().insert(ctx.request_event_id.clone()) {
+                    return false;
+                }
+                next.run(message).await
+            }
+        }
+
+        let (client_pool, server_pool) = MockRelayPool::create_pair();
+        let server_pubkey = server_pool.mock_public_key();
+        let s_pool = Arc::new(server_pool);
+
+        let mut transport = NostrServerTransport::with_relay_pool(
+            NostrServerTransportConfig::default()
+                .with_encryption_mode(EncryptionMode::Disabled)
+                .with_open_stream(OpenStreamConfig::default().with_enabled(true)),
+            Arc::clone(&s_pool) as Arc<dyn RelayPoolTrait>,
+        )
+        .await
+        .expect("server transport");
+        transport.add_inbound_middleware(Arc::new(ForwardOnce(std::sync::Mutex::new(
+            std::collections::HashSet::new(),
+        ))));
+
+        let mut server_rx = transport
+            .take_message_receiver()
+            .expect("server message receiver");
+        transport.start().await.expect("server start");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        for (label, request_id, token, stream_before_redelivery) in [
+            ("mid-stream redelivery", "live-stream-1", "tok-live", true),
+            (
+                "redelivery before the first frame",
+                "live-stream-2",
+                "tok-idle",
+                false,
+            ),
+        ] {
+            let client_keys = Keys::generate();
+            let call_event = streaming_call_event(
+                &client_keys,
+                server_pubkey,
+                serde_json::json!(request_id),
+                token,
+                Vec::new(),
+            );
+            let event_id = call_event.id.to_hex();
+            client_pool
+                .publish_event(&call_event)
+                .await
+                .expect("publish the streaming call");
+
+            let incoming = tokio::time::timeout(Duration::from_secs(3), server_rx.recv())
+                .await
+                .unwrap_or_else(|_| panic!("{label}: the request must reach the handler"))
+                .expect("channel closed");
+            assert_eq!(incoming.event_id, event_id);
+            let writer = transport
+                .get_open_stream_writer(&event_id)
+                .expect("the forwarded request must have a writer");
+            if stream_before_redelivery {
+                writer.start().await.expect("start the stream");
+                writer.write("chunk".to_string()).await.expect("stream");
+            }
+
+            client_pool
+                .publish_event(&call_event)
+                .await
+                .expect("redeliver the same request event");
+            settle_until("the dropped redelivery's cleanup must run", || {
+                let routes = transport.event_routes.clone();
+                let event_id = event_id.clone();
+                async move { !routes.has_event_route(&event_id).await }
+            })
+            .await;
+
+            let held = transport
+                .get_open_stream_writer(&event_id)
+                .unwrap_or_else(|| {
+                    panic!("{label}: a forwarded request's slot must survive a redelivery")
+                });
+            assert_eq!(
+                held.has_started(),
+                stream_before_redelivery,
+                "{label}: the slot must still hold the writer the handler was given"
+            );
+
+            if !stream_before_redelivery {
+                writer.start().await.expect("start the stream late");
+                writer.write("chunk".to_string()).await.expect("stream");
+            }
+            writer.close().await.expect("close the stream");
+            transport
+                .send_response(
+                    &event_id,
+                    list_result_response(serde_json::json!(request_id)),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{label}: the streamed response must deliver: {e}"));
+            let delivered = s_pool
+                .stored_events()
+                .await
+                .into_iter()
+                .filter(|e| {
+                    e.kind == Kind::Custom(CTXVM_MESSAGES_KIND)
+                        && e.pubkey == server_pubkey
+                        && e.content.contains(request_id)
+                })
+                .count();
+            assert_eq!(delivered, 1, "{label}: exactly one response delivery");
+        }
+
+        transport.close().await.expect("close the server");
+    }
+
+    /// A forward the worker channel refuses (shutdown) is not a forward: the request never
+    /// reached a handler, so the chain's cleanup still has to release the writer slot. The
+    /// record-only-on-a-successful-send rule that governs the route release governs this too.
+    #[tokio::test]
+    async fn a_refused_forward_still_releases_the_writer_slot() {
+        struct ForwardAll;
+        #[async_trait::async_trait]
+        impl InboundMiddleware for ForwardAll {
+            async fn handle(
+                &self,
+                message: JsonRpcMessage,
+                _ctx: &InboundContext,
+                next: middleware::Next,
+            ) -> bool {
+                next.run(message).await
+            }
+        }
+
+        let state = ServerOpenStreamState::new(&OpenStreamConfig::default(), 10);
+        install_slot(
+            &state,
+            "evt-refused",
+            deferral_test_writer("tok-refused"),
+            false,
+        );
+        assert!(!state.lock_slots().is_empty(), "the slot is installed");
+
+        // A closed worker channel is what a transport in shutdown presents to the seam.
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(rx);
+        let ctx = Arc::new(InboundContext {
+            client_pubkey: "client_pk".to_string(),
+            request_event_id: "evt-refused".to_string(),
+            is_encrypted: false,
+            mirrored_wrap_kind: None,
+            client_pmis: None,
+            payment_interaction: None,
+            cancel: tokio_util::sync::CancellationToken::new(),
+        });
+        middleware::run_inbound_chain(
+            Arc::from(vec![Arc::new(ForwardAll) as Arc<dyn InboundMiddleware>]),
+            ctx,
+            tx,
+            ServerEventRouteStore::new(),
+            state.clone(),
+            JsonRpcMessage::Request(JsonRpcRequest {
+                jsonrpc: "2.0".to_string(),
+                id: serde_json::json!("refused-1"),
+                method: "tools/call".to_string(),
+                params: None,
+            }),
+            None,
+        )
+        .await;
+
+        assert!(
+            state.lock_slots().is_empty(),
+            "a request that never reached the worker must not keep its writer slot"
+        );
+    }
+
+    /// The redelivery window before the forward, where the answer to "has anything forwarded
+    /// yet?" is no for a request that is about to. A middleware that drops the duplicate without
+    /// waiting for the first delivery reaches its cleanup inside that window, so the release has
+    /// to be held off by the first delivery's chain still being in flight.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_redelivery_dropped_before_the_owner_forwards_keeps_the_writer() {
+        /// Drops every delivery of a request event after the first, immediately and without
+        /// waiting for it: the shape any dedup-by-event-id middleware has when it does not join.
+        struct DedupFirst(std::sync::Mutex<std::collections::HashSet<String>>);
+        #[async_trait::async_trait]
+        impl InboundMiddleware for DedupFirst {
+            async fn handle(
+                &self,
+                message: JsonRpcMessage,
+                ctx: &InboundContext,
+                next: middleware::Next,
+            ) -> bool {
+                if !self.0.lock().unwrap().insert(ctx.request_event_id.clone()) {
+                    return false;
+                }
+                next.run(message).await
+            }
+        }
+
+        /// Holds the first delivery inside the chain long enough for the redelivery to arrive,
+        /// be dropped, and run its cleanup, all before this one reaches the terminal.
+        struct SlowGate(Duration);
+        #[async_trait::async_trait]
+        impl InboundMiddleware for SlowGate {
+            async fn handle(
+                &self,
+                message: JsonRpcMessage,
+                _ctx: &InboundContext,
+                next: middleware::Next,
+            ) -> bool {
+                tokio::time::sleep(self.0).await;
+                next.run(message).await
+            }
+        }
+
+        let (client_pool, server_pool) = MockRelayPool::create_pair();
+        let server_pubkey = server_pool.mock_public_key();
+        let s_pool = Arc::new(server_pool);
+
+        let mut transport = NostrServerTransport::with_relay_pool(
+            NostrServerTransportConfig::default()
+                .with_encryption_mode(EncryptionMode::Disabled)
+                .with_open_stream(OpenStreamConfig::default().with_enabled(true)),
+            Arc::clone(&s_pool) as Arc<dyn RelayPoolTrait>,
+        )
+        .await
+        .expect("server transport");
+        transport.add_inbound_middleware(Arc::new(DedupFirst(std::sync::Mutex::new(
+            std::collections::HashSet::new(),
+        ))));
+        transport.add_inbound_middleware(Arc::new(SlowGate(Duration::from_millis(400))));
+
+        let mut server_rx = transport
+            .take_message_receiver()
+            .expect("server message receiver");
+        transport.start().await.expect("server start");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let client_keys = Keys::generate();
+        let call_event = streaming_call_event(
+            &client_keys,
+            server_pubkey,
+            serde_json::json!("slow-gate-1"),
+            "tok-slow",
+            Vec::new(),
+        );
+        let event_id = call_event.id.to_hex();
+        client_pool
+            .publish_event(&call_event)
+            .await
+            .expect("publish the streaming call");
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        client_pool
+            .publish_event(&call_event)
+            .await
+            .expect("redeliver the same request event");
+
+        // The duplicate's cleanup runs while the first delivery is still in the gate: its route
+        // pop is the settle signal, and nothing has forwarded yet.
+        settle_until("the duplicate's drop-cleanup must run", || {
+            let routes = transport.event_routes.clone();
+            let event_id = event_id.clone();
+            async move { !routes.has_event_route(&event_id).await }
+        })
+        .await;
+        assert!(
+            server_rx.try_recv().is_err(),
+            "the first delivery must still be in the chain when the duplicate is cleaned up"
+        );
+        assert!(
+            transport.get_open_stream_writer(&event_id).is_some(),
+            "the duplicate must not reclaim the writer of a delivery still in flight"
+        );
+
+        // The first delivery then forwards, and its writer is still there for the handler.
+        let incoming = tokio::time::timeout(Duration::from_secs(3), server_rx.recv())
+            .await
+            .expect("the gated request must reach the handler")
+            .expect("channel closed");
+        assert_eq!(incoming.event_id, event_id);
+        let writer = transport
+            .get_open_stream_writer(&event_id)
+            .expect("the forwarded request must still have its writer");
+        writer.start().await.expect("start the stream");
+        writer.write("chunk".to_string()).await.expect("stream");
+        writer.close().await.expect("close the stream");
+        transport
+            .send_response(
+                &event_id,
+                list_result_response(serde_json::json!("slow-gate-1")),
+            )
+            .await
+            .expect("the streamed response must deliver");
+        let delivered = s_pool
+            .stored_events()
+            .await
+            .into_iter()
+            .filter(|e| {
+                e.kind == Kind::Custom(CTXVM_MESSAGES_KIND)
+                    && e.pubkey == server_pubkey
+                    && e.content.contains("slow-gate-1")
+            })
+            .count();
+        assert_eq!(delivered, 1, "exactly one response delivery");
+
+        transport.close().await.expect("close the server");
+    }
+
+    /// A priced streaming call whose payment never settles still releases its writer slot.
+    ///
+    /// The redelivery tests above pin what must be KEPT; this pins what must still go. The
+    /// delivery that owns the payment is the one that fails here, so nothing can answer the
+    /// request and the slot is garbage.
+    ///
+    /// It also rules out the payment route snapshot as a stand-in for request ownership. That
+    /// snapshot is written when the invoice is published and lives out its full TTL whatever the
+    /// payment does. Keying the release on it would strand this slot, and its token index entry,
+    /// until the transport closed, once per invoice a client declines to pay.
+    #[cfg(feature = "test-utils")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unpaid_streaming_call_releases_its_open_stream_slot() {
+        let (client_pool, server_pool) = MockRelayPool::create_pair();
+        let server_pubkey = server_pool.mock_public_key();
+        let s_pool = Arc::new(server_pool);
+
+        // The invoice is never settled (the fake takes 5 s), and the pending TTL bounds the
+        // settlement wait at 200 ms, so the lifecycle ends in a verification timeout.
+        let mut transport =
+            paid_streaming_transport(&s_pool, 5_000, Duration::from_millis(200)).await;
+        let mut server_rx = transport
+            .take_message_receiver()
+            .expect("server message receiver");
+        transport.start().await.expect("server start");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let client_keys = Keys::generate();
+        let call_event = streaming_call_event(
+            &client_keys,
+            server_pubkey,
+            serde_json::json!("unpaid-1"),
+            "tok-unpaid",
+            Vec::new(),
+        );
+        let event_id = call_event.id.to_hex();
+        client_pool
+            .publish_event(&call_event)
+            .await
+            .expect("publish the paid streaming call");
+
+        // Positive control: the invoice went out, so the writer slot HAD been created (it is
+        // created before dispatch) and an empty map below can only mean the cleanup released it.
+        settle_until("the invoice must be published", || {
+            let pool = Arc::clone(&s_pool);
+            async move {
+                pool.stored_events()
+                    .await
+                    .iter()
+                    .any(|e| e.content.contains("payment_required"))
+            }
+        })
+        .await;
+
+        let token_key = ServerOpenStreamState::client_token_key(
+            &client_keys.public_key().to_hex(),
+            "tok-unpaid",
+        );
+        settle_until(
+            "an unpaid request's writer slot and token index entry must be released",
+            || {
+                let open_stream = transport.open_stream.clone();
+                let token_key = token_key.clone();
+                async move {
+                    open_stream.lock_slots().is_empty()
+                        && !open_stream.lock_token_index().contains_key(&token_key)
+                }
+            },
+        )
+        .await;
+        assert!(
+            server_rx.try_recv().is_err(),
+            "an unpaid request must not reach the handler"
+        );
+        // The snapshot for this request is STILL live at the moment the slot has to go, which is
+        // why "a live snapshot exists" cannot stand in for "a live delivery owns this request".
+        assert!(
+            transport.take_payment_route_snapshot(&event_id).is_some(),
+            "the invoice's route snapshot outlives the failed payment"
+        );
 
         transport.close().await.expect("close the server");
     }
