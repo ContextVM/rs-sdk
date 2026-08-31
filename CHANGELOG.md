@@ -42,16 +42,20 @@
     configured payment processor verifies settlement, with `notifications/payment_accepted`
     sent on the way. A dynamic pricing callback can reject the invocation (emitting
     `notifications/payment_rejected`) or waive payment (forwarding it untouched). Duplicate
-    deliveries of the same request event share one payment rather than charging twice, and
-    once an invoice has been issued a later failure never re-charges a client who already
-    paid: a verified payment is delivered even if the acceptance notification cannot be
-    published. Because a payment can outlast the 60 s stale-route sweep, the transport now
+    deliveries of the same request event share one payment rather than charging twice, without
+    costing the paying request its stream: the duplicate is dropped, and the seam's
+    drop-cleanup leaves the open-stream writer of a request that already reached the handler
+    in place. Once an invoice has been issued a later failure never re-charges a client who
+    already paid: a verified payment is delivered even if the acceptance notification cannot
+    be published. Because a payment can outlast the 60 s stale-route sweep, the transport now
     captures the request's routing fields when it emits `payment_required` and delivers the
     eventual result from that capture when the route is gone.
     `payment_notification_sender` returns the payment-notification publish as an injectable
     closure for a detached middleware, alongside the existing `targeted_response_sender`.
     The middleware is not registered by default; registration arrives with the payments
     configuration entry point.
+    Setting `max_pending_payments` to zero refuses every priced request, rather than running
+    the server's payments through room for one.
 
 ### Fixed
 
@@ -65,6 +69,12 @@
   on itself whenever the relay delivered its `notifications/initialized` before its `initialize`,
   which Nostr does not order. The worker now satisfies the handshake itself at startup, before it
   drains any relay-sourced message, so no inbound message can reach the pre-service handshake.
+
+- CEP-41 open-stream: a redelivery of a `tools/call` that carries a progress token no longer
+  disturbs the request the first delivery forwarded. Relays can deliver the same request event
+  more than once; the second delivery used to replace the writer slot with a fresh, unstarted
+  writer, which left `send_response` deciding a live stream's deferral against the wrong
+  writer and answering on the plain path mid-stream. The first writer now stays.
 
 - CEP-41 open-stream: a deferred final response (one held back while a stream was
   still open) went out with routing tags only, so it carried neither the CEP-35

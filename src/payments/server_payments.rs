@@ -83,6 +83,13 @@ pub struct ServerPaymentsOptions {
     /// Maximum number of concurrently tracked pending-payment request ids (a
     /// DoS/memory guardrail). When the cache is full and every entry is live,
     /// a new priced request is refused rather than evicting a live payment.
+    ///
+    /// Zero means no payment can be tracked at all, so every priced request the TRANSPARENT
+    /// middleware sees is refused at the gate. The explicit-gating lifecycle keeps its state in
+    /// an authorization store and does not consult this cap, so a server registering both
+    /// lifecycles from one set of options still serves gating sessions at zero. The reference
+    /// implementation has no explicit rule here: its cache degrades to room for a single payment
+    /// at zero, which reads as "unlimited" and is not.
     pub max_pending_payments: usize,
     /// Which payment-interaction lifecycles the server accepts. Carried here so
     /// the options stay API-stable; consumed by the payments configuration
@@ -183,6 +190,9 @@ pub fn create_server_payments_middleware(
     let processors_by_pmi = params
         .processors_by_pmi
         .unwrap_or_else(|| Arc::new(build_processors_by_pmi(&params.options.processors)));
+    // Under a zero cap the pending cache is never consulted, so its capacity only has to be a
+    // legal one; the refusal itself is `refuse_priced_requests`.
+    let refuse_priced_requests = params.options.max_pending_payments == 0;
     let capacity = NonZeroUsize::new(params.options.max_pending_payments)
         .unwrap_or_else(|| NonZeroUsize::new(1).expect("1 is non-zero"));
     Arc::new(ServerPaymentsMiddleware {
@@ -190,6 +200,7 @@ pub fn create_server_payments_middleware(
         sender: params.sender,
         processors_by_pmi,
         pending: tokio::sync::Mutex::new(LruCache::new(capacity)),
+        refuse_priced_requests,
     })
 }
 
@@ -282,6 +293,9 @@ struct ServerPaymentsMiddleware {
     /// insert only, and every await happens after it drops. Holding it across the verify
     /// await would serialize every priced request in the server behind one payment.
     pending: tokio::sync::Mutex<LruCache<String, PendingEntry>>,
+    /// Set when the configured pending-payment cap is zero: no payment can be tracked, so no
+    /// priced request can be gated, so every one of them is refused before any payment work.
+    refuse_priced_requests: bool,
 }
 
 #[async_trait]
@@ -318,6 +332,18 @@ impl InboundMiddleware for ServerPaymentsMiddleware {
             client_pubkey = %ctx.client_pubkey,
             "priced capability matched"
         );
+
+        // A cap of zero leaves nowhere to track this request's payment, so it cannot be gated:
+        // refuse it, rather than quietly running the whole server's payments through room for
+        // one. Same shape as the capacity refusal below (drop, warn, no invoice).
+        if self.refuse_priced_requests {
+            tracing::warn!(
+                target: LOG_TARGET,
+                event_id = %ctx.request_event_id,
+                "pending-payment capacity is zero; refusing the priced request"
+            );
+            return false;
+        }
 
         let event_id = ctx.request_event_id.clone();
         let now = Instant::now();
@@ -1447,6 +1473,70 @@ mod lifecycle_tests {
     }
 
     #[tokio::test]
+    async fn a_zero_pending_cap_refuses_every_priced_request() {
+        let log = EventLog::default();
+        let fx = fixture_with(
+            |o| o.with_max_pending_payments(0),
+            TestProcessor::new("pmi-a", log.clone()),
+            &[],
+        );
+        fx.harness
+            .dispatch(Arc::new(test_ctx("evt-zero")), call_message())
+            .await;
+        assert_eq!(
+            fx.create_calls.load(Ordering::SeqCst),
+            0,
+            "a refused request mints no invoice"
+        );
+        assert_eq!(fx.sent.items().len(), 0, "and emits nothing");
+        assert_eq!(fx.harness.delivered(), 0, "and never forwards");
+
+        // Only priced requests are refused: a free one was never going to be tracked.
+        let free = JsonRpcMessage::Request(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: serde_json::json!("free-zero"),
+            method: "tools/call".to_string(),
+            params: Some(serde_json::json!({ "name": "free-tool" })),
+        });
+        fx.harness
+            .dispatch(Arc::new(test_ctx("evt-zero-free")), free)
+            .await;
+        assert_eq!(
+            fx.harness.delivered(),
+            1,
+            "an unpriced request still forwards under a zero cap"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_single_pending_slot_still_admits_a_payment() {
+        // The other side of the zero boundary: one slot is a working server, not a refused one.
+        // Without this, refusing at any cap below two reads the same as refusing at zero.
+        let log = EventLog::default();
+        let fx = fixture_with(
+            |o| o.with_max_pending_payments(1),
+            TestProcessor::new("pmi-a", log.clone()),
+            &[],
+        );
+        fx.harness
+            .dispatch(Arc::new(test_ctx("evt-one")), call_message())
+            .await;
+        assert_eq!(
+            fx.create_calls.load(Ordering::SeqCst),
+            1,
+            "a cap of one still mints the invoice"
+        );
+        assert_eq!(
+            fx.sent.methods(),
+            vec![
+                "notifications/payment_required",
+                "notifications/payment_accepted"
+            ]
+        );
+        assert_eq!(fx.harness.delivered(), 1, "and still forwards once paid");
+    }
+
+    #[tokio::test]
     async fn a_non_transparent_session_forwards_a_priced_request() {
         let log = EventLog::default();
         let fx = fixture(TestProcessor::new("pmi-a", log.clone()));
@@ -1569,6 +1659,7 @@ mod lifecycle_tests {
             sender: test_sender(log.clone(), sent, &[]),
             pending: tokio::sync::Mutex::new(LruCache::new(NonZeroUsize::new(40).unwrap())),
             options,
+            refuse_priced_requests: false,
         });
         {
             let now = Instant::now();
@@ -1884,6 +1975,7 @@ mod lifecycle_tests {
             sender: test_sender(log.clone(), sent.clone(), &[]),
             pending: tokio::sync::Mutex::new(LruCache::new(NonZeroUsize::new(30).unwrap())),
             options,
+            refuse_priced_requests: false,
         });
         {
             let now = Instant::now();
@@ -1958,6 +2050,7 @@ mod lifecycle_tests {
             sender: test_sender(log.clone(), sent, &[]),
             pending: tokio::sync::Mutex::new(LruCache::new(NonZeroUsize::new(1000).unwrap())),
             options,
+            refuse_priced_requests: false,
         });
         let harness = Harness::new(
             Arc::clone(&concrete) as Arc<dyn InboundMiddleware>,
