@@ -761,13 +761,6 @@ async fn an_encrypted_session_gates_and_delivers_end_to_end() {
 
     // The client decrypts the invoice off the gift wrap: the inner-tag correlation and
     // the wrap path work end to end for a payment notification.
-    //
-    // Only the invoice is asserted through the client channel. The client transport
-    // currently consumes the response-correlation entry on the FIRST correlated
-    // message of any kind, so the acceptance notification and the paid response are
-    // dropped client-side as uncorrelated; delivering them to a paying client is the
-    // client-side payment work's to fix, and this test must not paper over it. Their
-    // publication is asserted on the wire below instead.
     let invoice = tokio::time::timeout(Duration::from_secs(3), client_rx.recv())
         .await
         .expect("the client must decrypt and receive the invoice")
@@ -780,6 +773,30 @@ async fn an_encrypted_session_gates_and_delivers_end_to_end() {
             assert_eq!(params.get("pmi").unwrap(), "fake");
         }
         other => panic!("expected the invoice first, got {other:?}"),
+    }
+
+    // The correlation entry survives the correlated invoice notification, so the
+    // acceptance and the paid result also reach the paying client's own channel.
+    let accepted = tokio::time::timeout(Duration::from_secs(3), client_rx.recv())
+        .await
+        .expect("the client must receive the acceptance notification")
+        .expect("client channel open");
+    match accepted {
+        JsonRpcMessage::Notification(n) => {
+            assert_eq!(n.method, "notifications/payment_accepted");
+        }
+        other => panic!("expected the acceptance notification, got {other:?}"),
+    }
+    let delivered = tokio::time::timeout(Duration::from_secs(3), client_rx.recv())
+        .await
+        .expect("the client must receive the paid result")
+        .expect("client channel open");
+    match delivered {
+        JsonRpcMessage::Response(r) => {
+            assert_eq!(r.id, serde_json::json!("enc-1"));
+            assert!(r.result.get("content").is_some(), "the paid result body");
+        }
+        other => panic!("expected the paid result, got {other:?}"),
     }
 
     // Everything on the wire rides a gift wrap: no plaintext ContextVM event at all,
@@ -897,6 +914,28 @@ async fn an_encrypted_payment_outliving_the_sweep_still_delivers_encrypted() {
             .any(|e| e.kind == Kind::Custom(CTXVM_MESSAGES_KIND)),
         "an encrypted session's paid result must never be published in plaintext"
     );
+
+    // Delivery, not just publication: the acceptance and the swept-route paid result
+    // decrypt and arrive on the paying client's own channel (the correlation entry
+    // survives the correlated invoice notification).
+    let accepted = tokio::time::timeout(Duration::from_secs(3), client_rx.recv())
+        .await
+        .expect("the client must receive the acceptance notification")
+        .expect("client channel open");
+    match accepted {
+        JsonRpcMessage::Notification(n) => {
+            assert_eq!(n.method, "notifications/payment_accepted");
+        }
+        other => panic!("expected the acceptance notification, got {other:?}"),
+    }
+    let delivered = tokio::time::timeout(Duration::from_secs(3), client_rx.recv())
+        .await
+        .expect("the client must receive the paid result")
+        .expect("client channel open");
+    match delivered {
+        JsonRpcMessage::Response(r) => assert_eq!(r.id, serde_json::json!("enc-sweep-1")),
+        other => panic!("expected the paid result, got {other:?}"),
+    }
 
     fx.server.close().await.expect("close");
 }

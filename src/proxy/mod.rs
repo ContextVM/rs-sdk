@@ -5,6 +5,7 @@
 
 use crate::core::error::{Error, Result};
 use crate::core::types::JsonRpcMessage;
+use crate::payments::client_payments::{with_client_payments, ClientPaymentsOptions};
 use crate::transport::client::{NostrClientTransport, NostrClientTransportConfig};
 
 /// Configuration for the proxy.
@@ -13,12 +14,28 @@ use crate::transport::client::{NostrClientTransport, NostrClientTransportConfig}
 pub struct ProxyConfig {
     /// Nostr client transport configuration.
     pub nostr_config: NostrClientTransportConfig,
+    /// CEP-8: client payment configuration. When `Some`, the proxy registers
+    /// payments on its transport via
+    /// [`with_client_payments`] at construction, before the transport
+    /// starts. `None` (the default) leaves
+    /// the transport's own payment configuration untouched.
+    pub payment_options: Option<ClientPaymentsOptions>,
 }
 
 impl ProxyConfig {
     /// Create a new proxy configuration.
     pub fn new(nostr_config: NostrClientTransportConfig) -> Self {
-        Self { nostr_config }
+        Self {
+            nostr_config,
+            payment_options: None,
+        }
+    }
+
+    /// CEP-8: register client payments on the proxy's transport at
+    /// construction.
+    pub fn with_payment_options(mut self, options: ClientPaymentsOptions) -> Self {
+        self.payment_options = Some(options);
+        self
     }
 }
 
@@ -34,7 +51,15 @@ impl NostrMCPProxy {
     where
         T: nostr_sdk::prelude::IntoNostrSigner,
     {
-        let transport = NostrClientTransport::new(signer, config.nostr_config).await?;
+        let mut transport = NostrClientTransport::new(signer, config.nostr_config).await?;
+        // CEP-8: register payments between construction and ownership, while
+        // the transport is still pre-start. Registering in `start()` instead
+        // would carry a real trap: a first `start()` that consumed the options
+        // and then failed at the transport would leave a second `start()`
+        // silently skipping registration, shipping a non-paying client.
+        if let Some(payment_options) = config.payment_options {
+            with_client_payments(&mut transport, payment_options)?;
+        }
 
         Ok(Self {
             transport,
@@ -95,7 +120,14 @@ impl NostrMCPProxy {
         use crate::NostrClientTransport;
         use rmcp::ServiceExt;
 
-        let transport = NostrClientTransport::new(signer, config.nostr_config).await?;
+        let mut transport = NostrClientTransport::new(signer, config.nostr_config).await?;
+        // CEP-8: the rmcp-direct path constructs its own transport, so it
+        // registers payments here too; without this, this path would silently
+        // ship a non-paying client. Registration is genuinely pre-start: the
+        // rmcp worker starts the transport only after serving begins.
+        if let Some(payment_options) = config.payment_options {
+            with_client_payments(&mut transport, payment_options)?;
+        }
         handler
             .serve(transport)
             .await
@@ -130,7 +162,10 @@ mod tests {
             pmis: vec![],
         };
 
-        let config = ProxyConfig { nostr_config };
+        let config = ProxyConfig {
+            nostr_config,
+            payment_options: None,
+        };
 
         assert_eq!(
             config.nostr_config.relay_urls,
@@ -146,9 +181,22 @@ mod tests {
     }
 
     #[test]
+    fn payment_options_default_none_and_builder_sets_some() {
+        let config = ProxyConfig::new(NostrClientTransportConfig::default());
+        assert!(
+            config.payment_options.is_none(),
+            "no payment registration unless asked"
+        );
+        let config = ProxyConfig::new(NostrClientTransportConfig::default())
+            .with_payment_options(crate::payments::ClientPaymentsOptions::new());
+        assert!(config.payment_options.is_some());
+    }
+
+    #[test]
     fn test_proxy_config_with_defaults() {
         let config = ProxyConfig {
             nostr_config: NostrClientTransportConfig::default(),
+            payment_options: None,
         };
         assert!(!config.nostr_config.is_stateless);
         assert_eq!(
