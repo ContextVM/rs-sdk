@@ -21,7 +21,7 @@ mod client_correlation_store {
     async fn stores_request_with_event_id() {
         let store = ClientCorrelationStore::new();
         store
-            .register("event123".into(), json!("req1"), false)
+            .register("event123".into(), json!("req1"), false, None)
             .await;
         assert!(store.contains("event123").await);
     }
@@ -30,7 +30,7 @@ mod client_correlation_store {
     async fn stores_and_resolves_original_request_id() {
         let store = ClientCorrelationStore::new();
         store
-            .register("event456".into(), json!("req2"), false)
+            .register("event456".into(), json!("req2"), false, None)
             .await;
 
         // Retrieve the stored original ID.
@@ -38,15 +38,19 @@ mod client_correlation_store {
         assert_eq!(original, json!("req2"));
 
         // After removal the entry is fully gone.
-        assert!(store.remove("event456").await);
+        assert!(store.remove("event456").await.is_some());
         assert!(store.get_original_id("event456").await.is_none());
     }
 
     #[tokio::test]
     async fn register_request_flags_initialize_requests() {
         let store = ClientCorrelationStore::new();
-        store.register("e_init".into(), json!("r1"), true).await;
-        store.register("e_normal".into(), json!("r2"), false).await;
+        store
+            .register("e_init".into(), json!("r1"), true, None)
+            .await;
+        store
+            .register("e_normal".into(), json!("r2"), false, None)
+            .await;
 
         assert!(store.is_initialize_request("e_init").await);
         assert!(!store.is_initialize_request("e_normal").await);
@@ -58,7 +62,9 @@ mod client_correlation_store {
     #[tokio::test]
     async fn restores_original_request_id() {
         let store = ClientCorrelationStore::new();
-        store.register("event789".into(), json!(42), false).await;
+        store
+            .register("event789".into(), json!(42), false, None)
+            .await;
         let original = store.get_original_id("event789").await.unwrap();
         assert_eq!(original, json!(42));
     }
@@ -72,14 +78,16 @@ mod client_correlation_store {
     #[tokio::test]
     async fn get_and_remove_roundtrip() {
         let store = ClientCorrelationStore::new();
-        store.register("event1".into(), json!("req1"), false).await;
+        store
+            .register("event1".into(), json!("req1"), false, None)
+            .await;
 
         // Lookup succeeds before removal.
         let original = store.get_original_id("event1").await.unwrap();
         assert_eq!(original, json!("req1"));
 
-        // Remove returns true and cleans up completely.
-        assert!(store.remove("event1").await);
+        // Remove returns the entry and cleans up completely.
+        assert!(store.remove("event1").await.is_some());
         assert!(!store.contains("event1").await);
         assert!(store.get_original_id("event1").await.is_none());
     }
@@ -89,15 +97,17 @@ mod client_correlation_store {
     #[tokio::test]
     async fn removes_existing_request() {
         let store = ClientCorrelationStore::new();
-        store.register("event1".into(), json!(null), false).await;
-        assert!(store.remove("event1").await);
+        store
+            .register("event1".into(), json!(null), false, None)
+            .await;
+        assert!(store.remove("event1").await.is_some());
         assert!(!store.contains("event1").await);
     }
 
     #[tokio::test]
     async fn returns_false_for_unknown_request() {
         let store = ClientCorrelationStore::new();
-        assert!(!store.remove("unknown").await);
+        assert!(store.remove("unknown").await.is_none());
     }
 
     // ── clear ─────────────────────────────────────────────────────
@@ -105,8 +115,12 @@ mod client_correlation_store {
     #[tokio::test]
     async fn removes_all_pending_requests() {
         let store = ClientCorrelationStore::new();
-        store.register("event1".into(), json!(null), false).await;
-        store.register("event2".into(), json!(null), false).await;
+        store
+            .register("event1".into(), json!(null), false, None)
+            .await;
+        store
+            .register("event2".into(), json!(null), false, None)
+            .await;
         store.clear().await;
         assert_eq!(store.count().await, 0);
     }
@@ -118,7 +132,7 @@ mod client_correlation_store {
         let store = ClientCorrelationStore::with_max_pending(2);
         for i in 0..5 {
             store
-                .register(format!("event{i}"), json!(null), false)
+                .register(format!("event{i}"), json!(null), false, None)
                 .await;
         }
         assert_eq!(store.count().await, 2);
