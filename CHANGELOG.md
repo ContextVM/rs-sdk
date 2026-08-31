@@ -85,8 +85,38 @@
     `GatewayConfig` gains `payment_options` (with a `with_payment_options` builder),
     consumed when the gateway builds its transport in both `NostrMCPGateway::new` and
     `serve_handler`.
+  - The client payments registration entry point:
+    `contextvm_sdk::payments::with_client_payments(&mut transport, options)` composes
+    the whole client-side payment stack in one call, before `start()`. It advertises
+    the configured handlers' payment methods (replacing any config-seeded list, as the
+    reference implementation does), optionally requests a payment interaction mode,
+    and installs the payment engine into the transport's inbound path. The engine
+    drives both lifecycles: transparent auto-pay (an in-flight dedup per payment
+    request, a policy gate and the handler's own gate ahead of every wallet action,
+    synthesized decline and rejection errors toward the local consumer, a
+    synthetic-progress heartbeat carrying the request's original progress token, and a
+    keep-alive touch loop so a slow payment survives the transport's correlation
+    retention sweep) and explicit gating (`-32042` intercepted and answered through an
+    `on_payment_required` callback with a byte-true retry of the cached original
+    request, `-32043` retried under a capped exponential backoff seeded by the
+    server's `retry_after` and floored at one second, and a fixed, documented set of
+    give-up surfaces as the only paths either code reaches the consumer). It refuses,
+    with an error and before touching any state, registration on a started, closed, or
+    already-registered transport. The proxy joins in: `ProxyConfig` gains
+    `payment_options` (with a `with_payment_options` builder), consumed when the proxy
+    builds its transport in both `NostrMCPProxy::new` and `serve_client_handler`. The
+    payments guide (`docs/payments.md`) documents both lifecycles end to end, the
+    client shapes, and the operational notes for auto-pay deployments.
 
 ### Fixed
+
+- Client transport: the response-correlation entry was consumed by the FIRST correlated
+  inbound message of any kind, so a server that emitted a correlated notification before
+  its response (a CEP-8 payment notification, or any custom correlated notification) cost
+  the client that response, which was then dropped as a response for an unknown request.
+  Only a response or an error response consumes the entry now; correlated notifications
+  are forwarded without touching it, matching the reference implementation's
+  classification by JSON-RPC type.
 
 - Server transport: a request dropped by the inbound middleware chain (a gated priced
   invocation, a rejected payment, a chain panic) leaked its CEP-19 wrap-kind tracking
