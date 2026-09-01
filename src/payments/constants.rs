@@ -19,6 +19,8 @@ pub const PMI_BITCOIN_LIGHTNING_BOLT11: &str = "bitcoin-lightning-bolt11";
 
 /// Default payment TTL when `payment_required` carries no `ttl` (ms). Mirrors the server default.
 pub const DEFAULT_PAYMENT_TTL_MS: u64 = 300_000;
+/// Default cap on concurrently tracked pending-payment request ids (a DoS/memory guardrail).
+pub const DEFAULT_MAX_PENDING_PAYMENTS: usize = 1000;
 /// Default synthetic-progress heartbeat interval (ms). Half the 60 s MCP request timeout.
 pub const DEFAULT_SYNTHETIC_PROGRESS_INTERVAL_MS: u64 = 30_000;
 /// Per-map cap for the `AuthorizationStore` LRUs. Equals [`core::constants::DEFAULT_LRU_SIZE`](crate::core::constants::DEFAULT_LRU_SIZE).
@@ -46,6 +48,7 @@ mod tests {
     fn pmi_and_ttls_match_ts_sdk() {
         assert_eq!(PMI_BITCOIN_LIGHTNING_BOLT11, "bitcoin-lightning-bolt11");
         assert_eq!(DEFAULT_PAYMENT_TTL_MS, 300_000);
+        assert_eq!(DEFAULT_MAX_PENDING_PAYMENTS, 1000);
         assert_eq!(DEFAULT_SYNTHETIC_PROGRESS_INTERVAL_MS, 30_000);
         assert_eq!(AUTH_STORE_MAX_ENTRIES, 5000);
         // Mirrors the core LRU default; keep the two in lockstep.
