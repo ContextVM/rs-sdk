@@ -256,6 +256,163 @@ fn cep8_payment_rejected_params_shape() {
     );
 }
 
+// ── explicit-gating full error objects ──────────────────────────────────────
+//
+// These call the SAME builders the explicit-gating middleware publishes through, so a
+// drift in the middleware's wire bytes fails here, not just in its own unit tests. The
+// JSON-RPC `id` on all three errors is the original inner request id (the spec's
+// examples show the request's own id; the targeted publish path does not rewrite ids).
+
+#[test]
+fn cep8_payment_required_error_object() {
+    use contextvm_sdk::payments::server_explicit_gating::build_payment_required_error;
+
+    let full = build_payment_required_error(
+        serde_json::json!(3),
+        PaymentOption {
+            amount: 100,
+            pmi: "bitcoin-lightning-bolt11".to_string(),
+            pay_req: "lnbc1...".to_string(),
+            description: Some("Echo tool invocation".to_string()),
+            ttl: Some(600),
+            meta: None,
+        },
+    );
+    assert_eq!(
+        serde_json::to_value(&full).expect("error object serializes"),
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "error": {
+                "code": -32042,
+                "message": "Payment Required",
+                "data": {
+                    "instructions": "Payment is required to process this request. Pay one \
+                                     of the offered options, then retry the same request \
+                                     with exactly the same method and params.",
+                    "payment_options": [{
+                        "amount": 100,
+                        "pmi": "bitcoin-lightning-bolt11",
+                        "pay_req": "lnbc1...",
+                        "description": "Echo tool invocation",
+                        "ttl": 600
+                    }]
+                }
+            }
+        })
+    );
+
+    // Absent optional fields are omitted from the option object entirely, matching the
+    // reference implementation dropping `undefined` values.
+    let minimal = build_payment_required_error(
+        serde_json::json!("req-1"),
+        PaymentOption {
+            amount: 21,
+            pmi: "cashu".to_string(),
+            pay_req: "creq...".to_string(),
+            description: None,
+            ttl: None,
+            meta: None,
+        },
+    );
+    let value = serde_json::to_value(&minimal).expect("error object serializes");
+    assert_eq!(
+        value["error"]["data"]["payment_options"],
+        serde_json::json!([{ "amount": 21, "pmi": "cashu", "pay_req": "creq..." }])
+    );
+}
+
+#[test]
+fn cep8_payment_pending_error_object() {
+    use contextvm_sdk::payments::server_explicit_gating::build_payment_pending_error;
+
+    let pending = build_payment_pending_error(serde_json::json!(3), 500);
+    assert_eq!(
+        serde_json::to_value(&pending).expect("error object serializes"),
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "error": {
+                "code": -32043,
+                "message": "Payment Pending",
+                "data": {
+                    "instructions": "A payment is already pending for this invocation. \
+                                     Retry the same request later with exactly the same \
+                                     method and params.",
+                    "retry_after": 1
+                }
+            }
+        })
+    );
+}
+
+#[test]
+fn cep8_payment_rejected_error_object_has_no_data_key() {
+    use contextvm_sdk::payments::server_explicit_gating::build_payment_rejected_error;
+
+    let rejected =
+        build_payment_rejected_error(serde_json::json!(3), Some("not today".to_string()));
+    let value = serde_json::to_value(&rejected).expect("error object serializes");
+    assert_eq!(
+        value,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "error": { "code": -32000, "message": "not today" }
+        })
+    );
+    assert!(
+        value["error"].get("data").is_none(),
+        "the rejection error must carry NO data key at all"
+    );
+
+    // A reasonless rejection falls back to the policy message.
+    let fallback = build_payment_rejected_error(serde_json::json!(4), None);
+    assert_eq!(fallback.error.message, "Payment rejected by policy");
+}
+
+#[test]
+fn cep8_payment_required_error_always_carries_exactly_one_option() {
+    use contextvm_sdk::payments::server_explicit_gating::build_payment_required_error;
+
+    // An empty `payment_options` is representable at the TYPE level (below), but the
+    // middleware's builder takes its single option by value, so no caller can drive
+    // the published object to zero options: the CEP-8 `>= 1` requirement holds by
+    // construction at the only emission site.
+    let empty_is_representable = PaymentRequiredErrorData {
+        instructions: None,
+        payment_options: Vec::new(),
+    };
+    assert_eq!(
+        serde_json::to_value(&empty_is_representable).expect("data serializes")["payment_options"]
+            .as_array()
+            .expect("array")
+            .len(),
+        0
+    );
+
+    let built = build_payment_required_error(
+        serde_json::json!(1),
+        PaymentOption {
+            amount: 1,
+            pmi: "bitcoin-lightning-bolt11".to_string(),
+            pay_req: "lnbc1...".to_string(),
+            description: None,
+            ttl: None,
+            meta: None,
+        },
+    );
+    assert_eq!(
+        serde_json::to_value(&built).expect("error object serializes")["error"]["data"]
+            ["payment_options"]
+            .as_array()
+            .expect("array")
+            .len(),
+        1,
+        "the builder emits exactly one option, always"
+    );
+}
+
 #[test]
 fn cep8_payment_required_error_data_shape() {
     let data = PaymentRequiredErrorData {

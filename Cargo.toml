@@ -102,6 +102,10 @@ name = "payments_transparent_e2e"
 required-features = ["test-utils"]
 
 [[test]]
+name = "payments_explicit_gating_e2e"
+required-features = ["test-utils"]
+
+[[test]]
 name = "rmcp_handshake_survival"
 required-features = ["rmcp", "test-utils"]
 

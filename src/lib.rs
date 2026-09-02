@@ -92,8 +92,8 @@ pub use transport::server::{
 
 // ── Payments (CEP-8) ─────────────────────────────────────────────────
 pub use payments::{
-    AuthorizationStore, CanonicalInvocationIdentity, Meta, PaymentAcceptedParams, PaymentError,
-    PaymentHandler, PaymentHandlerRequest, PaymentInteractionPolicy, PaymentOption,
+    AuthorizationStore, CanonicalInvocationIdentity, ClaimOrPending, Meta, PaymentAcceptedParams,
+    PaymentError, PaymentHandler, PaymentHandlerRequest, PaymentInteractionPolicy, PaymentOption,
     PaymentPendingErrorData, PaymentProcessor, PaymentProcessorCreateParams,
     PaymentProcessorVerifyParams, PaymentRejectedParams, PaymentRequiredErrorData,
     PaymentRequiredParams, PricedCapability, ResolvePrice, ResolvePriceParams, ResolvePriceResult,

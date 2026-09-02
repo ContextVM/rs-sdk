@@ -477,6 +477,11 @@ pub struct NostrServerTransport {
     /// Reverse lookup: event_id → client route.
     event_routes: ServerEventRouteStore,
     /// CEP-19: Track the incoming gift-wrap kind per request for mirroring.
+    ///
+    /// Every entry is reclaimed: a responded request's entry by `send_response`, a
+    /// swept or session-expired request's by the respective cleanup, and a request
+    /// dropped by the inbound middleware chain by the seam's drop-cleanup (on both the
+    /// primary and the CEP-22 re-inject dispatch paths).
     request_wrap_kinds: Arc<RwLock<HashMap<String, Option<u16>>>>,
     /// CEP-8: routing snapshots for requests whose payment can outlive the 60 s stale-route
     /// sweep. Written by the injected payment-notification sender when it publishes
@@ -1095,6 +1100,14 @@ impl NostrServerTransport {
     #[cfg(feature = "test-utils")]
     pub async fn has_event_route(&self, event_id: &str) -> bool {
         self.event_routes.has_event_route(event_id).await
+    }
+
+    /// Test-only: whether a CEP-19 wrap-kind entry is still tracked for `event_id`, so a
+    /// test can assert the seam's drop-cleanup released the entry a dropped (gated)
+    /// request reserved.
+    #[cfg(feature = "test-utils")]
+    pub async fn has_request_wrap_kind(&self, event_id: &str) -> bool {
+        self.request_wrap_kinds.read().await.contains_key(event_id)
     }
 
     /// Send a response back to the client that sent the original request.
@@ -3221,6 +3234,7 @@ impl NostrServerTransport {
                     &tx,
                     &event_routes,
                     &open_stream,
+                    &request_wrap_kinds,
                     &cancel,
                     mcp_msg,
                     sender_pubkey,
@@ -3396,6 +3410,7 @@ impl NostrServerTransport {
                     tx,
                     event_routes,
                     open_stream,
+                    request_wrap_kinds,
                     cancel,
                     message,
                     sender_pubkey.to_string(),
@@ -6937,6 +6952,7 @@ mod tests {
             tx,
             ServerEventRouteStore::new(),
             state.clone(),
+            Arc::new(RwLock::new(HashMap::new())),
             JsonRpcMessage::Request(JsonRpcRequest {
                 jsonrpc: "2.0".to_string(),
                 id: serde_json::json!("refused-1"),
