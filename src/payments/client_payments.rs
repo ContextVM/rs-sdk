@@ -622,6 +622,23 @@ impl ClientPaymentsEngine {
         requested_gating: bool,
         effective_gating: bool,
     ) {
+        // The transport's correlation gate already ran, but the gate and this
+        // hook are separate awaited store calls, so a concurrent consumer
+        // (store eviction under capacity pressure) can retire the entry in
+        // the window between them. Without a live entry there is no request
+        // to keep alive and no identity to fail toward, so nothing may
+        // engage a wallet: the offer is left to the application (the caller
+        // still forwards the notification), matching the reference client's
+        // uncorrelated-offer handling.
+        if entry.is_none() {
+            tracing::warn!(
+                target: LOG_TARGET,
+                correlated_event_id = %correlated_event_id,
+                "dropping a payment_required with no live pending entry"
+            );
+            return;
+        }
+
         // Fail-closed serde is the validator: a malformed offer (fractional
         // amount, negative ttl) engages nothing, and the caller forwards the
         // raw notification so nothing is hidden from the application.
@@ -3087,5 +3104,44 @@ mod tests {
             second.is_some(),
             "a re-cache of the same id must not reset the retry budget"
         );
+    }
+
+    /// An offer whose pending entry vanished between the transport's
+    /// correlation gate and this hook (the two are separate awaited store
+    /// calls, so store eviction under capacity pressure can retire the entry
+    /// in the window) engages nothing: no wallet call, no keep-alives, no
+    /// in-flight claim, nothing synthesized. The caller still forwards the
+    /// notification, matching the reference client's uncorrelated-offer
+    /// handling.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn offer_with_no_live_entry_engages_nothing() {
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let options = ClientPaymentsOptions::new()
+            .with_handlers(vec![Arc::new(RecordingHandler::new(Arc::clone(&calls)))]);
+        let mut fx = engine_fx(options, Duration::from_secs(30)).await;
+
+        let forward = drive(
+            &fx,
+            &required_notif(21, "inv-1", "fake", None),
+            None,
+            false,
+            false,
+        );
+        assert!(forward, "the notification is still forwarded to the app");
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "the wallet must never run for a request with no live entry"
+        );
+        assert!(
+            lock(&fx.engine.touch_loops).is_empty(),
+            "no keep-alive for a dead request"
+        );
+        assert!(lock(&fx.engine.heartbeats).entries.is_empty());
+        assert!(
+            lock(&fx.engine.in_flight_pay_reqs).is_empty(),
+            "no claim taken"
+        );
+        assert!(fx.rx.try_recv().is_err(), "nothing synthesized");
     }
 }
