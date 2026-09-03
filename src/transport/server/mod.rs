@@ -868,6 +868,22 @@ impl NostrServerTransport {
         self.supported_payment_interaction = Some(policy);
     }
 
+    /// Whether [`start`](Self::start) has run (the same predicate the pre-start
+    /// `debug_assert!`s above use).
+    pub(crate) fn is_started(&self) -> bool {
+        !self.task_handles.is_empty()
+    }
+
+    /// The configured session timeout.
+    pub(crate) fn session_timeout(&self) -> Duration {
+        self.config.session_timeout
+    }
+
+    /// The recorded payment-interaction policy, or `None` when payments were never configured.
+    pub(crate) fn supported_payment_interaction(&self) -> Option<PaymentInteractionPolicy> {
+        self.supported_payment_interaction
+    }
+
     /// Start listening for incoming requests.
     pub async fn start(&mut self) -> Result<()> {
         self.base
@@ -7423,6 +7439,212 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         transport.close().await.expect("close");
+    }
+
+    /// A minimal local processor double for the registration wiring tests below, so
+    /// they run in every feature configuration (the deterministic fakes are
+    /// `test-utils`-gated).
+    struct RegistrationStubProcessor {
+        pmi: String,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::payments::PaymentProcessor for RegistrationStubProcessor {
+        fn pmi(&self) -> &str {
+            &self.pmi
+        }
+
+        async fn create_payment_required(
+            &self,
+            params: crate::payments::types::PaymentProcessorCreateParams,
+        ) -> std::result::Result<
+            crate::payments::types::PaymentRequiredParams,
+            crate::payments::PaymentError,
+        > {
+            Ok(crate::payments::types::PaymentRequiredParams {
+                amount: params.amount,
+                pay_req: format!("invoice-{}", params.request_event_id),
+                pmi: self.pmi.clone(),
+                description: params.description,
+                ttl: None,
+                meta: None,
+            })
+        }
+
+        async fn verify_payment(
+            &self,
+            _params: crate::payments::types::PaymentProcessorVerifyParams,
+        ) -> std::result::Result<crate::payments::types::VerifyOutcome, crate::payments::PaymentError>
+        {
+            Ok(crate::payments::types::VerifyOutcome::default())
+        }
+    }
+
+    fn registration_options(payment_ttl: Duration) -> crate::payments::ServerPaymentsOptions {
+        crate::payments::ServerPaymentsOptions::new(
+            vec![Arc::new(RegistrationStubProcessor {
+                pmi: "stub-pmi".to_string(),
+            })],
+            vec![crate::payments::types::PricedCapability {
+                method: "tools/call".to_string(),
+                name: Some("paid-tool".to_string()),
+                amount: 21,
+                max_amount: None,
+                currency_unit: "sats".to_string(),
+                description: None,
+            }],
+        )
+        .with_payment_ttl(payment_ttl)
+    }
+
+    /// The payments registration entry point threads the configured `payment_ttl` into
+    /// the notification sender's snapshot horizon: the snapshot recorded at
+    /// `payment_required` publication expires at capture time plus the CONFIGURED TTL,
+    /// not the crate default. The recorded `expires_at` is asserted directly against
+    /// the configured horizon, bounded by instants taken around the flow, so the test
+    /// has no timing dependence: a default-stamping wiring (300 s) and a
+    /// capped-at-default wiring both record a horizon below the lower bound and fail.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn snapshot_expiry_tracks_the_configured_payment_ttl() {
+        let configured_ttl = Duration::from_secs(1234); // distinctive, above the 300 s default
+        let (client_pool, server_pool) = MockRelayPool::create_pair();
+        let server_pubkey = server_pool.mock_public_key();
+        let s_pool = Arc::new(server_pool);
+
+        let mut transport = NostrServerTransport::with_relay_pool(
+            NostrServerTransportConfig::default().with_encryption_mode(EncryptionMode::Disabled),
+            Arc::clone(&s_pool) as Arc<dyn RelayPoolTrait>,
+        )
+        .await
+        .expect("server transport");
+        crate::payments::with_server_payments(&mut transport, registration_options(configured_ttl))
+            .expect("register payments");
+
+        let mut server_rx = transport.take_message_receiver().expect("receiver");
+        let before_publish = Instant::now();
+        transport.start().await.expect("start");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let client_keys = Keys::generate();
+        let request = JsonRpcMessage::Request(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: serde_json::json!("snap-ttl-1"),
+            method: "tools/call".to_string(),
+            params: Some(serde_json::json!({ "name": "paid-tool" })),
+        });
+        let request_event = crate::core::serializers::mcp_to_nostr_event(
+            &request,
+            CTXVM_MESSAGES_KIND,
+            BaseTransport::create_recipient_tags(&server_pubkey),
+        )
+        .expect("serialize the priced call")
+        .sign_with_keys(&client_keys)
+        .expect("sign the priced call");
+        let request_event_id = request_event.id.to_hex();
+        client_pool
+            .publish_event(&request_event)
+            .await
+            .expect("publish the priced call");
+
+        // Wait for the middleware to publish payment_required (which records the snapshot).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let published = s_pool
+                .stored_events()
+                .await
+                .into_iter()
+                .any(|e| e.pubkey == server_pubkey && e.content.contains("payment_required"));
+            if published {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "payment_required must be published for the priced call"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let after_publish = Instant::now();
+
+        {
+            let cache = NostrServerTransport::lock_payment_route_snapshots(
+                &transport.payment_route_snapshots,
+            );
+            let expires_at = cache
+                .peek(&request_event_id)
+                .expect("the publish must have recorded a route snapshot")
+                .expires_at;
+            assert!(
+                expires_at >= before_publish + configured_ttl,
+                "the snapshot horizon must be the CONFIGURED payment_ttl, not the crate \
+                 default (or a default-capped value)"
+            );
+            assert!(
+                expires_at <= after_publish + configured_ttl,
+                "the snapshot horizon must not exceed capture time plus the configured TTL"
+            );
+        }
+
+        // Drain whatever the settled payment forwarded, then shut down.
+        let _ = server_rx.try_recv();
+        transport.close().await.expect("close");
+    }
+
+    /// The payments registration entry point routes each composed tag segment to its
+    /// own announcement slot: the `cap` tags land in the pricing slot and the
+    /// `pmi`/availability tags in the extra-common slot. The slots are asserted
+    /// directly because they are what the pricing-only list kinds and the common-only
+    /// first-response replay consume, where a swap has real wire consequences; the
+    /// kind 11316 announcement concatenates both slots and only its segment ORDER
+    /// betrays a swap.
+    #[tokio::test]
+    async fn tags_land_in_their_slots() {
+        let pool: Arc<dyn RelayPoolTrait> = Arc::new(MockRelayPool::new());
+        let mut transport =
+            NostrServerTransport::with_relay_pool(NostrServerTransportConfig::default(), pool)
+                .await
+                .expect("server transport");
+        crate::payments::with_server_payments(
+            &mut transport,
+            registration_options(Duration::from_secs(300)),
+        )
+        .expect("register payments");
+
+        let tuples = |tags: &[Tag]| -> Vec<Vec<String>> {
+            tags.iter().map(|t| t.clone().to_vec()).collect()
+        };
+
+        assert_eq!(
+            tuples(transport.announcement_manager.get_pricing_tags()),
+            vec![vec![
+                "cap".to_string(),
+                "tool:paid-tool".to_string(),
+                "21".to_string(),
+                "sats".to_string()
+            ]],
+            "the pricing slot must hold exactly the cap segment"
+        );
+
+        let payment_tuples: Vec<Vec<String>> =
+            tuples(&transport.announcement_manager.get_common_tags())
+                .into_iter()
+                .filter(|t| {
+                    matches!(
+                        t.first().map(String::as_str),
+                        Some("pmi") | Some("payment_interaction") | Some("cap")
+                    )
+                })
+                .collect();
+        assert_eq!(
+            payment_tuples,
+            vec![
+                vec!["pmi".to_string(), "stub-pmi".to_string()],
+                vec![
+                    "payment_interaction".to_string(),
+                    "explicit_gating".to_string()
+                ],
+            ],
+            "the extra-common slot must hold the pmi and availability tags, and no cap tag"
+        );
     }
 
     // ── Targeted response sender ─────────────────────────────────────────────

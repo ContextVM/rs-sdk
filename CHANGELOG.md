@@ -70,6 +70,21 @@
     the two checks can never mint a second invoice against an unclaimed paid grant.
     Registration arrives with the payments configuration entry point, alongside the
     transparent middleware's.
+  - The server payments registration entry point:
+    `contextvm_sdk::payments::with_server_payments(&mut transport, options)` composes
+    the whole server-side payment stack in one call, before `start()`. It advertises
+    the configured payment methods and prices on announcements (`pmi` and `cap` tags,
+    plus a `payment_interaction=explicit_gating` availability tag when the policy is
+    `Optional`), records the negotiation policy, and registers the transparent payment
+    middleware plus, under `Optional`, the explicit-gating middleware with a fresh
+    authorization store, with the payment senders built after the tags so their
+    captured discovery replay is complete. It refuses (with an error, before touching
+    any state) the two calls that would silently lose money: registration after
+    `start()`, which would advertise payments while gating nothing, and a second
+    registration, which would charge every priced request twice. The gateway joins in:
+    `GatewayConfig` gains `payment_options` (with a `with_payment_options` builder),
+    consumed when the gateway builds its transport in both `NostrMCPGateway::new` and
+    `serve_handler`.
 
 ### Fixed
 

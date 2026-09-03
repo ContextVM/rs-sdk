@@ -7,8 +7,10 @@
 //! [`PaymentError`] taxonomy, the canonical invocation identity used for
 //! explicit-gating authorization matching, the bounded [`AuthorizationStore`] of
 //! pending and granted authorizations, and deterministic fakes behind the
-//! `test-utils` feature. It carries no transport wiring and no network; the
-//! middleware that consumes these arrives later.
+//! `test-utils` feature. The one piece of transport wiring here is the
+//! [`with_server_payments`](crate::payments::server_transport_payments::with_server_payments)
+//! registration entry point, which composes the middlewares, tags, and senders
+//! onto a server transport.
 //!
 //! Constants and tag builders stay reachable under their module paths
 //! ([`crate::payments::constants`] / [`crate::payments::tags`]); the wire/config
@@ -22,6 +24,7 @@ pub mod errors;
 pub mod server_explicit_gating;
 pub mod server_payments;
 pub(crate) mod server_payments_utils;
+pub mod server_transport_payments;
 pub mod tags;
 pub mod traits;
 pub mod types;
@@ -41,6 +44,7 @@ pub use server_explicit_gating::{
 pub use server_payments::{
     create_server_payments_middleware, ServerPaymentsMiddlewareParams, ServerPaymentsOptions,
 };
+pub use server_transport_payments::with_server_payments;
 pub use traits::{PaymentHandler, PaymentProcessor, ResolvePrice};
 pub use types::{
     Meta, PaymentAcceptedParams, PaymentHandlerRequest, PaymentInteractionPolicy, PaymentOption,

@@ -5,6 +5,7 @@
 
 use crate::core::error::{Error, Result};
 use crate::core::types::JsonRpcMessage;
+use crate::payments::{with_server_payments, ServerPaymentsOptions};
 use crate::transport::server::{IncomingRequest, NostrServerTransport, NostrServerTransportConfig};
 
 /// Configuration for the gateway.
@@ -13,12 +14,26 @@ use crate::transport::server::{IncomingRequest, NostrServerTransport, NostrServe
 pub struct GatewayConfig {
     /// Nostr server transport configuration.
     pub nostr_config: NostrServerTransportConfig,
+    /// Optional CEP-8 payments configuration. When set, the gateway registers
+    /// payments on its transport via [`with_server_payments`] between
+    /// constructing the transport and starting it.
+    pub payment_options: Option<ServerPaymentsOptions>,
 }
 
 impl GatewayConfig {
-    /// Create a new gateway configuration.
+    /// Create a new gateway configuration (payments stay opt-in via
+    /// [`with_payment_options`](Self::with_payment_options)).
     pub fn new(nostr_config: NostrServerTransportConfig) -> Self {
-        Self { nostr_config }
+        Self {
+            nostr_config,
+            payment_options: None,
+        }
+    }
+
+    /// Set the CEP-8 payments configuration.
+    pub fn with_payment_options(mut self, payment_options: ServerPaymentsOptions) -> Self {
+        self.payment_options = Some(payment_options);
+        self
     }
 }
 
@@ -37,7 +52,10 @@ impl NostrMCPGateway {
     where
         T: nostr_sdk::prelude::IntoNostrSigner,
     {
-        let transport = NostrServerTransport::new(signer, config.nostr_config).await?;
+        let mut transport = NostrServerTransport::new(signer, config.nostr_config).await?;
+        if let Some(payment_options) = config.payment_options {
+            with_server_payments(&mut transport, payment_options)?;
+        }
 
         Ok(Self {
             transport,
@@ -74,6 +92,11 @@ impl NostrMCPGateway {
     }
 
     /// Stop the gateway.
+    ///
+    /// The underlying transport is not restartable after close, so a stopped
+    /// gateway cannot be started again (a later `start` panics at the transport's
+    /// message-channel expect); payments registration neither causes nor changes
+    /// this.
     pub async fn stop(&mut self) -> Result<()> {
         if !self.is_running {
             return Ok(());
@@ -107,7 +130,10 @@ impl NostrMCPGateway {
         use crate::NostrServerTransport;
         use rmcp::ServiceExt;
 
-        let transport = NostrServerTransport::new(signer, config.nostr_config).await?;
+        let mut transport = NostrServerTransport::new(signer, config.nostr_config).await?;
+        if let Some(payment_options) = config.payment_options {
+            with_server_payments(&mut transport, payment_options)?;
+        }
         handler
             .serve(transport)
             .await
@@ -148,12 +174,16 @@ mod tests {
             open_stream: Default::default(),
         };
 
-        let config = GatewayConfig { nostr_config };
+        let config = GatewayConfig {
+            nostr_config,
+            payment_options: None,
+        };
 
         assert_eq!(
             config.nostr_config.relay_urls,
             vec!["wss://relay.example.com"]
         );
+        assert!(config.payment_options.is_none());
         assert_eq!(
             config.nostr_config.encryption_mode,
             EncryptionMode::Required
@@ -177,11 +207,21 @@ mod tests {
     fn test_gateway_config_with_defaults() {
         let config = GatewayConfig {
             nostr_config: NostrServerTransportConfig::default(),
+            payment_options: None,
         };
         assert_eq!(
             config.nostr_config.encryption_mode,
             EncryptionMode::Optional
         );
         assert!(!config.nostr_config.is_announced_server);
+    }
+
+    #[test]
+    fn test_gateway_config_builder_sets_payment_options() {
+        let config =
+            GatewayConfig::new(NostrServerTransportConfig::default()).with_payment_options(
+                crate::payments::ServerPaymentsOptions::new(Vec::new(), Vec::new()),
+            );
+        assert!(config.payment_options.is_some());
     }
 }

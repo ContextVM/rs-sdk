@@ -437,3 +437,65 @@ fn cep8_payment_required_error_data_shape() {
         })
     );
 }
+
+// ── announcement segment composition ─────────────────────────────────────────
+
+/// The composed announcement segments a payments-configured server advertises, built
+/// from the public builders exactly as the registration entry point composes them.
+///
+/// The per-tag formats are pinned above; the delta pinned here is the COMPOSITION,
+/// asserted as ordered sequences: the extra segment is one `pmi` tag per processor in
+/// registration order (duplicates preserved), followed by exactly one
+/// `payment_interaction=explicit_gating` availability tag ordered LAST when explicit
+/// gating is available as an opt-in mode; a transparent-only server advertises no
+/// `payment_interaction` tag at all. The pricing segment is the `cap` tags in
+/// declaration order.
+#[test]
+fn cep8_announcement_segments_compose_per_policy() {
+    let pmis = ["pmi:A".to_string(), "pmi:B".to_string()];
+    let caps = vec![
+        priced("tools/call", "add", 1, None, "sats"),
+        priced("prompts/get", "summarize", 5, Some(20), "sats"),
+    ];
+
+    // Explicit gating available (the permissive default policy): availability tag last.
+    let mut extra_optional: Vec<Tag> = pmis.iter().map(|p| pmi_tag(p)).collect();
+    extra_optional.push(payment_interaction_tag(
+        PaymentInteractionMode::ExplicitGating,
+    ));
+    assert_eq!(
+        wire_all(&extra_optional),
+        vec![
+            vec!["pmi", "pmi:A"],
+            vec!["pmi", "pmi:B"],
+            vec!["payment_interaction", "explicit_gating"],
+        ],
+        "the availability tag must be present exactly once and ordered last"
+    );
+
+    // Transparent-only: the pmi tags alone, no payment_interaction tag.
+    let extra_transparent: Vec<Tag> = pmis.iter().map(|p| pmi_tag(p)).collect();
+    assert_eq!(
+        wire_all(&extra_transparent),
+        vec![vec!["pmi", "pmi:A"], vec!["pmi", "pmi:B"]],
+        "a transparent-only server advertises no payment_interaction tag"
+    );
+
+    // Duplicate processors emit duplicate pmi tags (ts-sdk parity; the tag list maps
+    // the raw processor list, not the deduplicated selection map).
+    let duplicated = ["pmi:A".to_string(), "pmi:A".to_string()];
+    let extra_duplicated: Vec<Tag> = duplicated.iter().map(|p| pmi_tag(p)).collect();
+    assert_eq!(
+        wire_all(&extra_duplicated),
+        vec![vec!["pmi", "pmi:A"], vec!["pmi", "pmi:A"]],
+    );
+
+    // The pricing segment, in declaration order, range prices hyphenated.
+    assert_eq!(
+        wire_all(&cap_tags_from_priced_capabilities(&caps)),
+        vec![
+            vec!["cap", "tool:add", "1", "sats"],
+            vec!["cap", "prompt:summarize", "5-20", "sats"],
+        ],
+    );
+}
