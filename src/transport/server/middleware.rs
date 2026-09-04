@@ -56,6 +56,33 @@ pub struct InboundContext {
     pub cancel: CancellationToken,
 }
 
+impl InboundContext {
+    /// Construct an inbound context.
+    ///
+    /// This is the supported way to create an [`InboundContext`] from outside the SDK,
+    /// since the struct is `#[non_exhaustive]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        client_pubkey: impl Into<String>,
+        request_event_id: impl Into<String>,
+        is_encrypted: bool,
+        mirrored_wrap_kind: Option<u16>,
+        client_pmis: Option<Vec<String>>,
+        payment_interaction: Option<PaymentInteractionMode>,
+        cancel: CancellationToken,
+    ) -> Self {
+        Self {
+            client_pubkey: client_pubkey.into(),
+            request_event_id: request_event_id.into(),
+            is_encrypted,
+            mirrored_wrap_kind,
+            client_pmis,
+            payment_interaction,
+            cancel,
+        }
+    }
+}
+
 /// A general-purpose inbound middleware, run as the final inbound stage before delivery to the MCP
 /// handler.
 ///
