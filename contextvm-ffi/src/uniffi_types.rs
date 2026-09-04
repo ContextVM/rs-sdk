@@ -9,9 +9,13 @@ use crate::builders::{
     build_server_config_parts, ClientConfigParts,
 };
 use crate::error::FfiError;
+use crate::payment_gate::{PaymentGate, PaymentGateConfig, PaymentGateTransport};
 use crate::runtime::global_runtime;
 use crate::types::json_rpc_id_to_string;
+use contextvm_sdk::transport::server::{PaymentNotificationSender, TargetedResponseSender};
 use parking_lot::Mutex as ParkingLotMutex;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -643,6 +647,8 @@ struct ServerInner {
             >,
         >,
     >,
+    /// Payment gate after `start()` if priced capabilities are non-empty.
+    payment_gate: Option<crate::payment_gate::PaymentGate>,
     /// Optional override for the relay pool (tests only).
     relay_pool_override: Option<Arc<dyn contextvm_sdk::relay::RelayPoolTrait>>,
 }
@@ -651,6 +657,42 @@ const STATE_CONFIGURING: u8 = 0;
 const STATE_STARTING: u8 = 1;
 const STATE_STARTED: u8 = 2;
 const STATE_CLOSED: u8 = 3;
+
+/// Real transport bridge used by the payment gate.
+///
+/// Captures the SDK's injectable notification and targeted-response senders so
+/// the gate can emit CEP-8 lifecycle events and explicit-gating errors.
+#[derive(Clone)]
+struct ServerPaymentTransport {
+    notification_sender: PaymentNotificationSender,
+    targeted_sender: TargetedResponseSender,
+}
+
+impl PaymentGateTransport for ServerPaymentTransport {
+    fn send_payment_notification(
+        &self,
+        client_pubkey: String,
+        request_event_id: String,
+        mirrored_wrap_kind: Option<u16>,
+        notification: contextvm_sdk::JsonRpcMessage,
+    ) -> Pin<Box<dyn Future<Output = contextvm_sdk::Result<()>> + Send>> {
+        (self.notification_sender)(
+            client_pubkey,
+            request_event_id,
+            mirrored_wrap_kind,
+            notification,
+        )
+    }
+
+    fn send_targeted_response(
+        &self,
+        client_pubkey: String,
+        request_event_id: String,
+        response: contextvm_sdk::JsonRpcMessage,
+    ) -> Pin<Box<dyn Future<Output = contextvm_sdk::Result<()>> + Send>> {
+        (self.targeted_sender)(client_pubkey, request_event_id, response)
+    }
+}
 
 impl Server {
     fn not_started_error() -> FfiError {
@@ -726,6 +768,13 @@ impl Server {
         self.inner.lock().receiver.clone()
     }
 
+    fn no_payment_gate_error() -> FfiError {
+        FfiError {
+            code: crate::error::ErrorCode::Payment,
+            message: "payments not configured".into(),
+        }
+    }
+
     /// Test-only constructor that injects a mock relay pool.
     #[doc(hidden)]
     pub fn new_with_relay_pool(
@@ -762,6 +811,7 @@ impl Server {
                 payment_policy: None,
                 transport: None,
                 receiver: None,
+                payment_gate: None,
                 relay_pool_override: None,
             }),
         })
@@ -846,33 +896,79 @@ impl Server {
         sdk_config.request_timeout = Duration::from_secs(request);
         sdk_config.session_timeout = Duration::from_secs(session);
 
-        let result = global_runtime()
-            .block_on(async move {
-                let mut transport = if let Some(pool) = relay_pool_override {
-                    contextvm_sdk::NostrServerTransport::with_relay_pool(sdk_config, pool).await?
-                } else {
-                    contextvm_sdk::NostrServerTransport::new(self.keys.clone(), sdk_config).await?
-                };
+        let mut payment_extra = extra_tags;
+        if payment_enabled {
+            payment_extra.extend(contextvm_sdk::payments::tags::pmi_tags(&[
+                contextvm_sdk::payments::constants::PMI_BITCOIN_LIGHTNING_BOLT11.into(),
+            ]));
+            if matches!(
+                payment_policy,
+                Some(contextvm_sdk::payments::PaymentInteractionPolicy::Optional)
+            ) {
+                payment_extra.push(contextvm_sdk::payments::tags::payment_interaction_tag(
+                    contextvm_sdk::core::types::PaymentInteractionMode::ExplicitGating,
+                ));
+            }
+        }
 
-                if !extra_tags.is_empty() {
-                    transport.set_announcement_extra_tags(extra_tags);
-                }
-                if !pricing_tags.is_empty() {
-                    transport.set_announcement_pricing_tags(pricing_tags);
-                }
-                if let Some(policy) = payment_policy {
-                    transport.set_supported_payment_interaction(policy);
-                }
+        let gate_caps: Vec<crate::payment_gate::PricedCapability> =
+            priced_capabilities.iter().map(|c| c.into()).collect();
+        let gate_config = PaymentGateConfig {
+            payment_ttl_cap_secs: ttl_cap,
+            execution_budget_secs: exec,
+            request_timeout_secs: request,
+            session_timeout_secs: session,
+            parked_cap: 128,
+            event_queue_bound: 64,
+            policy: crate::payment_gate::PaymentLifecyclePolicy::Transparent,
+            priced_capabilities: gate_caps,
+        };
 
-                transport.start().await?;
-                transport.spawn_discoverability_publication();
+        let result = global_runtime().block_on(async move {
+            let mut transport = if let Some(pool) = relay_pool_override {
+                contextvm_sdk::NostrServerTransport::with_relay_pool(sdk_config, pool).await
+            } else {
+                contextvm_sdk::NostrServerTransport::new(self.keys.clone(), sdk_config).await
+            }
+            .map_err(FfiError::from)?;
 
-                Ok::<_, contextvm_sdk::Error>(transport)
-            })
-            .map_err(FfiError::from);
+            if !payment_extra.is_empty() {
+                transport.set_announcement_extra_tags(payment_extra);
+            }
+            if !pricing_tags.is_empty() {
+                transport.set_announcement_pricing_tags(pricing_tags);
+            }
+            if let Some(policy) = payment_policy {
+                transport.set_supported_payment_interaction(policy);
+            }
+
+            // Build and register the payment gate before start() so its senders capture
+            // the tag sets set above and the middleware chain is frozen in place.
+            let payment_gate = if !priced_capabilities.is_empty() {
+                let notification_sender =
+                    transport.payment_notification_sender(Duration::from_secs(ttl_cap));
+                let targeted_sender = transport.targeted_response_sender();
+                let gate_transport = Arc::new(ServerPaymentTransport {
+                    notification_sender,
+                    targeted_sender,
+                });
+                let gate = PaymentGate::new(gate_config, gate_transport)?;
+                let middleware: Arc<dyn contextvm_sdk::transport::server::InboundMiddleware> =
+                    Arc::new(gate.clone());
+                transport.add_inbound_middleware(middleware);
+                Some(gate)
+            } else {
+                None
+            };
+
+            transport.start().await.map_err(FfiError::from)?;
+            transport.spawn_discoverability_publication();
+
+            Ok::<_, FfiError>((transport, payment_gate))
+        });
 
         match result {
-            Ok(mut transport) => {
+            Ok((mut transport, payment_gate)) => {
                 let receiver = transport.take_message_receiver().ok_or_else(|| FfiError {
                     code: crate::error::ErrorCode::Other,
                     message: "receiver already taken".into(),
@@ -880,6 +976,7 @@ impl Server {
                 let mut inner = self.inner.lock();
                 inner.transport = Some(Arc::new(tokio::sync::Mutex::new(transport)));
                 inner.receiver = Some(Arc::new(tokio::sync::Mutex::new(receiver)));
+                inner.payment_gate = payment_gate;
                 self.state.store(STATE_STARTED, Ordering::SeqCst);
                 Ok(())
             }
@@ -977,13 +1074,15 @@ impl Server {
 
     /// Register priced capabilities from a JSON array.
     ///
-    /// Parsed and validated immediately; the actual `cap` tag derivation is applied
-    /// inside `start()` in a later phase.
+    /// Parsed and validated immediately, and the announcement `cap` pricing tags are
+    /// derived from the same source of truth used by the payment gate.
     pub fn set_priced_capabilities_json(&self, json: &str) -> Result<(), FfiError> {
         self.require_configuring()?;
         let caps = parse_priced_capabilities_json(json)?;
+        let tags = contextvm_sdk::payments::tags::cap_tags_from_priced_capabilities(&caps);
         let mut inner = self.inner.lock();
         inner.priced_capabilities = caps;
+        inner.pricing_tags = tags;
         Ok(())
     }
 
@@ -996,6 +1095,97 @@ impl Server {
         let mut inner = self.inner.lock();
         inner.payment_policy = Some(sdk_payment_interaction_policy(policy));
         Ok(())
+    }
+
+    /// Receive the next payment-gate request, timing out after `timeout_secs`.
+    ///
+    /// Returns `None` on timeout (or when no payment gate is configured).
+    pub fn recv_payment_gate_request(
+        &self,
+        timeout_secs: u64,
+    ) -> Result<Option<crate::payment_gate::PaymentGateRequest>, FfiError> {
+        self.require_started()?;
+        let gate = self.inner.lock().payment_gate.clone();
+        match gate {
+            Some(gate) => Ok(global_runtime()
+                .block_on(async { gate.recv_timeout(Duration::from_secs(timeout_secs)).await })),
+            None => Ok(None),
+        }
+    }
+
+    /// Submit an invoice for a parked payment-gate request.
+    pub fn submit_invoice(
+        &self,
+        request_event_id: String,
+        amount_sats: i64,
+        pay_req: String,
+        pmi: String,
+        ttl_secs: u64,
+        description: Option<String>,
+    ) -> Result<(), FfiError> {
+        self.require_started()?;
+        let gate = self
+            .inner
+            .lock()
+            .payment_gate
+            .clone()
+            .ok_or_else(Self::no_payment_gate_error)?;
+        global_runtime().block_on(async {
+            gate.submit_invoice(
+                &request_event_id,
+                amount_sats,
+                &pay_req,
+                &pmi,
+                ttl_secs,
+                description.as_deref(),
+            )
+            .await
+        })
+    }
+
+    /// Mark a previously submitted invoice as settled.
+    pub fn mark_payment_settled(
+        &self,
+        pay_req: String,
+        meta_json: Option<String>,
+    ) -> Result<(), FfiError> {
+        self.require_started()?;
+        let gate = self
+            .inner
+            .lock()
+            .payment_gate
+            .clone()
+            .ok_or_else(Self::no_payment_gate_error)?;
+        global_runtime().block_on(async { gate.mark_settled(&pay_req, meta_json.as_deref()).await })
+    }
+
+    /// Mark a previously submitted invoice as failed.
+    pub fn mark_payment_failed(
+        &self,
+        pay_req: String,
+        message: Option<String>,
+    ) -> Result<(), FfiError> {
+        self.require_started()?;
+        let gate = self
+            .inner
+            .lock()
+            .payment_gate
+            .clone()
+            .ok_or_else(Self::no_payment_gate_error)?;
+        let message = message.as_deref().unwrap_or("");
+        global_runtime().block_on(async { gate.mark_failed(&pay_req, message).await })
+    }
+
+    /// Mark a parked paid request as already completed so it can be replayed for free.
+    pub fn mark_replayed(&self, request_event_id: String) -> Result<(), FfiError> {
+        self.require_started()?;
+        let gate = self
+            .inner
+            .lock()
+            .payment_gate
+            .clone()
+            .ok_or_else(Self::no_payment_gate_error)?;
+        global_runtime().block_on(async { gate.mark_replayed(&request_event_id).await })
     }
 
     /// Publish server announcement.
@@ -1120,6 +1310,7 @@ impl Server {
 
         let mut inner = self.inner.lock();
         inner.receiver = None;
+        inner.payment_gate = None;
         Ok(())
     }
 }

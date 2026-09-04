@@ -51,6 +51,8 @@ pub use handle::FfiHandle;
 // Re-export core UniFFI objects so Rust integration tests can drive the two-phase
 // server lifecycle (e.g. with a mock relay pool). These are not a stable public API.
 #[doc(hidden)]
+pub use payment_gate::PaymentGateRequest;
+#[doc(hidden)]
 pub use uniffi_types::{
     CapabilityExclusion, Client, ClientConfig, EncryptionMode, GiftWrapMode, IncomingRequest,
     JsonRpcMessage, Keys, PaymentInteractionPolicy, Server, ServerConfig,

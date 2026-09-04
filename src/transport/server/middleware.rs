@@ -120,6 +120,16 @@ pub struct Next {
 }
 
 impl Next {
+    /// Keep the request's route and open-stream slot alive without forwarding the
+    /// message yet. Used by middleware (e.g. payment gating) that parks a request
+    /// and resolves it asynchronously from a foreign caller. The middleware still
+    /// must call [`run`](Self::run) exactly once when the request is finally ready to
+    /// forward, or let the route time out.
+    pub fn keep_alive(&self) {
+        self.reached.store(true, Ordering::SeqCst);
+        self.open_stream.mark_forwarded(&self.ctx.request_event_id);
+    }
+
     /// Advance the chain. At the end, mark reached, forward to the worker, and return `true`.
     pub async fn run(self, message: JsonRpcMessage) -> bool {
         match self.chain.get(self.index) {

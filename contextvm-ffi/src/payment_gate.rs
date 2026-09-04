@@ -10,10 +10,8 @@
 //! W1c can bridge the gate to the real `NostrServerTransport` without this
 //! module depending on transport internals.
 
-// The module is not yet wired into the broader FFI surface (W1c will consume it
-// in a later phase), so public types and helpers are intentionally "dead" for
-// now.  This is a temporary Phase-2 allowance.
-#![allow(dead_code)]
+// Phase 3 wires this module into the UniFFI `Server` start() path.  A few
+// helpers (e.g. parse_priced_capabilities_json) remain test-only.
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
@@ -123,6 +121,19 @@ impl PricedCapability {
     }
 }
 
+impl From<&contextvm_sdk::payments::types::PricedCapability> for PricedCapability {
+    fn from(cap: &contextvm_sdk::payments::types::PricedCapability) -> Self {
+        Self {
+            method: cap.method.clone(),
+            name: cap.name.clone().unwrap_or_default(),
+            amount_sats: cap.amount,
+            max_amount_sats: cap.max_amount,
+            currency_unit: cap.currency_unit.clone(),
+            description: cap.description.clone().unwrap_or_default(),
+        }
+    }
+}
+
 /// Configuration for the payment gate.
 #[derive(Debug, Clone)]
 pub struct PaymentGateConfig {
@@ -160,7 +171,7 @@ impl Default for PaymentGateConfig {
 }
 
 /// A request emitted to the foreign consumer (W1c) when a paid call is parked.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, uniffi::Record)]
 pub struct PaymentGateRequest {
     /// Original request Nostr event id.
     pub request_event_id: String,
@@ -204,6 +215,9 @@ pub trait PaymentGateTransport: Send + Sync {
 /// small internal trait.  Unit tests supply a fake implementation that records
 /// the forwarded message.
 pub(crate) trait PaymentNext: Send {
+    /// Keep the request's route alive without forwarding the message yet.
+    fn keep_alive(&self);
+
     /// Consume the continuation and forward `message` down the chain.
     fn run(self: Box<Self>, message: JsonRpcMessage) -> Pin<Box<dyn Future<Output = bool> + Send>>;
 }
@@ -211,6 +225,10 @@ pub(crate) trait PaymentNext: Send {
 struct SdkNext(Next);
 
 impl PaymentNext for SdkNext {
+    fn keep_alive(&self) {
+        self.0.keep_alive();
+    }
+
     fn run(self: Box<Self>, message: JsonRpcMessage) -> Pin<Box<dyn Future<Output = bool> + Send>> {
         let next = (*self).0;
         Box::pin(async move { next.run(message).await })
@@ -337,6 +355,7 @@ impl PaymentGate {
     }
 
     /// Try to receive a [`PaymentGateRequest`] without waiting.
+    #[cfg(test)]
     pub fn try_recv(&self) -> Option<PaymentGateRequest> {
         if let Ok(mut rx) = self.inner.events_rx.try_lock() {
             rx.try_recv().ok()
@@ -525,6 +544,7 @@ impl PaymentGate {
     }
 
     /// Validate a JSON string containing a list of priced capabilities.
+    #[cfg(test)]
     pub fn parse_priced_capabilities_json(s: &str) -> Result<Vec<PricedCapability>, FfiError> {
         let caps: Vec<PricedCapability> = serde_json::from_str(s).map_err(|e| FfiError {
             code: ErrorCode::Validation,
@@ -626,6 +646,10 @@ impl PaymentGate {
                     .unwrap_or_else(|| capability.name.clone());
 
                 let next_and_message = if lifecycle == PaymentLifecyclePolicy::Transparent {
+                    // Keep the original request route alive across the foreign
+                    // invoice/settlement window so the eventual response can be
+                    // delivered on the same route.
+                    next.keep_alive();
                     Some((next, JsonRpcMessage::Request(request.clone())))
                 } else {
                     None
@@ -1223,7 +1247,6 @@ enum SettleOutcome {
 
 /// Outcome of preparing a `mark_replayed` call.
 struct ReplayOutcome {
-    canonical_key: String,
     identity: CanonicalInvocationIdentity,
     next_and_message: Option<(Box<dyn PaymentNext>, JsonRpcMessage)>,
     lifecycle: PaymentLifecyclePolicy,
@@ -1456,7 +1479,6 @@ impl PaymentGate {
                 drop(parking);
 
                 Ok(ReplayOutcome {
-                    canonical_key,
                     identity,
                     next_and_message,
                     lifecycle,
@@ -1583,6 +1605,7 @@ mod tests {
     }
 
     #[derive(Debug, Clone)]
+    #[allow(dead_code)]
     enum TransportRecord {
         Notification {
             client_pubkey: String,
@@ -1659,6 +1682,8 @@ mod tests {
     }
 
     impl PaymentNext for FakeNext {
+        fn keep_alive(&self) {}
+
         fn run(
             self: Box<Self>,
             message: JsonRpcMessage,
