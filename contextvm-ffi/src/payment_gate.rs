@@ -408,11 +408,17 @@ impl PaymentGate {
             description,
         )?;
 
-        if lifecycle == PaymentLifecyclePolicy::Gating {
-            self.send_payment_required_error(&canonical_key).await;
+        let send_result = if lifecycle == PaymentLifecyclePolicy::Gating {
+            self.send_payment_required_error(&canonical_key).await
         } else {
             self.send_payment_required_notification(&canonical_key)
+                .await
+        };
+
+        if let Err(e) = send_result {
+            self.rollback_invoice(&canonical_key, lifecycle, released_next, nonce)
                 .await;
+            return Err(e);
         }
 
         if let Some(next) = released_next {
@@ -452,10 +458,14 @@ impl PaymentGate {
                     return Err(payment_error("no parked request to forward"));
                 };
 
-                // Grant and immediately consume it so the canonical id is paid for the
-                // single forward we are about to perform.
-                self.inner.auth_store.grant(&identity, ttl_ms);
-                self.inner.auth_store.claim(&identity);
+                // Grant and immediately consume it under one lock so the canonical id
+                // is paid for the single forward we are about to perform and can never
+                // be stolen by a concurrent duplicate.
+                if !self.inner.auth_store.grant_and_claim(&identity, ttl_ms) {
+                    return Err(payment_error(
+                        "settlement grant was concurrently consumed or expired",
+                    ));
+                }
 
                 let accepted = PaymentAcceptedParams { amount, pmi, meta };
                 let _ = self
@@ -760,17 +770,18 @@ impl PaymentGate {
                     description,
                 } = &snapshot.state
                 {
-                    self.send_payment_required_notification_data(
-                        &snapshot.client_pubkey,
-                        &snapshot.request_event_id,
-                        snapshot.mirrored_wrap_kind,
-                        *amount,
-                        pay_req,
-                        pmi,
-                        *ttl_secs,
-                        description.as_deref(),
-                    )
-                    .await;
+                    let _ = self
+                        .send_payment_required_notification_data(
+                            &snapshot.client_pubkey,
+                            &snapshot.request_event_id,
+                            snapshot.mirrored_wrap_kind,
+                            *amount,
+                            pay_req,
+                            pmi,
+                            *ttl_secs,
+                            description.as_deref(),
+                        )
+                        .await;
                 }
 
                 // The duplicate is not forwarded; release its continuation so the
@@ -900,11 +911,11 @@ impl PaymentGate {
         self.park_ttl().as_millis() as u64
     }
 
-    async fn send_payment_required_error(&self, canonical_key: &str) {
+    async fn send_payment_required_error(&self, canonical_key: &str) -> Result<(), FfiError> {
         let (client_pubkey, request_event_id, request_id, option) = {
             let parking = self.inner.parking.lock();
             let Some(entry) = parking.by_key.get(canonical_key) else {
-                return;
+                return Err(payment_error("parked entry disappeared before response"));
             };
             let PaymentState::InvoiceIssued {
                 pay_req,
@@ -914,7 +925,7 @@ impl PaymentGate {
                 description,
             } = &entry.state
             else {
-                return;
+                return Err(payment_error("invoice state missing before response"));
             };
             let option = PaymentOption {
                 amount: *amount,
@@ -933,18 +944,21 @@ impl PaymentGate {
         };
 
         let response = build_payment_required_error(request_id, option);
-        let _ = self
-            .inner
+        self.inner
             .transport
             .send_targeted_response(
                 client_pubkey,
                 request_event_id,
                 JsonRpcMessage::ErrorResponse(response),
             )
-            .await;
+            .await
+            .map_err(|e| payment_error(format!("failed to publish payment_required: {e}")))
     }
 
-    async fn send_payment_required_notification(&self, canonical_key: &str) {
+    async fn send_payment_required_notification(
+        &self,
+        canonical_key: &str,
+    ) -> Result<(), FfiError> {
         let (
             client_pubkey,
             request_event_id,
@@ -957,7 +971,9 @@ impl PaymentGate {
         ) = {
             let parking = self.inner.parking.lock();
             let Some(entry) = parking.by_key.get(canonical_key) else {
-                return;
+                return Err(payment_error(
+                    "parked entry disappeared before notification",
+                ));
             };
             let PaymentState::InvoiceIssued {
                 pay_req,
@@ -967,7 +983,7 @@ impl PaymentGate {
                 description,
             } = &entry.state
             else {
-                return;
+                return Err(payment_error("invoice state missing before notification"));
             };
             (
                 entry.client_pubkey.clone(),
@@ -991,7 +1007,7 @@ impl PaymentGate {
             ttl,
             description.as_deref(),
         )
-        .await;
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1005,7 +1021,7 @@ impl PaymentGate {
         pmi: &str,
         ttl_secs: u64,
         description: Option<&str>,
-    ) {
+    ) -> Result<(), FfiError> {
         let params = PaymentRequiredParams {
             amount,
             pay_req: pay_req.into(),
@@ -1019,8 +1035,7 @@ impl PaymentGate {
             method: PAYMENT_REQUIRED_METHOD.into(),
             params: Some(serde_json::to_value(&params).expect("serialize")),
         });
-        let _ = self
-            .inner
+        self.inner
             .transport
             .send_payment_notification(
                 client_pubkey.into(),
@@ -1028,7 +1043,8 @@ impl PaymentGate {
                 mirrored_wrap_kind,
                 notification,
             )
-            .await;
+            .await
+            .map_err(|e| payment_error(format!("failed to publish payment_required: {e}")))
     }
 
     async fn send_payment_pending(
@@ -1337,6 +1353,52 @@ impl PaymentGate {
         Ok((canonical_key, nonce, expires_at, lifecycle, released_next))
     }
 
+    /// Rollback an invoice transition when the transport publish fails.
+    ///
+    /// Restores `AwaitingInvoice` and (in gating mode) the parked `Next`, resets the
+    /// TTL to the original park budget, and spawns a TTL worker so the consumer can
+    /// retry `submit_invoice` later.
+    async fn rollback_invoice(
+        &self,
+        canonical_key: &str,
+        lifecycle: PaymentLifecyclePolicy,
+        released_next: Option<Box<dyn PaymentNext>>,
+        nonce: u64,
+    ) {
+        let now = tokio::time::Instant::now();
+        let expires_at = now + self.park_ttl();
+
+        let identity = {
+            let mut parking = self.inner.parking.lock();
+            if let Some(entry) = parking.by_key.get_mut(canonical_key) {
+                if matches!(entry.state, PaymentState::InvoiceIssued { .. }) {
+                    entry.state = PaymentState::AwaitingInvoice;
+                    entry.expires_at = expires_at;
+                    if lifecycle == PaymentLifecyclePolicy::Gating {
+                        if let Some(next) = released_next {
+                            entry.next_and_message =
+                                Some((next, JsonRpcMessage::Request(entry.request.clone())));
+                        }
+                    }
+                }
+                Some(entry.identity.clone())
+            } else {
+                None
+            }
+        };
+
+        if let Some(identity) = identity {
+            self.inner
+                .auth_store
+                .update_pending_ttl(&identity, self.park_ttl_ms());
+        }
+
+        tokio::spawn(
+            self.clone()
+                .ttl_worker(canonical_key.to_string(), nonce, expires_at),
+        );
+    }
+
     async fn prepare_settle(&self, pay_req: &str) -> Result<SettleOutcome, FfiError> {
         let now = tokio::time::Instant::now();
         let canonical_key = {
@@ -1505,6 +1567,7 @@ mod tests {
         PAYMENT_REQUIRED_ERROR_CODE, PAYMENT_REQUIRED_METHOD,
     };
     use contextvm_sdk::transport::server::InboundContext;
+    use std::sync::atomic::AtomicUsize;
     use tokio_util::sync::CancellationToken;
 
     fn test_config(policy: PaymentLifecyclePolicy) -> PaymentGateConfig {
@@ -1587,15 +1650,31 @@ mod tests {
     }
 
     #[derive(Clone)]
-    struct FakeTransport(Arc<std::sync::Mutex<Vec<TransportRecord>>>);
+    struct FakeTransport {
+        inner: Arc<std::sync::Mutex<Vec<TransportRecord>>>,
+        fail_next_notification: Arc<AtomicUsize>,
+        fail_next_response: Arc<AtomicUsize>,
+    }
 
     impl FakeTransport {
         fn new() -> Self {
-            Self(Arc::new(std::sync::Mutex::new(Vec::new())))
+            Self {
+                inner: Arc::new(std::sync::Mutex::new(Vec::new())),
+                fail_next_notification: Arc::new(AtomicUsize::new(0)),
+                fail_next_response: Arc::new(AtomicUsize::new(0)),
+            }
         }
 
         fn records(&self) -> Vec<TransportRecord> {
-            self.0.lock().unwrap().clone()
+            self.inner.lock().unwrap().clone()
+        }
+
+        fn fail_next_notification(&self, count: usize) {
+            self.fail_next_notification.store(count, Ordering::SeqCst);
+        }
+
+        fn fail_next_response(&self, count: usize) {
+            self.fail_next_response.store(count, Ordering::SeqCst);
         }
     }
 
@@ -1607,8 +1686,23 @@ mod tests {
             mirrored_wrap_kind: Option<u16>,
             notification: JsonRpcMessage,
         ) -> Pin<Box<dyn Future<Output = contextvm_sdk::Result<()>> + Send>> {
-            let inner = self.0.clone();
+            let inner = self.inner.clone();
+            let counter = self.fail_next_notification.clone();
             Box::pin(async move {
+                if counter
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
+                        if v > 0 {
+                            Some(v - 1)
+                        } else {
+                            None
+                        }
+                    })
+                    .is_ok()
+                {
+                    return Err(contextvm_sdk::Error::Transport(
+                        "injected notification failure".into(),
+                    ));
+                }
                 inner.lock().unwrap().push(TransportRecord::Notification {
                     client_pubkey,
                     request_event_id,
@@ -1625,8 +1719,23 @@ mod tests {
             request_event_id: String,
             response: JsonRpcMessage,
         ) -> Pin<Box<dyn Future<Output = contextvm_sdk::Result<()>> + Send>> {
-            let inner = self.0.clone();
+            let inner = self.inner.clone();
+            let counter = self.fail_next_response.clone();
             Box::pin(async move {
+                if counter
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
+                        if v > 0 {
+                            Some(v - 1)
+                        } else {
+                            None
+                        }
+                    })
+                    .is_ok()
+                {
+                    return Err(contextvm_sdk::Error::Transport(
+                        "injected response failure".into(),
+                    ));
+                }
                 inner.lock().unwrap().push(TransportRecord::Response {
                     client_pubkey,
                     request_event_id,
@@ -2268,6 +2377,251 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&response).unwrap(),
             serde_json::to_value(&expected).unwrap(),
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn payment_pending_error_byte_identical_to_sdk() {
+        let transport = Arc::new(FakeTransport::new());
+        let gate = PaymentGate::new(
+            test_config(PaymentLifecyclePolicy::Gating),
+            transport.clone(),
+        )
+        .unwrap();
+        let ctx = make_context("client", "e1", Some(PaymentInteractionMode::ExplicitGating));
+        let (_next, _recorder) = FakeNext::new();
+
+        gate.handle_inner(tools_call("1", "echo"), &ctx, boxed_next(_recorder.clone()))
+            .await;
+        let event = gate.try_recv().unwrap();
+
+        // A duplicate before an invoice is issued answers with -32043.
+        let ctx2 = make_context("client", "e2", Some(PaymentInteractionMode::ExplicitGating));
+        let (_next2, _recorder2) = FakeNext::new();
+        gate.handle_inner(
+            tools_call("2", "echo"),
+            &ctx2,
+            boxed_next(_recorder2.clone()),
+        )
+        .await;
+
+        let response = find_response(&transport.records()).expect("payment_pending error");
+        let remaining_ms = 10_000; // park_ttl is 10 s in the paused clock
+        let expected = build_payment_pending_error(serde_json::json!("2"), remaining_ms);
+
+        assert_eq!(
+            serde_json::to_value(&response).unwrap(),
+            serde_json::to_value(&expected).unwrap(),
+        );
+
+        // The original request is still parked and can be invoiced.
+        gate.submit_invoice(
+            &event.request_event_id,
+            1000,
+            "lnbc123",
+            "bitcoin-lightning-bolt11",
+            10,
+            Some("test"),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn transparent_submit_invoice_failed_publish_is_retryable() {
+        let transport = Arc::new(FakeTransport::new());
+        let gate = PaymentGate::new(
+            test_config(PaymentLifecyclePolicy::Transparent),
+            transport.clone(),
+        )
+        .unwrap();
+        let (_next, recorder) = FakeNext::new();
+        let ctx = make_context("client", "e1", None);
+
+        gate.handle_inner(tools_call("1", "echo"), &ctx, boxed_next(recorder.clone()))
+            .await;
+        let event = gate.try_recv().unwrap();
+
+        transport.fail_next_notification(1);
+        let err = gate
+            .submit_invoice(
+                &event.request_event_id,
+                1000,
+                "lnbc...",
+                "bitcoin-lightning-bolt11",
+                10,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Payment);
+
+        // No payment_required notification was recorded (the publish failed).
+        assert!(find_notification(&transport.records(), PAYMENT_REQUIRED_METHOD).is_none());
+
+        // The state is back to AwaitingInvoice, so the same invoice can be retried.
+        gate.submit_invoice(
+            &event.request_event_id,
+            1000,
+            "lnbc...",
+            "bitcoin-lightning-bolt11",
+            10,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(find_notification(&transport.records(), PAYMENT_REQUIRED_METHOD).is_some());
+
+        // Settlement still forwards the original parked Next.
+        gate.mark_settled("lnbc...", None).await.unwrap();
+        assert!(recorder.lock().unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn gating_submit_invoice_failed_publish_is_retryable() {
+        let transport = Arc::new(FakeTransport::new());
+        let gate = PaymentGate::new(
+            test_config(PaymentLifecyclePolicy::Gating),
+            transport.clone(),
+        )
+        .unwrap();
+        let (_next, _recorder) = FakeNext::new();
+        let ctx = make_context("client", "e1", Some(PaymentInteractionMode::ExplicitGating));
+
+        gate.handle_inner(tools_call("1", "echo"), &ctx, boxed_next(_recorder.clone()))
+            .await;
+        let event = gate.try_recv().unwrap();
+
+        transport.fail_next_response(1);
+        let err = gate
+            .submit_invoice(
+                &event.request_event_id,
+                1000,
+                "lnbc...",
+                "bitcoin-lightning-bolt11",
+                10,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Payment);
+
+        // No targeted -32042 was recorded (the publish failed).
+        assert!(find_response(&transport.records()).is_none());
+
+        // The state is back to AwaitingInvoice, so the same invoice can be retried.
+        gate.submit_invoice(
+            &event.request_event_id,
+            1000,
+            "lnbc...",
+            "bitcoin-lightning-bolt11",
+            10,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(find_response(&transport.records()).is_some());
+    }
+
+    #[tokio::test]
+    async fn concurrent_settle_with_duplicate_requests_yields_one_forward() {
+        let transport = Arc::new(FakeTransport::new());
+        let gate = Arc::new(
+            PaymentGate::new(
+                test_config(PaymentLifecyclePolicy::Transparent),
+                transport.clone(),
+            )
+            .unwrap(),
+        );
+        let (_next, recorder) = FakeNext::new();
+        let ctx = make_context("client", "e1", None);
+
+        gate.handle_inner(tools_call("1", "echo"), &ctx, boxed_next(recorder.clone()))
+            .await;
+        let event = gate.try_recv().unwrap();
+
+        gate.submit_invoice(
+            &event.request_event_id,
+            1000,
+            "lnbc-concurrent",
+            "bitcoin-lightning-bolt11",
+            10,
+            None,
+        )
+        .await
+        .unwrap();
+
+        const N: usize = 10;
+        let barrier = Arc::new(tokio::sync::Barrier::new(N + 1));
+
+        enum RaceResult {
+            Duplicate {
+                forwarded: bool,
+                recorder: Arc<std::sync::Mutex<Option<JsonRpcMessage>>>,
+            },
+            Settled(std::result::Result<(), FfiError>),
+        }
+
+        let mut set = tokio::task::JoinSet::new();
+        for i in 0..N {
+            let g = gate.clone();
+            let b = barrier.clone();
+            let (_dup_next, dup_recorder) = FakeNext::new();
+            let ctx_dup = make_context("client", &format!("e-dup-{i}"), None);
+            set.spawn(async move {
+                b.wait().await;
+                let forwarded = g
+                    .handle_inner(
+                        tools_call(&format!("dup-{i}"), "echo"),
+                        &ctx_dup,
+                        boxed_next(dup_recorder.clone()),
+                    )
+                    .await;
+                RaceResult::Duplicate {
+                    forwarded,
+                    recorder: dup_recorder,
+                }
+            });
+        }
+
+        let gate_for_settle = gate.clone();
+        let b = barrier.clone();
+        set.spawn(async move {
+            b.wait().await;
+            RaceResult::Settled(gate_for_settle.mark_settled("lnbc-concurrent", None).await)
+        });
+
+        let mut ok_settles = 0;
+        let mut forwards = 0;
+        while let Some(res) = set.join_next().await {
+            match res.unwrap() {
+                RaceResult::Duplicate {
+                    forwarded,
+                    recorder,
+                } => {
+                    if forwarded {
+                        forwards += 1;
+                    }
+                    assert!(
+                        recorder.lock().unwrap().is_none(),
+                        "duplicate must not forward"
+                    );
+                }
+                RaceResult::Settled(r) => {
+                    if r.is_ok() {
+                        ok_settles += 1;
+                    }
+                }
+            }
+        }
+
+        assert_eq!(ok_settles, 1, "exactly one mark_settled wins");
+        assert_eq!(forwards, 0, "duplicates never forward");
+        assert!(
+            recorder.lock().unwrap().is_some(),
+            "the original parked Next was forwarded exactly once"
         );
     }
 }
