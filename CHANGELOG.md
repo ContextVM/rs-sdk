@@ -4,6 +4,11 @@
 
 ### Added
 
+- `AuthorizationStore::grant_and_claim` — atomically records a paid grant and
+  consumes it in one lock, so a transparent payment lifecycle can settle and
+  forward exactly once without a concurrent duplicate claiming the grant between
+  `grant` and `claim`.
+
 - `InboundContext::new(...)` — supported public constructor for the (previously
   test-only-constructible, `#[non_exhaustive]`) inbound middleware context, needed
   by downstream middleware consumers such as the FFI payment gate.
@@ -116,6 +121,11 @@
     client shapes, and the operational notes for auto-pay deployments.
 
 ### Fixed
+
+- Inbound middleware `Next::run` no longer marks the continuation `released` before
+  terminal delivery succeeds. If the worker send fails (e.g., the server is closing),
+  `run` now calls `release()` synchronously so the request's route, wrap-kind entry,
+  and open-stream slot are never leaked.
 
 - Client transport: the response-correlation entry was consumed by the FIRST correlated
   inbound message of any kind, so a server that emitted a correlated notification before
