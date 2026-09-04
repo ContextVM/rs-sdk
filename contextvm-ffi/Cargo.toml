@@ -17,6 +17,9 @@ serde_json = "1"
 uniffi = "0.31"
 parking_lot = "0.12"
 
+[dev-dependencies]
+contextvm-sdk = { path = "..", features = ["test-utils"] }
+
 [features]
 default = []
 # End-to-end tests that spawn the `nak` CLI relay (https://github.com/nbd-wtf/nostr-cli).
