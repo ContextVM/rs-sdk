@@ -12,10 +12,13 @@ crate-type = ["cdylib", "staticlib", "lib"]
 [dependencies]
 contextvm-sdk = { path = ".." }
 nostr-sdk = { version = "0.44", features = ["nip59"] }
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["full", "test-util"] }
+tokio-util = { version = "0.7", default-features = false }
 serde_json = "1"
+serde = { version = "1", features = ["derive"] }
 uniffi = "0.31"
 parking_lot = "0.12"
+async-trait = "0.1"
 
 [features]
 default = []

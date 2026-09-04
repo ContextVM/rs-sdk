@@ -20,6 +20,7 @@ mod discovery;
 pub mod error;
 pub mod handle;
 mod kv;
+mod payment_gate;
 mod runtime;
 pub mod types;
 mod uniffi_types;
