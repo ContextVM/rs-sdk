@@ -159,6 +159,17 @@
   effective-mode disclosure behind the same one-shot latches, and `cap` pricing tags on a
   capability-list result.
 
+- Payment error payloads (`-32042` Payment Required and `-32043` Payment Pending) are now
+  built through shared SDK helpers, `build_payment_required_error` and
+  `build_payment_pending_error`, so the FFI targeted responses and the server middleware
+  produce byte-identical error objects. The helpers are now public in
+  `contextvm_sdk::payments`.
+
+- `IncomingRequest` and the `Next` inbound middleware continuation now carry an optional
+  `canonical_invocation_id`, threaded from canonical identity computation through to the
+  FFI `PaymentGateRequest`. This lets foreign payment handlers key their durable
+  `PaymentRecord` by canonical identity.
+
 ### Changed
 
 - rmcp server worker: every client now receives the handler's declared `protocolVersion` in its

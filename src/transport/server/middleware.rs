@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use async_trait::async_trait;
 use futures::future::FutureExt; // .catch_unwind()
@@ -104,7 +105,7 @@ pub trait InboundMiddleware: Send + Sync {
 
 /// The continuation handed to a middleware. Owned/`Arc` so it is `Send + 'static` for the detached
 /// chain. [`run`](Self::run) consumes it, so a middleware forwards at most once.
-#[must_use = "call `run` to forward the message, or drop `Next` to gate (drop) it"]
+#[must_use = "call `run` to forward the message, `release` to drop a kept-alive request, or drop `Next` to gate (drop) it"]
 pub struct Next {
     chain: Arc<[Arc<dyn InboundMiddleware>]>,
     index: usize,
@@ -117,6 +118,16 @@ pub struct Next {
     event: Option<Event>,
     // Set true only at the terminal; the single source of truth for drop-cleanup.
     reached: Arc<AtomicBool>,
+    // Set when `keep_alive` is called. Used by `Drop`/`release` to reverse the route reservation.
+    kept_alive: AtomicBool,
+    // Set by `run` or `release` so `Drop` does not try to re-release an already-consumed Next.
+    released: AtomicBool,
+    // Stamped by a payment gate and attached to the terminal `IncomingRequest`.
+    canonical_invocation_id: Mutex<Option<String>>,
+    // Carried so `release` can pop the route and clean up wrap kinds when a kept-alive Next is
+    // dropped after the chain runner has exited.
+    event_routes: ServerEventRouteStore,
+    request_wrap_kinds: Arc<RwLock<HashMap<String, Option<u16>>>>,
 }
 
 impl Next {
@@ -124,20 +135,29 @@ impl Next {
     /// message yet. Used by middleware (e.g. payment gating) that parks a request
     /// and resolves it asynchronously from a foreign caller. The middleware still
     /// must call [`run`](Self::run) exactly once when the request is finally ready to
-    /// forward, or let the route time out.
+    /// forward, or call [`release`](Self::release) to drop it.
     pub fn keep_alive(&self) {
+        self.kept_alive.store(true, Ordering::SeqCst);
         self.reached.store(true, Ordering::SeqCst);
         self.open_stream.mark_forwarded(&self.ctx.request_event_id);
     }
 
+    /// Stamp this `Next` with a canonical invocation id. The terminal `IncomingRequest` will
+    /// carry it. Used by the payment gate to surface the canonical identity to the handler.
+    pub fn set_canonical_invocation_id(&self, id: String) {
+        *self.canonical_invocation_id.lock().unwrap() = Some(id);
+    }
+
     /// Advance the chain. At the end, mark reached, forward to the worker, and return `true`.
     pub async fn run(self, message: JsonRpcMessage) -> bool {
+        self.released.store(true, Ordering::SeqCst);
         match self.chain.get(self.index) {
             None => {
                 // Terminal: forward to the worker. `reached` is set ONLY here (the sole writer),
                 // so route cleanup is authoritative regardless of what any middleware returns.
                 // Record delivery only on a successful send: if the worker channel is closed
                 // (shutdown), the route is released by cleanup instead of leaked until the sweep.
+                let canonical_invocation_id = self.canonical_invocation_id.lock().unwrap().take();
                 let delivered = self
                     .tx
                     .send(IncomingRequest {
@@ -145,7 +165,8 @@ impl Next {
                         client_pubkey: self.ctx.client_pubkey.clone(),
                         event_id: self.ctx.request_event_id.clone(),
                         is_encrypted: self.ctx.is_encrypted,
-                        event: self.event,
+                        canonical_invocation_id,
+                        event: self.event.clone(),
                     })
                     .is_ok();
                 self.reached.store(delivered, Ordering::SeqCst);
@@ -164,11 +185,82 @@ impl Next {
                     ctx: Arc::clone(&self.ctx),
                     tx: self.tx.clone(),
                     open_stream: self.open_stream.clone(),
-                    event: self.event, // moved forward
+                    event: self.event.clone(), // shared forward
                     reached: Arc::clone(&self.reached),
+                    kept_alive: AtomicBool::new(false),
+                    released: AtomicBool::new(false),
+                    canonical_invocation_id: Mutex::new(None),
+                    event_routes: self.event_routes.clone(),
+                    request_wrap_kinds: Arc::clone(&self.request_wrap_kinds),
                 };
                 mw.handle(message, &self.ctx, next).await
             }
+        }
+    }
+
+    /// Release a kept-alive request without forwarding it. Reverses `keep_alive`, pops the
+    /// request's route and wrap-kind entry, and disposes any open-stream slot.
+    pub async fn release(self) {
+        self.released.store(true, Ordering::SeqCst);
+        let event_id = self.ctx.request_event_id.clone();
+        self.reached.store(false, Ordering::SeqCst);
+        self.open_stream.unmark_forwarded(&event_id);
+
+        let popped_route = self.event_routes.pop(&event_id).await;
+
+        // Release the wrap-kind entry the transport reserved before dispatch (CEP-19),
+        // but ONLY when this cleanup's own pop returned the route. See the same logic in
+        // `run_inbound_chain`.
+        if popped_route.is_some() {
+            self.request_wrap_kinds.write().await.remove(&event_id);
+        }
+
+        // Reclaim the open-stream slot if this was the last chain run and it was un-forwarded.
+        if let Some(slot) = self.open_stream.leave_chain(&event_id) {
+            let token = slot.writer.progress_token().to_string();
+            let client = slot.snapshot.client_pubkey.to_hex();
+            self.open_stream
+                .lock_token_index()
+                .remove(&ServerOpenStreamState::client_token_key(&client, &token));
+            slot.writer.dispose();
+        }
+    }
+}
+
+impl Drop for Next {
+    fn drop(&mut self) {
+        if self.kept_alive.load(Ordering::SeqCst) && !self.released.load(Ordering::SeqCst) {
+            self.released.store(true, Ordering::SeqCst);
+
+            // If the chain runner is still alive, it will observe `reached == false` and
+            // `forwarded == false` and complete route + slot cleanup. If it has already exited,
+            // spawn a cleanup task so a parked `Next` that is dropped after `keep_alive` does not
+            // strand route state.
+            let event_id = self.ctx.request_event_id.clone();
+            let reached = Arc::clone(&self.reached);
+            let open_stream = self.open_stream.clone();
+            let event_routes = self.event_routes.clone();
+            let request_wrap_kinds = Arc::clone(&self.request_wrap_kinds);
+
+            tokio::spawn(async move {
+                reached.store(false, Ordering::SeqCst);
+                open_stream.unmark_forwarded(&event_id);
+
+                let popped_route = event_routes.pop(&event_id).await;
+
+                if popped_route.is_some() {
+                    request_wrap_kinds.write().await.remove(&event_id);
+                }
+
+                if let Some(slot) = open_stream.leave_chain(&event_id) {
+                    let token = slot.writer.progress_token().to_string();
+                    let client = slot.snapshot.client_pubkey.to_hex();
+                    open_stream
+                        .lock_token_index()
+                        .remove(&ServerOpenStreamState::client_token_key(&client, &token));
+                    slot.writer.dispose();
+                }
+            });
         }
     }
 }
@@ -199,6 +291,7 @@ pub(crate) fn dispatch_inbound(
             client_pubkey,
             event_id,
             is_encrypted,
+            canonical_invocation_id: None,
             event,
         });
         return;
@@ -280,6 +373,11 @@ pub(crate) async fn run_inbound_chain(
         open_stream: open_stream.clone(),
         event,
         reached: Arc::clone(&reached),
+        kept_alive: AtomicBool::new(false),
+        released: AtomicBool::new(false),
+        canonical_invocation_id: Mutex::new(None),
+        event_routes: event_routes.clone(),
+        request_wrap_kinds: Arc::clone(&request_wrap_kinds),
     };
 
     // Catch a middleware panic in-task: a panic in a detached tokio::spawn never reaches the event

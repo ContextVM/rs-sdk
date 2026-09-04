@@ -45,7 +45,8 @@ pub use client_payments::{
 };
 pub use errors::PaymentError;
 pub use server_explicit_gating::{
-    create_explicit_gating_middleware, ExplicitGatingMiddlewareParams,
+    build_payment_pending_error, build_payment_required_error, create_explicit_gating_middleware,
+    ExplicitGatingMiddlewareParams,
 };
 pub use server_payments::{
     create_server_payments_middleware, ServerPaymentsMiddlewareParams, ServerPaymentsOptions,
