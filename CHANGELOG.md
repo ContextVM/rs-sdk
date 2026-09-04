@@ -185,6 +185,16 @@
   `mark_payment_failed`, and `mark_replayed`. `Server::start()` wires the gate, derives
   the `cap`/`pmi`/`payment_interaction` announcement tags, and keeps the original
   request route alive for transparent paid requests so the handler result is delivered.
+- **Breaking (contextvm-ffi 0.2.0):** the UniFFI `Server` is now two-phase. `Server::new`
+  only stores the configuration; `Server::start()` builds and starts the transport.
+  Pre-start setters (`set_announcement_extra_tags`, `set_priced_capabilities_json`,
+  `set_payment_interaction_policy`) must be called before `start()` and are enforced by
+  a release-build `Configuring / Started / Closed` state machine. `ErrorCode` gains
+  `NotStarted` and `Closed`, returned by runtime and payment methods before `start()` or
+  after `close()` instead of blocking or panicking. `ServerConfig.request_timeout_secs`
+  and `session_timeout_secs` are now `Option<u64>`: `None` lets `start()` derive
+  payment-aware defaults; `Some(v)` is validated against the route budget and never
+  silently bumped. See `contextvm-ffi/CHANGELOG.md` for the full 0.2.0 release notes.
 
 ## [0.2.2] - 2026-07-29
 

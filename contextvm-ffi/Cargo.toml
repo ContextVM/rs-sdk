@@ -1,6 +1,6 @@
 [package]
 name = "contextvm-ffi"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "FFI bindings for the ContextVM SDK — C header + Python/Swift/Kotlin support"
 license = "MIT"
