@@ -1750,6 +1750,9 @@ mod tests {
             assert_eq!(ErrorCode::Validation as i32, 5, "CVM_VALIDATION");
             assert_eq!(ErrorCode::Unauthorized as i32, 6, "CVM_UNAUTHORIZED");
             assert_eq!(ErrorCode::Serialization as i32, 7, "CVM_SERIALIZATION");
+            assert_eq!(ErrorCode::Payment as i32, 8, "CVM_PAYMENT");
+            assert_eq!(ErrorCode::NotStarted as i32, 9, "CVM_NOT_STARTED");
+            assert_eq!(ErrorCode::Closed as i32, 10, "CVM_CLOSED");
             assert_eq!(ErrorCode::Other as i32, 99, "CVM_OTHER");
         }
     }

@@ -1115,6 +1115,9 @@ mod tests {
             assert_eq!(ErrorCode::Validation as i32, 5);
             assert_eq!(ErrorCode::Unauthorized as i32, 6);
             assert_eq!(ErrorCode::Serialization as i32, 7);
+            assert_eq!(ErrorCode::Payment as i32, 8);
+            assert_eq!(ErrorCode::NotStarted as i32, 9);
+            assert_eq!(ErrorCode::Closed as i32, 10);
             assert_eq!(ErrorCode::Other as i32, 99);
         }
 

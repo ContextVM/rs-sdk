@@ -84,6 +84,8 @@ typedef enum {
     CVM_UNAUTHORIZED = 6,
     CVM_SERIALIZATION = 7,
     CVM_PAYMENT = 8,
+    CVM_NOT_STARTED = 9,
+    CVM_CLOSED = 10,
     CVM_OTHER = 99,
 } CvmErrorCode;
 
