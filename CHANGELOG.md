@@ -4,6 +4,13 @@
 
 ### Added
 
+- `InboundContext::new(...)` — supported public constructor for the (previously
+  test-only-constructible, `#[non_exhaustive]`) inbound middleware context, needed
+  by downstream middleware consumers such as the FFI payment gate.
+- `Next::keep_alive()` — allows an inbound middleware to hold a request route
+  open while parking the message (used by the FFI payment gate's transparent
+  lifecycle to keep the parked request deliverable after settlement).
+
 - CEP-8 capability pricing and payments (in progress; foundational pieces, not yet a
   usable payment flow):
   - Server-side payment-interaction negotiation and advertisement: the server transport
