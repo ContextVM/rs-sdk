@@ -150,13 +150,16 @@ impl Next {
 
     /// Advance the chain. At the end, mark reached, forward to the worker, and return `true`.
     pub async fn run(self, message: JsonRpcMessage) -> bool {
-        self.released.store(true, Ordering::SeqCst);
         match self.chain.get(self.index) {
             None => {
                 // Terminal: forward to the worker. `reached` is set ONLY here (the sole writer),
                 // so route cleanup is authoritative regardless of what any middleware returns.
                 // Record delivery only on a successful send: if the worker channel is closed
                 // (shutdown), the route is released by cleanup instead of leaked until the sweep.
+                //
+                // `released` is set only after a successful delivery. On failure we hand `self`
+                // to `release()` so the route/wrap/open-stream state is reclaimed synchronously
+                // rather than left for the sweep.
                 let canonical_invocation_id = self.canonical_invocation_id.lock().unwrap().take();
                 let delivered = self
                     .tx
@@ -174,8 +177,12 @@ impl Next {
                     // From here the request belongs to the handler and its response, so a later
                     // delivery's drop-cleanup must leave its open-stream writer alone.
                     self.open_stream.mark_forwarded(&self.ctx.request_event_id);
+                    self.released.store(true, Ordering::SeqCst);
+                    true
+                } else {
+                    self.release().await;
+                    false
                 }
-                delivered
             }
             Some(mw) => {
                 let mw = Arc::clone(mw);
@@ -914,5 +921,89 @@ mod tests {
         .await;
         assert!(got2.is_none());
         assert!(!routes.has_event_route("e2").await);
+    }
+
+    /// Parks the continuation and exposes it for a later resumed `run`.
+    struct ParkThenResume(Arc<Mutex<Option<Next>>>);
+
+    #[async_trait]
+    impl InboundMiddleware for ParkThenResume {
+        async fn handle(
+            &self,
+            _message: JsonRpcMessage,
+            _ctx: &InboundContext,
+            next: Next,
+        ) -> bool {
+            next.keep_alive();
+            *self.0.lock().unwrap() = Some(next);
+            false
+        }
+    }
+
+    #[tokio::test]
+    async fn kept_alive_run_delivery_failure_releases_route_and_wrap_kind() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let routes = ServerEventRouteStore::new();
+        let wrap_kinds: Arc<RwLock<HashMap<String, Option<u16>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+
+        routes
+            .register(
+                "e1".to_string(),
+                "client_pk".to_string(),
+                serde_json::json!("1"),
+                None,
+            )
+            .await;
+        wrap_kinds
+            .write()
+            .await
+            .insert("e1".to_string(), Some(1059));
+
+        let parked = Arc::new(Mutex::new(None));
+        let ctx = Arc::new(InboundContext {
+            client_pubkey: "client_pk".to_string(),
+            request_event_id: "e1".to_string(),
+            is_encrypted: false,
+            mirrored_wrap_kind: Some(1059),
+            client_pmis: None,
+            payment_interaction: None,
+            cancel: CancellationToken::new(),
+        });
+
+        run_inbound_chain(
+            chain_of(vec![Arc::new(ParkThenResume(Arc::clone(&parked)))]),
+            ctx,
+            tx,
+            routes.clone(),
+            open_stream_state(),
+            Arc::clone(&wrap_kinds),
+            req("1", "tools/call"),
+            None,
+        )
+        .await;
+
+        // The chain runner exited without cleanup because keep_alive set `reached`.
+        assert!(routes.has_event_route("e1").await);
+        assert!(wrap_kinds.read().await.contains_key("e1"));
+
+        // Dropping the worker receiver makes the resumed delivery fail.
+        drop(rx);
+        let next = parked.lock().unwrap().take().expect("kept Next was stored");
+        let delivered = next.run(req("1", "tools/call")).await;
+        assert!(
+            !delivered,
+            "delivery must fail when the worker channel is closed"
+        );
+
+        // The resumed Next must have released the route and wrap-kind entry synchronously.
+        assert!(
+            !routes.has_event_route("e1").await,
+            "failed resumed delivery must release its route"
+        );
+        assert!(
+            !wrap_kinds.read().await.contains_key("e1"),
+            "failed resumed delivery must release its wrap-kind entry"
+        );
     }
 }
