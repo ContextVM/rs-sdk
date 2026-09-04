@@ -82,6 +82,7 @@ pub struct IncomingRequest {
     pub client_pubkey: String,
     pub event_id: String,
     pub is_encrypted: bool,
+    pub canonical_invocation_id: Option<String>,
 }
 
 /// A discovered server announcement.
@@ -279,6 +280,7 @@ fn incoming_to_uniffi(req: &contextvm_sdk::IncomingRequest) -> IncomingRequest {
         client_pubkey: req.client_pubkey.clone(),
         event_id: req.event_id.clone(),
         is_encrypted: req.is_encrypted,
+        canonical_invocation_id: req.canonical_invocation_id.clone(),
         // req.event (the full client-signed Nostr event) is deliberately not
         // forwarded — see the note on `IncomingRequest` above.
     }
@@ -437,10 +439,6 @@ fn parse_tags_json(json: &str) -> Result<Vec<nostr_sdk::prelude::Tag>, FfiError>
         })
         .collect()
 }
-
-/// Supported payment method identifiers for CEP-8 payment requests.
-#[allow(dead_code)]
-pub(crate) const SUPPORTED_PAYMENT_METHOD_IDS: &[&str] = &["bitcoin-lightning-bolt11"];
 
 /// Parse a JSON array of priced capabilities, validating each row.
 fn parse_priced_capabilities_json(
@@ -864,13 +862,19 @@ impl Server {
         let lower_bound = crate::builders::payment_timeout_lower_bound(ttl_cap, exec, margin);
 
         let request = match pending_config.request_timeout_secs {
-            Some(v) if v > 0 => {
+            Some(0) => {
+                return Err(FfiError {
+                    code: crate::error::ErrorCode::Validation,
+                    message: "request_timeout_secs must be > 0".into(),
+                });
+            }
+            Some(v) => {
                 if payment_enabled {
                     crate::builders::validate_explicit_timeout(v, lower_bound)?;
                 }
                 v
             }
-            _ => {
+            None => {
                 if payment_enabled {
                     crate::builders::derive_payment_request_timeout(ttl_cap, exec, margin)
                 } else {
@@ -879,13 +883,19 @@ impl Server {
             }
         };
         let session = match pending_config.session_timeout_secs {
-            Some(v) if v > 0 => {
+            Some(0) => {
+                return Err(FfiError {
+                    code: crate::error::ErrorCode::Validation,
+                    message: "session_timeout_secs must be > 0".into(),
+                });
+            }
+            Some(v) => {
                 if payment_enabled {
                     crate::builders::validate_explicit_timeout(v, lower_bound)?;
                 }
                 v
             }
-            _ => {
+            None => {
                 if payment_enabled {
                     crate::builders::derive_payment_session_timeout(ttl_cap, exec, margin)
                 } else {
@@ -973,15 +983,43 @@ impl Server {
                     code: crate::error::ErrorCode::Other,
                     message: "receiver already taken".into(),
                 })?;
+
                 let mut inner = self.inner.lock();
-                inner.transport = Some(Arc::new(tokio::sync::Mutex::new(transport)));
-                inner.receiver = Some(Arc::new(tokio::sync::Mutex::new(receiver)));
-                inner.payment_gate = payment_gate;
-                self.state.store(STATE_STARTED, Ordering::SeqCst);
-                Ok(())
+                match self.state.load(Ordering::SeqCst) {
+                    STATE_CLOSED => {
+                        // close() won the race while we were building the transport.
+                        // Drop the payment gate first so its parked Nextes can be
+                        // released, then close the transport we built and give up.
+                        drop(payment_gate);
+                        drop(inner);
+                        global_runtime()
+                            .block_on(async { transport.close().await })
+                            .ok();
+                        Err(Self::closed_error())
+                    }
+                    STATE_STARTING => {
+                        inner.transport = Some(Arc::new(tokio::sync::Mutex::new(transport)));
+                        inner.receiver = Some(Arc::new(tokio::sync::Mutex::new(receiver)));
+                        inner.payment_gate = payment_gate;
+                        self.state.store(STATE_STARTED, Ordering::SeqCst);
+                        Ok(())
+                    }
+                    other => {
+                        drop(payment_gate);
+                        drop(inner);
+                        global_runtime()
+                            .block_on(async { transport.close().await })
+                            .ok();
+                        Err(Self::start_state_error(other))
+                    }
+                }
             }
             Err(e) => {
-                self.state.store(STATE_CONFIGURING, Ordering::SeqCst);
+                // If close() won while we were starting, leave the state CLOSED.
+                // Otherwise reset to CONFIGURING so the user can retry.
+                if self.state.load(Ordering::SeqCst) != STATE_CLOSED {
+                    self.state.store(STATE_CONFIGURING, Ordering::SeqCst);
+                }
                 Err(e)
             }
         }
@@ -1283,21 +1321,27 @@ impl Server {
     }
 
     /// Close the server transport.
+    ///
+    /// Exported as `shutdown` in UniFFI languages because `close` conflicts with the
+    /// `AutoCloseable` method generated for every object.
+    #[uniffi::method(name = "shutdown")]
     pub fn close(&self) -> Result<(), FfiError> {
-        match self.state.load(Ordering::SeqCst) {
-            STATE_CLOSED => return Ok(()),
-            STATE_CONFIGURING => {
-                self.state.store(STATE_CLOSED, Ordering::SeqCst);
+        let (transport, payment_gate) = {
+            let mut inner = self.inner.lock();
+            let prev = self.state.load(Ordering::SeqCst);
+            if prev == STATE_CLOSED {
                 return Ok(());
             }
-            _ => {}
-        }
-
-        let transport = {
-            let mut inner = self.inner.lock();
-            inner.transport.take()
+            self.state.store(STATE_CLOSED, Ordering::SeqCst);
+            let transport = inner.transport.take();
+            inner.receiver = None;
+            let payment_gate = inner.payment_gate.take();
+            (transport, payment_gate)
         };
-        self.state.store(STATE_CLOSED, Ordering::SeqCst);
+
+        // Drop the payment gate before closing the transport so any parked Nextes
+        // can run their Drop cleanup against live transport state.
+        drop(payment_gate);
 
         if let Some(transport) = transport {
             global_runtime()
@@ -1308,9 +1352,6 @@ impl Server {
                 .map_err(FfiError::from)?;
         }
 
-        let mut inner = self.inner.lock();
-        inner.receiver = None;
-        inner.payment_gate = None;
         Ok(())
     }
 }
@@ -1421,6 +1462,10 @@ impl Client {
     }
 
     /// Close the client transport.
+    ///
+    /// Exported as `shutdown` in UniFFI languages because `close` conflicts with the
+    /// `AutoCloseable` method generated for every object.
+    #[uniffi::method(name = "shutdown")]
     pub fn close(&self) -> Result<(), FfiError> {
         let transport = self.transport.clone();
         global_runtime()
@@ -1866,8 +1911,6 @@ mod tests {
             r#"[{"method":"tools/call","amount":1000,"maxAmount":500,"currencyUnit":"sats"}]"#;
         let err = parse_priced_capabilities_json(max_bad).unwrap_err();
         assert_eq!(err.code, crate::error::ErrorCode::Validation);
-
-        assert_eq!(SUPPORTED_PAYMENT_METHOD_IDS, &["bitcoin-lightning-bolt11"]);
     }
 
     #[test]
@@ -1940,5 +1983,28 @@ mod tests {
             .set_payment_interaction_policy(PaymentInteractionPolicy::Optional)
             .unwrap_err();
         assert_eq!(err.code, crate::error::ErrorCode::Closed);
+    }
+
+    #[test]
+    fn server_zero_timeout_is_rejected() {
+        let keys = Keys::generate();
+
+        let config = ServerConfig {
+            request_timeout_secs: Some(0),
+            ..Default::default()
+        };
+        let server = Server::new(&keys, &config).unwrap();
+        let err = server.start().unwrap_err();
+        assert_eq!(err.code, crate::error::ErrorCode::Validation);
+        assert!(err.message.contains("request_timeout_secs"));
+
+        let config = ServerConfig {
+            session_timeout_secs: Some(0),
+            ..Default::default()
+        };
+        let server = Server::new(&keys, &config).unwrap();
+        let err = server.start().unwrap_err();
+        assert_eq!(err.code, crate::error::ErrorCode::Validation);
+        assert!(err.message.contains("session_timeout_secs"));
     }
 }

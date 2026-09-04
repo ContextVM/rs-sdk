@@ -2,6 +2,38 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Payment gate no longer allows settled or replayed invocations to be reused as free
+  authorizations. `mark_payment_settled` (transparent) and the gating retry path remove
+  the local parked entry once the request is forwarded. `mark_replayed` forwards the
+  current request and removes the entry rather than leaving a persistent `Replayed` state.
+- `mark_replayed` now forwards the current request in both transparent and gating modes
+  and no longer discards the `Next` continuation early in gating mode.
+- Parked registry capacity check, eviction, and insert are now performed atomically under
+  a single `parking` lock, and every exit path (settle, fail, expire, evict, queue
+  overflow, discard) fully releases the parked `Next` continuation.
+- `Server::start()` now uses a `Starting` state and abandons if `close()` wins the race
+  while the transport is being built, preventing a closed server from being resurrected.
+- `Some(0)` for `request_timeout_secs` or `session_timeout_secs` is now a validation
+  error instead of falling through to defaults.
+- `-32042` and `-32043` FFI error payloads are now byte-identical to the SDK builders by
+  reusing `build_payment_required_error` and `build_payment_pending_error`.
+- Removed the dead `SUPPORTED_PAYMENT_METHOD_IDS` constant; the gate validates against the
+  SDK's `PMI_BITCOIN_LIGHTNING_BOLT11` constant.
+
+### Added
+
+- `IncomingRequest` (UniFFI and C) now carries an optional `canonical_invocation_id` so
+  consumers can key their payment result cache by canonical identity.
+
+### Changed
+
+- **Breaking (UniFFI Kotlin/Swift):** `Server` and `Client` lifecycle methods are now
+  exported as `shutdown()` instead of `close()`. The `close()` name conflicts with the
+  `AutoCloseable` method that UniFFI generates for every object in recent binders.
+  C consumers using `cvm_server_ch_close` / `cvm_client_ch_close` are unaffected.
+
 ## [0.2.0] - 2026-09-04
 
 ### Added

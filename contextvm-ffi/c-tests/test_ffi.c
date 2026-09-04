@@ -191,7 +191,8 @@ TEST(null_safety) {
         .message = msg,
         .client_pubkey = NULL,
         .event_id = NULL,
-        .is_encrypted = 0
+        .is_encrypted = 0,
+        .canonical_invocation_id = NULL
     };
     cvm_incoming_request_free(req);
 }

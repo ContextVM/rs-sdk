@@ -123,9 +123,10 @@ typedef struct {
 
 typedef struct {
     CvmJsonRpcMessage message;
-    char *client_pubkey; /* owned hex string */
-    char *event_id;      /* owned hex string */
+    char *client_pubkey;           /* owned hex string */
+    char *event_id;                /* owned hex string */
     bool is_encrypted;
+    char *canonical_invocation_id; /* owned, may be NULL */
 } CvmIncomingRequest;
 
 typedef struct {

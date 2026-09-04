@@ -56,6 +56,7 @@ pub struct FfiIncomingRequest {
     pub client_pubkey: *mut c_char,
     pub event_id: *mut c_char,
     pub is_encrypted: bool,
+    pub canonical_invocation_id: *mut c_char,
 }
 
 /// A discovered server announcement.
@@ -340,6 +341,7 @@ pub extern "C" fn cvm_incoming_request_free(req: FfiIncomingRequest) {
     cvm_message_free(req.message);
     cvm_string_free(req.client_pubkey);
     cvm_string_free(req.event_id);
+    cvm_string_free(req.canonical_invocation_id);
 }
 
 #[no_mangle]
@@ -1156,6 +1158,7 @@ mod tests {
                 client_pubkey: std::ptr::null_mut(),
                 event_id: std::ptr::null_mut(),
                 is_encrypted: false,
+                canonical_invocation_id: std::ptr::null_mut(),
             });
         }
 
