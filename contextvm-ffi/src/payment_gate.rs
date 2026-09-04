@@ -1396,29 +1396,25 @@ impl PaymentGate {
         let nonce = self.inner.nonce.fetch_add(1, Ordering::SeqCst);
         let expires_at = now + Duration::from_secs(ttl_secs);
 
-        let prior = match &entry.state {
-            PaymentState::AwaitingInvoice => None,
-            PaymentState::Publishing {
-                pay_req: existing,
-                amount,
-                ..
-            } => Some((existing.clone(), *amount)),
+        match &entry.state {
+            PaymentState::AwaitingInvoice => {}
+            PaymentState::Publishing { .. } => {
+                // Coalesce concurrent submissions: an attempt is already in
+                // flight for this identity. Replacing its nonce here would let
+                // a fast failure roll back a slow success whose invoice the
+                // client already received (lost-success race, round-4 review).
+                // The consumer treats this error as retryable and re-binds the
+                // same invoice on the next gate event.
+                parking.insert(&canonical_key, entry);
+                return Err(payment_error(
+                    "invoice publication already in flight; retry on the next gate event",
+                ));
+            }
             PaymentState::InvoiceIssued { .. } | PaymentState::Granted | PaymentState::Claiming => {
                 parking.insert(&canonical_key, entry);
                 return Err(payment_error(
                     "invoice already issued or payment already settled",
                 ));
-            }
-        };
-
-        if let Some((existing_pay_req, existing_amount)) = prior {
-            if existing_pay_req.as_str() != pay_req {
-                parking.insert(&canonical_key, entry);
-                return Err(validation_error("double-invoice guard: pay_req mismatch"));
-            }
-            if amount_sats != existing_amount {
-                parking.insert(&canonical_key, entry);
-                return Err(validation_error("re-bind amount mismatch"));
             }
         }
 
@@ -1847,6 +1843,9 @@ mod tests {
         inner: Arc<std::sync::Mutex<Vec<TransportRecord>>>,
         fail_next_notification: Arc<AtomicUsize>,
         fail_next_response: Arc<AtomicUsize>,
+        /// When > 0, every notification send sleeps this many (possibly paused)
+        /// milliseconds before completing — used to force slow-success publishes.
+        notification_delay_ms: Arc<std::sync::atomic::AtomicU64>,
     }
 
     impl FakeTransport {
@@ -1855,6 +1854,7 @@ mod tests {
                 inner: Arc::new(std::sync::Mutex::new(Vec::new())),
                 fail_next_notification: Arc::new(AtomicUsize::new(0)),
                 fail_next_response: Arc::new(AtomicUsize::new(0)),
+                notification_delay_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             }
         }
 
@@ -1869,6 +1869,10 @@ mod tests {
         fn fail_next_response(&self, count: usize) {
             self.fail_next_response.store(count, Ordering::SeqCst);
         }
+
+        fn set_notification_delay_ms(&self, ms: u64) {
+            self.notification_delay_ms.store(ms, Ordering::SeqCst);
+        }
     }
 
     impl PaymentGateTransport for FakeTransport {
@@ -1881,7 +1885,11 @@ mod tests {
         ) -> Pin<Box<dyn Future<Output = contextvm_sdk::Result<()>> + Send>> {
             let inner = self.inner.clone();
             let counter = self.fail_next_notification.clone();
+            let delay_ms = self.notification_delay_ms.load(Ordering::SeqCst);
             Box::pin(async move {
+                if delay_ms > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                }
                 if counter
                     .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
                         if v > 0 {
@@ -2618,6 +2626,138 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_publish_success_survives_concurrent_rejection_transparent() {
+        let transport = Arc::new(FakeTransport::new());
+        transport.set_notification_delay_ms(5_000);
+        let gate = PaymentGate::new(
+            test_config(PaymentLifecyclePolicy::Transparent),
+            transport.clone(),
+        )
+        .unwrap();
+        let (_next, recorder) = FakeNext::new();
+        let ctx = make_context("client", "e-slow-t", None);
+        gate.handle_inner(tools_call("1", "echo"), &ctx, boxed_next(recorder.clone()))
+            .await;
+        let event = gate.try_recv().unwrap();
+
+        // A: slow publish (5s on the paused clock).
+        let gate_a = gate.clone();
+        let id_a = event.request_event_id.clone();
+        let a = tokio::spawn(async move {
+            gate_a
+                .submit_invoice(
+                    &id_a,
+                    1000,
+                    "lnbc-slow-t",
+                    "bitcoin-lightning-bolt11",
+                    10,
+                    None,
+                )
+                .await
+        });
+        // Let A enter Publishing and block inside its slow send.
+        tokio::time::sleep(std::time::Duration::from_millis(1_000)).await;
+
+        // B: concurrent submit of the same invoice must be rejected while A publishes.
+        let b_res = gate
+            .submit_invoice(
+                &event.request_event_id,
+                1000,
+                "lnbc-slow-t",
+                "bitcoin-lightning-bolt11",
+                10,
+                None,
+            )
+            .await;
+        assert!(
+            b_res.is_err(),
+            "concurrent submit while publishing must be rejected"
+        );
+        assert!(format!("{b_res:?}").contains("in flight"));
+
+        // A completes successfully — its success must NOT be lost.
+        let a_res = a.await.unwrap();
+        assert!(a_res.is_ok(), "slow publish success was lost: {a_res:?}");
+
+        // Settlement resolves against A's registered pay_req and forwards once.
+        gate.mark_settled("lnbc-slow-t", None).await.unwrap();
+        assert!(
+            recorder.lock().unwrap().is_some(),
+            "original request was forwarded after settle"
+        );
+        let required = transport
+            .records()
+            .iter()
+            .filter(|r| matches!(r, TransportRecord::Notification { notification: JsonRpcMessage::Notification(n), .. } if n.method == PAYMENT_REQUIRED_METHOD))
+            .count();
+        assert_eq!(required, 1, "exactly one payment_required notification");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_publish_success_survives_concurrent_rejection_gating() {
+        let transport = Arc::new(FakeTransport::new());
+        transport.set_notification_delay_ms(5_000);
+        let gate = PaymentGate::new(
+            test_config(PaymentLifecyclePolicy::Gating),
+            transport.clone(),
+        )
+        .unwrap();
+        let (_next, _recorder) = FakeNext::new();
+        let ctx = make_context(
+            "client",
+            "e-slow-g",
+            Some(PaymentInteractionMode::ExplicitGating),
+        );
+        gate.handle_inner(tools_call("1", "echo"), &ctx, boxed_next(_recorder.clone()))
+            .await;
+        let event = gate.try_recv().unwrap();
+
+        let gate_a = gate.clone();
+        let id_a = event.request_event_id.clone();
+        let a = tokio::spawn(async move {
+            gate_a
+                .submit_invoice(
+                    &id_a,
+                    1000,
+                    "lnbc-slow-g",
+                    "bitcoin-lightning-bolt11",
+                    10,
+                    None,
+                )
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(1_000)).await;
+
+        let b_res = gate
+            .submit_invoice(
+                &event.request_event_id,
+                1000,
+                "lnbc-slow-g",
+                "bitcoin-lightning-bolt11",
+                10,
+                None,
+            )
+            .await;
+        assert!(
+            b_res.is_err(),
+            "concurrent submit while publishing must be rejected"
+        );
+
+        let a_res = a.await.unwrap();
+        assert!(a_res.is_ok(), "slow publish success was lost: {a_res:?}");
+
+        // The -32042 targeted response was sent exactly once, and settlement
+        // registers the grant for the retrying client.
+        gate.mark_settled("lnbc-slow-g", None).await.unwrap();
+        let responses = transport
+            .records()
+            .iter()
+            .filter(|r| matches!(r, TransportRecord::Response { .. }))
+            .count();
+        assert_eq!(responses, 1, "exactly one targeted -32042 response");
     }
 
     #[tokio::test]
