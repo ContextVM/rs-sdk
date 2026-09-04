@@ -786,6 +786,34 @@ impl Server {
     }
 }
 
+/// RAII guard that rolls a `STARTING` server back to `CONFIGURING` if `start()`
+/// exits before it reaches `STATE_STARTED` and `close()` did not win the race.
+///
+/// This keeps a post-CAS validation or transport-build failure from stranding
+/// the server in `STATE_STARTING` and allows the caller to reconfigure and retry.
+/// Disarm the guard with [`StartStateGuard::disarm`] once the server is started.
+struct StartStateGuard<'a>(&'a Server);
+
+impl<'a> StartStateGuard<'a> {
+    fn new(server: &'a Server) -> Self {
+        Self(server)
+    }
+
+    fn disarm(self) {
+        std::mem::forget(self);
+    }
+}
+
+impl<'a> Drop for StartStateGuard<'a> {
+    fn drop(&mut self) {
+        // If close() won, leave the state CLOSED. Otherwise a failed or cancelled
+        // start() should be retryable from CONFIGURING.
+        if self.0.state.load(Ordering::SeqCst) != STATE_CLOSED {
+            self.0.state.store(STATE_CONFIGURING, Ordering::SeqCst);
+        }
+    }
+}
+
 #[uniffi::export]
 impl Server {
     /// Create a server but do not start it yet.
@@ -831,6 +859,10 @@ impl Server {
             Ok(_) => {}
             Err(current) => return Err(Self::start_state_error(current)),
         }
+
+        // If start() exits before we set STATE_STARTED and close() did not win,
+        // roll the state back to CONFIGURING so the caller can reconfigure/retry.
+        let guard = StartStateGuard::new(self);
 
         // Snapshot pending configuration; no setters can run while we are STARTING.
         let (
@@ -1002,6 +1034,7 @@ impl Server {
                         inner.receiver = Some(Arc::new(tokio::sync::Mutex::new(receiver)));
                         inner.payment_gate = payment_gate;
                         self.state.store(STATE_STARTED, Ordering::SeqCst);
+                        guard.disarm();
                         Ok(())
                     }
                     other => {
@@ -1015,11 +1048,8 @@ impl Server {
                 }
             }
             Err(e) => {
-                // If close() won while we were starting, leave the state CLOSED.
-                // Otherwise reset to CONFIGURING so the user can retry.
-                if self.state.load(Ordering::SeqCst) != STATE_CLOSED {
-                    self.state.store(STATE_CONFIGURING, Ordering::SeqCst);
-                }
+                // The StartStateGuard resets the state to CONFIGURING (unless close()
+                // already set it to CLOSED) when this function returns.
                 Err(e)
             }
         }
@@ -1820,6 +1850,7 @@ pub fn make_response(id: String, result: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
 
     fn request() -> contextvm_sdk::JsonRpcMessage {
         contextvm_sdk::JsonRpcMessage::Request(contextvm_sdk::JsonRpcRequest {
@@ -1986,7 +2017,7 @@ mod tests {
     }
 
     #[test]
-    fn server_zero_timeout_is_rejected() {
+    fn server_zero_timeout_is_rejected_and_state_is_retryable() {
         let keys = Keys::generate();
 
         let config = ServerConfig {
@@ -1994,6 +2025,13 @@ mod tests {
             ..Default::default()
         };
         let server = Server::new(&keys, &config).unwrap();
+        let err = server.start().unwrap_err();
+        assert_eq!(err.code, crate::error::ErrorCode::Validation);
+        assert!(err.message.contains("request_timeout_secs"));
+
+        // A post-CAS validation failure must roll back to CONFIGURING, not
+        // strand the server in STARTING. The second call must fail with the
+        // same validation error, not "server is already starting".
         let err = server.start().unwrap_err();
         assert_eq!(err.code, crate::error::ErrorCode::Validation);
         assert!(err.message.contains("request_timeout_secs"));
@@ -2006,5 +2044,130 @@ mod tests {
         let err = server.start().unwrap_err();
         assert_eq!(err.code, crate::error::ErrorCode::Validation);
         assert!(err.message.contains("session_timeout_secs"));
+
+        let err = server.start().unwrap_err();
+        assert_eq!(err.code, crate::error::ErrorCode::Validation);
+        assert!(err.message.contains("session_timeout_secs"));
+    }
+
+    /// A `RelayPoolTrait` wrapper whose `connect()` sleeps, so a test can win a
+    /// `close()` race against `start()` while the server is mid-build.
+    struct SlowRelayPool {
+        inner: contextvm_sdk::relay::MockRelayPool,
+        connect_delay: Duration,
+    }
+
+    impl SlowRelayPool {
+        fn new(delay: Duration) -> Self {
+            Self {
+                inner: contextvm_sdk::relay::MockRelayPool::new(),
+                connect_delay: delay,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl contextvm_sdk::relay::RelayPoolTrait for SlowRelayPool {
+        async fn connect(&self, relay_urls: &[String]) -> contextvm_sdk::Result<()> {
+            tokio::time::sleep(self.connect_delay).await;
+            self.inner.connect(relay_urls).await
+        }
+
+        async fn disconnect(&self) -> contextvm_sdk::Result<()> {
+            self.inner.disconnect().await
+        }
+
+        async fn publish_event(
+            &self,
+            event: &nostr_sdk::Event,
+        ) -> contextvm_sdk::Result<nostr_sdk::EventId> {
+            self.inner.publish_event(event).await
+        }
+
+        async fn publish(
+            &self,
+            builder: nostr_sdk::EventBuilder,
+        ) -> contextvm_sdk::Result<nostr_sdk::EventId> {
+            self.inner.publish(builder).await
+        }
+
+        async fn sign(
+            &self,
+            builder: nostr_sdk::EventBuilder,
+        ) -> contextvm_sdk::Result<nostr_sdk::Event> {
+            self.inner.sign(builder).await
+        }
+
+        async fn signer(&self) -> contextvm_sdk::Result<Arc<dyn nostr_sdk::NostrSigner>> {
+            self.inner.signer().await
+        }
+
+        fn notifications(
+            &self,
+        ) -> tokio::sync::broadcast::Receiver<nostr_sdk::RelayPoolNotification> {
+            self.inner.notifications()
+        }
+
+        async fn public_key(&self) -> contextvm_sdk::Result<nostr_sdk::PublicKey> {
+            self.inner.public_key().await
+        }
+
+        async fn subscribe(&self, filters: Vec<nostr_sdk::Filter>) -> contextvm_sdk::Result<()> {
+            self.inner.subscribe(filters).await
+        }
+
+        async fn publish_to(
+            &self,
+            urls: &[String],
+            builder: nostr_sdk::EventBuilder,
+        ) -> contextvm_sdk::Result<nostr_sdk::EventId> {
+            self.inner.publish_to(urls, builder).await
+        }
+
+        async fn fetch_events(
+            &self,
+            filters: Vec<nostr_sdk::Filter>,
+            timeout: Duration,
+        ) -> contextvm_sdk::Result<Vec<nostr_sdk::Event>> {
+            self.inner.fetch_events(filters, timeout).await
+        }
+    }
+
+    #[test]
+    fn server_close_race_during_start_leaves_state_closed() {
+        let keys = Keys::generate();
+        let pool = Arc::new(SlowRelayPool::new(Duration::from_millis(200)));
+        let config = ServerConfig {
+            relay_urls: vec!["wss://example.com".into()],
+            ..Default::default()
+        };
+        let server = Arc::new(
+            Server::new_with_relay_pool(
+                &keys,
+                &config,
+                pool as Arc<dyn contextvm_sdk::relay::RelayPoolTrait>,
+            )
+            .unwrap(),
+        );
+
+        let start_server = Arc::clone(&server);
+        let start_handle = std::thread::spawn(move || start_server.start());
+
+        // Let the start thread reach connect() before closing.
+        std::thread::sleep(Duration::from_millis(50));
+
+        // close() can be called while start() is mid-build.
+        server.close().unwrap();
+
+        let start_result = start_handle.join().unwrap();
+
+        // The winner must be close(); start() reports the loss.
+        assert_eq!(
+            start_result.unwrap_err().code,
+            crate::error::ErrorCode::Closed
+        );
+
+        // close() after the dust settles is idempotent.
+        assert!(server.close().is_ok());
     }
 }
