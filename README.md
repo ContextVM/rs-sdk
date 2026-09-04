@@ -179,6 +179,7 @@ The in-repo Rust SDK guides live in [`docs/README.md`](docs/README.md):
 - [`docs/transport-modes.md`](docs/transport-modes.md)
 - [`docs/stateless.md`](docs/stateless.md)
 - [`docs/oversized-transfer.md`](docs/oversized-transfer.md)
+- [`docs/payments.md`](docs/payments.md)
 - [`docs/rmcp.md`](docs/rmcp.md)
 - [`docs/transports.md`](docs/transports.md)
 - [`docs/gateway.md`](docs/gateway.md)
@@ -223,6 +224,14 @@ the final JSON-RPC response rather than replacing it. Disabled by default; opt i
 with `with_open_stream(OpenStreamConfig::enabled())`. See
 [docs/open-stream.md](docs/open-stream.md) for the writer and client APIs and the
 keepalive timer model.
+
+Both CEP-8 payment lifecycles run end to end: servers price capabilities and
+gate them through the transparent or explicit-gating lifecycle via
+`with_server_payments`, and clients auto-pay, keep paying requests alive, and
+drive the gated retry flow via `with_client_payments`. Payment rails ship as pluggable traits with
+deterministic fakes; real rails are a later phase. See
+[docs/payments.md](docs/payments.md) for both lifecycles, the client shapes,
+and the operational notes.
 
 ### Server Transport Config
 

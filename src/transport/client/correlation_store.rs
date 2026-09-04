@@ -18,6 +18,11 @@ pub struct PendingRequest {
     pub is_initialize: bool,
     /// When the request was registered.
     pub registered_at: Instant,
+    /// CEP-8: the original `_meta.progressToken` JSON value the request carried,
+    /// exactly as sent. Client-side payment work fabricates keep-alive progress
+    /// with this value, never a stringified form: rmcp's progress watcher is
+    /// keyed by the token's exact JSON type.
+    pub progress_token: Option<serde_json::Value>,
 }
 
 /// Tracks pending request event IDs and their original request IDs on the client side.
@@ -51,12 +56,14 @@ impl ClientCorrelationStore {
         }
     }
 
-    /// Register a pending request with its original JSON-RPC request ID.
+    /// Register a pending request with its original JSON-RPC request ID and, when
+    /// the request carried one, its original `_meta.progressToken` JSON value.
     pub async fn register(
         &self,
         event_id: String,
         original_id: serde_json::Value,
         is_initialize: bool,
+        progress_token: Option<serde_json::Value>,
     ) {
         self.pending_requests.write().await.push(
             event_id,
@@ -64,6 +71,7 @@ impl ClientCorrelationStore {
                 original_id,
                 is_initialize,
                 registered_at: Instant::now(),
+                progress_token,
             },
         );
     }
@@ -82,9 +90,19 @@ impl ClientCorrelationStore {
         self.pending_requests.read().await.contains(event_id)
     }
 
-    /// Remove a pending request. Returns `true` if the key existed.
-    pub async fn remove(&self, event_id: &str) -> bool {
-        self.pending_requests.write().await.pop(event_id).is_some()
+    /// Remove a pending request, returning the consumed entry if the key existed.
+    /// The caller gets the entry's `original_id` and `progress_token`, which the
+    /// client-side payment hooks need at consumption time.
+    pub async fn remove(&self, event_id: &str) -> Option<PendingRequest> {
+        self.pending_requests.write().await.pop(event_id)
+    }
+
+    /// A clone of the pending entry for `event_id`, without removing it or
+    /// promoting its LRU recency. The client-side payment hooks read the
+    /// entry's `original_id` and `progress_token` while the request stays
+    /// pending.
+    pub async fn peek(&self, event_id: &str) -> Option<PendingRequest> {
+        self.pending_requests.read().await.peek(event_id).cloned()
     }
 
     /// Retrieve the original request ID for a given event ID without removing it.
@@ -147,7 +165,7 @@ mod tests {
     #[tokio::test]
     async fn remove_nonexistent_is_noop() {
         let store = ClientCorrelationStore::new();
-        assert!(!store.remove("nonexistent").await);
+        assert!(store.remove("nonexistent").await.is_none());
         assert!(!store.contains("nonexistent").await);
     }
 
@@ -155,10 +173,10 @@ mod tests {
     async fn contains_after_clear() {
         let store = ClientCorrelationStore::new();
         store
-            .register("e1".into(), serde_json::Value::Null, false)
+            .register("e1".into(), serde_json::Value::Null, false, None)
             .await;
         store
-            .register("e2".into(), serde_json::Value::Null, false)
+            .register("e2".into(), serde_json::Value::Null, false, None)
             .await;
         assert!(store.contains("e1").await);
         store.clear().await;
@@ -170,10 +188,10 @@ mod tests {
     async fn register_and_remove_roundtrip() {
         let store = ClientCorrelationStore::new();
         store
-            .register("e1".into(), serde_json::Value::Null, false)
+            .register("e1".into(), serde_json::Value::Null, false, None)
             .await;
         assert!(store.contains("e1").await);
-        assert!(store.remove("e1").await);
+        assert!(store.remove("e1").await.is_some());
         assert!(!store.contains("e1").await);
     }
 
@@ -182,7 +200,7 @@ mod tests {
         let store = ClientCorrelationStore::new();
         for i in 0..=DEFAULT_LRU_SIZE {
             store
-                .register(format!("e{i}"), serde_json::Value::Null, false)
+                .register(format!("e{i}"), serde_json::Value::Null, false, None)
                 .await;
         }
 
@@ -197,7 +215,7 @@ mod tests {
 
         // Insert an entry that will be "old" by the time we sweep.
         store
-            .register("old".into(), serde_json::json!(1), false)
+            .register("old".into(), serde_json::json!(1), false, None)
             .await;
 
         // Sleep so "old" entry ages past the threshold.
@@ -205,7 +223,7 @@ mod tests {
 
         // Insert a fresh entry.
         store
-            .register("fresh".into(), serde_json::json!(2), false)
+            .register("fresh".into(), serde_json::json!(2), false, None)
             .await;
 
         // Sweep with a 10ms timeout — "old" should be removed, "fresh" should remain.
@@ -216,10 +234,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remove_returns_the_consumed_entry() {
+        let store = ClientCorrelationStore::new();
+        store
+            .register(
+                "e1".into(),
+                serde_json::json!("req-1"),
+                false,
+                Some(serde_json::json!(7)),
+            )
+            .await;
+        let entry = store.remove("e1").await.expect("entry existed");
+        assert_eq!(entry.original_id, serde_json::json!("req-1"));
+        assert_eq!(entry.progress_token, Some(serde_json::json!(7)));
+        assert!(!entry.is_initialize);
+        assert!(!store.contains("e1").await);
+    }
+
+    #[tokio::test]
+    async fn progress_token_preserves_the_exact_json_type() {
+        let store = ClientCorrelationStore::new();
+        store
+            .register(
+                "numeric".into(),
+                serde_json::json!(1),
+                false,
+                Some(serde_json::json!(5)),
+            )
+            .await;
+        store
+            .register(
+                "string".into(),
+                serde_json::json!(2),
+                false,
+                Some(serde_json::json!("5")),
+            )
+            .await;
+        let numeric = store.remove("numeric").await.expect("numeric entry");
+        let string = store.remove("string").await.expect("string entry");
+        // Number(5) and String("5") stringify identically on the wire but are
+        // distinct JSON values; the store must hand back exactly what was sent.
+        assert_eq!(numeric.progress_token, Some(serde_json::json!(5)));
+        assert_eq!(string.progress_token, Some(serde_json::json!("5")));
+        assert_ne!(numeric.progress_token, string.progress_token);
+    }
+
+    #[tokio::test]
+    async fn touch_refreshes_the_entry_past_a_sweep() {
+        let store = ClientCorrelationStore::new();
+        store
+            .register("kept".into(), serde_json::json!(1), false, None)
+            .await;
+        store
+            .register("dropped".into(), serde_json::json!(2), false, None)
+            .await;
+
+        // Age both entries past the timeout, then refresh only one.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(store.touch("kept").await);
+        assert!(!store.touch("unknown").await);
+
+        let swept = store.sweep_expired(Duration::from_millis(10)).await;
+        assert_eq!(swept, 1, "only the untouched entry expires");
+        assert!(store.contains("kept").await);
+        assert!(!store.contains("dropped").await);
+    }
+
+    #[tokio::test]
     async fn sweep_expired_returns_zero_when_nothing_expired() {
         let store = ClientCorrelationStore::new();
         store
-            .register("e1".into(), serde_json::Value::Null, false)
+            .register("e1".into(), serde_json::Value::Null, false, None)
             .await;
 
         let swept = store.sweep_expired(Duration::from_secs(60)).await;

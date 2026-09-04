@@ -24,6 +24,7 @@ For most native Rust applications, the primary entry points are `NostrServerTran
 - Discovery guide: public discovery helpers and event kinds
 - Oversized transfer guide: CEP-22 fragmentation, the three-timer model, and progress-aware request options
 - Open-stream guide: CEP-41 streaming responses, the writer and `call_tool_stream` APIs, and the keepalive timer model
+- Payments guide: CEP-8 capability pricing, both payment lifecycles, and the server/client registration entry points
 
 ### Bridging existing MCP applications
 

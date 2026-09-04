@@ -106,6 +106,18 @@ impl MockRelayPool {
         }
     }
 
+    /// Create a NEW pool bound to this pool's shared event store, with
+    /// caller-chosen signing keys.
+    ///
+    /// The new pool has its own notification channel and subscription slot,
+    /// like every linked pool. Choosing the keys lets a test bring a second
+    /// transport onto the same mock network under a chosen identity: the same
+    /// keys as an existing transport (a reconnect shape) or fresh ones (a
+    /// third-party sender).
+    pub fn linked_with_keys(&self, keys: Keys) -> Self {
+        Self::linked(Arc::clone(&self.inner), keys)
+    }
+
     /// Create a pair of linked mock relay pools with different signing keys.
     ///
     /// Both pools share the same event store. Each has its own notification

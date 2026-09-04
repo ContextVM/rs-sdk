@@ -167,6 +167,7 @@ struct Fx {
     server: NostrServerTransport,
     server_rx: tokio::sync::mpsc::UnboundedReceiver<IncomingRequest>,
     client: NostrClientTransport,
+    client_rx: tokio::sync::mpsc::UnboundedReceiver<JsonRpcMessage>,
     pool: Arc<MockRelayPool>,
     client_pubkey: PublicKey,
     server_pubkey: PublicKey,
@@ -210,7 +211,7 @@ async fn fixture(
         .expect("client transport");
 
     let server_rx = server.take_message_receiver().expect("server rx");
-    let _client_rx = client.take_message_receiver().expect("client rx");
+    let client_rx = client.take_message_receiver().expect("client rx");
     server.start().await.expect("server start");
     client.start().await.expect("client start");
     tokio::time::sleep(Duration::from_millis(20)).await;
@@ -219,6 +220,7 @@ async fn fixture(
         server,
         server_rx,
         client,
+        client_rx,
         pool,
         client_pubkey,
         server_pubkey,
@@ -317,6 +319,34 @@ async fn transparent_lifecycle_engages_through_the_entry_point() {
     assert!(
         all_tags(&response).contains(&vec!["e".to_string(), request_event_id]),
         "the response must correlate to the request"
+    );
+
+    // Delivery at the client's own channel: the correlation entry survives the
+    // correlated invoice notification, so the acceptance and the paid result arrive
+    // rather than being dropped as responses for an unknown request.
+    let mut methods = Vec::new();
+    for _ in 0..3 {
+        let msg = tokio::time::timeout(Duration::from_secs(3), fx.client_rx.recv())
+            .await
+            .expect("the client channel must deliver the whole lifecycle")
+            .expect("client channel open");
+        methods.push(match msg {
+            JsonRpcMessage::Notification(n) => n.method,
+            JsonRpcMessage::Response(r) => {
+                assert_eq!(r.id, serde_json::json!("pay-t1"));
+                "result".to_string()
+            }
+            other => panic!("unexpected client-channel message {other:?}"),
+        });
+    }
+    assert_eq!(
+        methods,
+        vec![
+            "notifications/payment_required".to_string(),
+            "notifications/payment_accepted".to_string(),
+            "result".to_string(),
+        ],
+        "the paying client must observe the invoice, the acceptance, then the result"
     );
 
     fx.server.close().await.expect("close");
@@ -654,6 +684,24 @@ async fn long_payment_survives_the_sweep_with_the_threaded_snapshot_ttl() {
     assert!(
         response.content.contains("\"sweep-1\""),
         "the delivered response must restore the client's own request id"
+    );
+
+    // The snapshot-delivered result also arrives at the client's own channel: the
+    // invoice, the acceptance, then the swept-route result.
+    let mut saw_result = false;
+    for _ in 0..3 {
+        let msg = tokio::time::timeout(Duration::from_secs(3), fx.client_rx.recv())
+            .await
+            .expect("the client channel must deliver the whole lifecycle")
+            .expect("client channel open");
+        if let JsonRpcMessage::Response(r) = msg {
+            assert_eq!(r.id, serde_json::json!("sweep-1"));
+            saw_result = true;
+        }
+    }
+    assert!(
+        saw_result,
+        "the swept-route paid result must reach the client channel"
     );
 
     fx.server.close().await.expect("close");

@@ -7,18 +7,20 @@
 //! [`PaymentError`] taxonomy, the canonical invocation identity used for
 //! explicit-gating authorization matching, the bounded [`AuthorizationStore`] of
 //! pending and granted authorizations, and deterministic fakes behind the
-//! `test-utils` feature. The one piece of transport wiring here is the
-//! [`with_server_payments`](crate::payments::server_transport_payments::with_server_payments)
-//! registration entry point, which composes the middlewares, tags, and senders
-//! onto a server transport.
+//! `test-utils` feature.
 //!
 //! Constants and tag builders stay reachable under their module paths
 //! ([`crate::payments::constants`] / [`crate::payments::tags`]); the wire/config
 //! types, traits, and error are also re-exported at this module root for
-//! ergonomic crate-level access.
+//! ergonomic crate-level access. The two pieces of transport wiring here are the
+//! [`with_server_payments`](crate::payments::server_transport_payments::with_server_payments)
+//! and [`with_client_payments`](crate::payments::client_payments::with_client_payments)
+//! registration entry points, which compose the payment stacks onto a server
+//! and a client transport respectively.
 
 pub mod authorization_store;
 pub mod canonical;
+pub mod client_payments;
 pub mod constants;
 pub mod errors;
 pub mod server_explicit_gating;
@@ -36,6 +38,10 @@ pub use authorization_store::{AuthorizationStore, ClaimOrPending};
 pub use canonical::{
     compute_canonical_invocation_hash, compute_canonical_invocation_identity,
     CanonicalInvocationIdentity,
+};
+pub use client_payments::{
+    with_client_payments, ClientPaymentsOptions, OnPaymentRequiredFn, PaymentApproval,
+    PaymentPolicyFn, PaymentRequiredCallbackParams,
 };
 pub use errors::PaymentError;
 pub use server_explicit_gating::{
