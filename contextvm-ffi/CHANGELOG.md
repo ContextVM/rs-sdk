@@ -4,20 +4,24 @@
 
 ### Fixed
 
-- `PaymentGate::submit_invoice` now propagates transport-send failures as
-  `ErrorCode::Payment` and rolls the parked entry back to `AwaitingInvoice`
-  (restoring the gating `Next` continuation) instead of advancing the state to
-  `InvoiceIssued`. This makes the publish retryable and prevents a lost request
-  from being paid against an invoice the client never received.
+- `PaymentGate::submit_invoice` now tracks a nonce-qualified `Publishing` state
+  while the invoice is being published. A failed or superseded concurrent
+  submission only rolls back the matching in-flight attempt; a successful newer
+  issue cannot be clobbered back to `AwaitingInvoice` by an older failed send.
+- `PaymentGate::submit_invoice` still propagates transport-send failures as
+  `ErrorCode::Payment` and reverts the matching `Publishing` attempt back to
+  `AwaitingInvoice`, restoring the gating `Next` continuation so the publish can
+  be retried.
 
 - `PaymentGate::mark_settled` (transparent lifecycle) now records and consumes the
   paid grant through `AuthorizationStore::grant_and_claim` so the single forward
   after settlement is atomic and can never race a concurrent duplicate.
 
 - `Server::start()` no longer strands the server in `Starting` after a post-CAS
-  validation or transport-build failure. A `StartStateGuard` rolls the state back
-  to `Configuring` so the caller can reconfigure and retry, while still leaving it
-  `Closed` if `close()` won the race.
+  validation or transport-build failure. A `StartStateGuard` uses a
+  compare-exchange to roll the state back to `Configuring`, so the caller can
+  reconfigure and retry; if a concurrent `close()` stores `Closed` first, the
+  guard cannot overwrite it.
 
 - Payment gate no longer allows settled or replayed invocations to be reused as free
   authorizations. `mark_payment_settled` (transparent) and the gating retry path remove

@@ -242,6 +242,13 @@ impl PaymentNext for SdkNext {
     }
 }
 
+/// Shared handle to the parked request continuation.
+///
+/// Multiple in-flight `submit_invoice` attempts for the same canonical id may
+/// hold clones of this `Arc`; only the one that successfully commits consumes
+/// and releases the `Next` so the original request is released exactly once.
+type NextHandle = Arc<Mutex<Option<Box<dyn PaymentNext>>>>;
+
 /// The payment gate middleware.
 ///
 /// Clone is cheap: it bumps the reference count of the internal `Arc`.
@@ -274,7 +281,7 @@ struct ParkedEntry {
     mirrored_wrap_kind: Option<u16>,
     capability: PricedCapability,
     request: JsonRpcRequest,
-    next_and_message: Option<(Box<dyn PaymentNext>, JsonRpcMessage)>,
+    next_and_message: Option<(NextHandle, JsonRpcMessage)>,
     state: PaymentState,
     expires_at: tokio::time::Instant,
     nonce: u64,
@@ -311,6 +318,17 @@ impl From<&ParkedEntry> for ParkedEntrySnapshot {
 #[derive(Debug, Clone)]
 enum PaymentState {
     AwaitingInvoice,
+    /// An invoice has been handed to the gate and the transport send is in
+    /// flight. The `nonce` on the [`ParkedEntry`] identifies which attempt
+    /// currently owns this state so a failed or superseded attempt cannot
+    /// clobber a newer successful one.
+    Publishing {
+        pay_req: String,
+        amount: i64,
+        pmi: String,
+        ttl_secs: u64,
+        description: Option<String>,
+    },
     InvoiceIssued {
         pay_req: String,
         amount: i64,
@@ -399,7 +417,7 @@ impl PaymentGate {
         ttl_secs: u64,
         description: Option<&str>,
     ) -> Result<(), FfiError> {
-        let (canonical_key, nonce, expires_at, lifecycle, released_next) = self.prepare_invoice(
+        let (canonical_key, nonce, expires_at, lifecycle, next_handle) = self.prepare_invoice(
             request_event_id,
             amount_sats,
             pay_req,
@@ -409,20 +427,49 @@ impl PaymentGate {
         )?;
 
         let send_result = if lifecycle == PaymentLifecyclePolicy::Gating {
-            self.send_payment_required_error(&canonical_key).await
+            self.send_payment_required_error(&canonical_key, nonce)
+                .await
         } else {
-            self.send_payment_required_notification(&canonical_key)
+            self.send_payment_required_notification(&canonical_key, nonce)
                 .await
         };
 
         if let Err(e) = send_result {
-            self.rollback_invoice(&canonical_key, lifecycle, released_next, nonce)
+            self.rollback_invoice(&canonical_key, lifecycle, next_handle, nonce)
                 .await;
             return Err(e);
         }
 
-        if let Some(next) = released_next {
-            next.release().await;
+        // Commit the in-flight `Publishing` state to `InvoiceIssued` only if
+        // this nonce still owns it.
+        if !self.finalize_invoice(&canonical_key, nonce) {
+            // Another attempt won or the entry was removed. Release the request
+            // if we still hold the only copy.
+            if let Some(handle) = next_handle {
+                let next = {
+                    let mut guard = handle.lock();
+                    guard.take()
+                };
+                if let Some(next) = next {
+                    next.release().await;
+                }
+            }
+            return Err(payment_error(
+                "invoice was superseded before it could be finalized",
+            ));
+        }
+
+        // Gating: the targeted response has been sent, so release the original
+        // request. The shared handle ensures this happens exactly once even when
+        // another attempt is racing the rollback.
+        if let Some(handle) = next_handle {
+            let next = {
+                let mut guard = handle.lock();
+                guard.take()
+            };
+            if let Some(next) = next {
+                next.release().await;
+            }
         }
 
         tokio::spawn(self.clone().ttl_worker(canonical_key, nonce, expires_at));
@@ -687,21 +734,21 @@ impl PaymentGate {
 
                 let nonce = self.inner.nonce.fetch_add(1, Ordering::SeqCst);
                 let expires_at = now + self.park_ttl();
+                let next_handle = Arc::new(Mutex::new(Some(next)));
 
-                let mut entry = ParkedEntry {
+                let entry = ParkedEntry {
                     identity,
                     request_event_id: ctx.request_event_id.clone(),
                     client_pubkey: ctx.client_pubkey.clone(),
                     mirrored_wrap_kind: ctx.mirrored_wrap_kind,
                     capability,
                     request: request.clone(),
-                    next_and_message: None,
+                    next_and_message: Some((next_handle, JsonRpcMessage::Request(request))),
                     state: PaymentState::AwaitingInvoice,
                     expires_at,
                     nonce,
                     lifecycle,
                 };
-                entry.next_and_message = Some((next, JsonRpcMessage::Request(request)));
 
                 // Atomic capacity check + insert under a single lock.
                 let evicted = {
@@ -755,7 +802,9 @@ impl PaymentGate {
     ) -> bool {
         let now = tokio::time::Instant::now();
         match &snapshot.state {
-            PaymentState::AwaitingInvoice | PaymentState::InvoiceIssued { .. } => {
+            PaymentState::AwaitingInvoice
+            | PaymentState::Publishing { .. }
+            | PaymentState::InvoiceIssued { .. } => {
                 // Duplicate before settlement. In gating mode answer with `-32043`; in
                 // transparent mode the client already has or will receive a payment-required
                 // notification for the original request.
@@ -911,28 +960,48 @@ impl PaymentGate {
         self.park_ttl().as_millis() as u64
     }
 
-    async fn send_payment_required_error(&self, canonical_key: &str) -> Result<(), FfiError> {
+    async fn send_payment_required_error(
+        &self,
+        canonical_key: &str,
+        expected_nonce: u64,
+    ) -> Result<(), FfiError> {
         let (client_pubkey, request_event_id, request_id, option) = {
             let parking = self.inner.parking.lock();
             let Some(entry) = parking.by_key.get(canonical_key) else {
                 return Err(payment_error("parked entry disappeared before response"));
             };
-            let PaymentState::InvoiceIssued {
-                pay_req,
-                amount,
-                pmi,
-                ttl_secs,
-                description,
-            } = &entry.state
-            else {
-                return Err(payment_error("invoice state missing before response"));
+            if entry.nonce != expected_nonce {
+                return Err(payment_error("invoice superseded before response"));
+            }
+            let (pay_req, amount, pmi, ttl_secs, description) = match &entry.state {
+                PaymentState::InvoiceIssued {
+                    pay_req,
+                    amount,
+                    pmi,
+                    ttl_secs,
+                    description,
+                }
+                | PaymentState::Publishing {
+                    pay_req,
+                    amount,
+                    pmi,
+                    ttl_secs,
+                    description,
+                } => (
+                    pay_req.clone(),
+                    *amount,
+                    pmi.clone(),
+                    *ttl_secs,
+                    description.clone(),
+                ),
+                _ => return Err(payment_error("invoice state missing before response")),
             };
             let option = PaymentOption {
-                amount: *amount,
-                pmi: pmi.clone(),
-                pay_req: pay_req.clone(),
-                description: description.clone(),
-                ttl: Some(*ttl_secs),
+                amount,
+                pmi,
+                pay_req,
+                description,
+                ttl: Some(ttl_secs),
                 meta: None,
             };
             (
@@ -958,6 +1027,7 @@ impl PaymentGate {
     async fn send_payment_required_notification(
         &self,
         canonical_key: &str,
+        expected_nonce: u64,
     ) -> Result<(), FfiError> {
         let (
             client_pubkey,
@@ -975,25 +1045,41 @@ impl PaymentGate {
                     "parked entry disappeared before notification",
                 ));
             };
-            let PaymentState::InvoiceIssued {
-                pay_req,
-                amount,
-                pmi,
-                ttl_secs,
-                description,
-            } = &entry.state
-            else {
-                return Err(payment_error("invoice state missing before notification"));
+            if entry.nonce != expected_nonce {
+                return Err(payment_error("invoice superseded before notification"));
+            }
+            let (pay_req, amount, pmi, ttl_secs, description) = match &entry.state {
+                PaymentState::InvoiceIssued {
+                    pay_req,
+                    amount,
+                    pmi,
+                    ttl_secs,
+                    description,
+                }
+                | PaymentState::Publishing {
+                    pay_req,
+                    amount,
+                    pmi,
+                    ttl_secs,
+                    description,
+                } => (
+                    pay_req.clone(),
+                    *amount,
+                    pmi.clone(),
+                    *ttl_secs,
+                    description.clone(),
+                ),
+                _ => return Err(payment_error("invoice state missing before notification")),
             };
             (
                 entry.client_pubkey.clone(),
                 entry.request_event_id.clone(),
                 entry.mirrored_wrap_kind,
-                *amount,
-                pay_req.clone(),
-                pmi.clone(),
-                *ttl_secs,
-                description.clone(),
+                amount,
+                pay_req,
+                pmi,
+                ttl_secs,
+                description,
             )
         };
 
@@ -1101,7 +1187,10 @@ impl PaymentGate {
             let mut parking = self.inner.parking.lock();
             let mut entry = parking.remove(canonical_key)?;
             self.inner.auth_store.clear_pending(&entry.identity);
-            let next = entry.next_and_message.take().map(|(next, _)| next);
+            let next = entry.next_and_message.take().and_then(|(handle, _)| {
+                let mut guard = handle.lock();
+                guard.take()
+            });
             (entry, next)
         };
 
@@ -1113,8 +1202,14 @@ impl PaymentGate {
     }
 
     async fn release_and_reject_evicted(&self, mut entry: ParkedEntry) {
-        if let Some((next, _)) = entry.next_and_message.take() {
-            next.release().await;
+        if let Some((handle, _)) = entry.next_and_message.take() {
+            let next = {
+                let mut guard = handle.lock();
+                guard.take()
+            };
+            if let Some(next) = next {
+                next.release().await;
+            }
         }
         self.inner.auth_store.clear_pending(&entry.identity);
 
@@ -1166,8 +1261,14 @@ impl PaymentGate {
             .await;
         }
 
-        if let Some((next, _)) = entry.next_and_message.take() {
-            next.release().await;
+        if let Some((handle, _)) = entry.next_and_message.take() {
+            let next = {
+                let mut guard = handle.lock();
+                guard.take()
+            };
+            if let Some(next) = next {
+                next.release().await;
+            }
         }
     }
 }
@@ -1239,7 +1340,7 @@ type InvoicePrepResult = (
     u64,
     tokio::time::Instant,
     PaymentLifecyclePolicy,
-    Option<Box<dyn PaymentNext>>,
+    Option<NextHandle>,
 );
 
 impl PaymentGate {
@@ -1295,41 +1396,41 @@ impl PaymentGate {
         let nonce = self.inner.nonce.fetch_add(1, Ordering::SeqCst);
         let expires_at = now + Duration::from_secs(ttl_secs);
 
-        match entry.state.clone() {
-            PaymentState::AwaitingInvoice => {
-                entry.state = PaymentState::InvoiceIssued {
-                    pay_req: pay_req.to_string(),
-                    amount: amount_sats,
-                    pmi: pmi.to_string(),
-                    ttl_secs,
-                    description: description.map(String::from),
-                };
-            }
-            PaymentState::InvoiceIssued {
+        let prior = match &entry.state {
+            PaymentState::AwaitingInvoice => None,
+            PaymentState::Publishing {
                 pay_req: existing,
                 amount,
                 ..
-            } => {
-                if existing != pay_req {
-                    parking.insert(&canonical_key, entry);
-                    return Err(validation_error("double-invoice guard: pay_req mismatch"));
-                }
-                if amount_sats != amount {
-                    parking.insert(&canonical_key, entry);
-                    return Err(validation_error("re-bind amount mismatch"));
-                }
-                entry.state = PaymentState::InvoiceIssued {
-                    pay_req: existing,
-                    amount: amount_sats,
-                    pmi: pmi.to_string(),
-                    ttl_secs,
-                    description: description.map(String::from),
-                };
-            }
-            _ => {
+            } => Some((existing.clone(), *amount)),
+            PaymentState::InvoiceIssued { .. } | PaymentState::Granted | PaymentState::Claiming => {
                 parking.insert(&canonical_key, entry);
-                return Err(payment_error("payment already settled or replayed"));
+                return Err(payment_error(
+                    "invoice already issued or payment already settled",
+                ));
             }
+        };
+
+        if let Some((existing_pay_req, existing_amount)) = prior {
+            if existing_pay_req.as_str() != pay_req {
+                parking.insert(&canonical_key, entry);
+                return Err(validation_error("double-invoice guard: pay_req mismatch"));
+            }
+            if amount_sats != existing_amount {
+                parking.insert(&canonical_key, entry);
+                return Err(validation_error("re-bind amount mismatch"));
+            }
+        }
+
+        // Mark this particular attempt as in flight. The actual `InvoiceIssued`
+        // commit only happens after the transport send succeeds, and only if this
+        // nonce still owns the state.
+        entry.state = PaymentState::Publishing {
+            pay_req: pay_req.to_string(),
+            amount: amount_sats,
+            pmi: pmi.to_string(),
+            ttl_secs,
+            description: description.map(String::from),
         };
 
         entry.nonce = nonce;
@@ -1338,11 +1439,16 @@ impl PaymentGate {
             .auth_store
             .update_pending_ttl(&entry.identity, ttl_secs * 1000);
 
-        // In gating mode the original request is answered with a targeted `-32042`,
-        // so the parked Next must be released after the response is sent. Hand it back
-        // to `submit_invoice` so the response goes out first.
-        let released_next = if entry.lifecycle == PaymentLifecyclePolicy::Gating {
-            entry.next_and_message.take().map(|(next, _)| next)
+        // In gating mode the original request must be released after the
+        // targeted response is sent. The `Next` stays in the entry's shared
+        // handle; `submit_invoice` will consume it on success. This clone lets a
+        // failed or superseded attempt release the request only if no in-flight
+        // attempt still needs it.
+        let next_handle = if entry.lifecycle == PaymentLifecyclePolicy::Gating {
+            entry
+                .next_and_message
+                .as_ref()
+                .map(|(handle, _)| handle.clone())
         } else {
             None
         };
@@ -1350,40 +1456,90 @@ impl PaymentGate {
         parking.insert(&canonical_key, entry);
         drop(parking);
 
-        Ok((canonical_key, nonce, expires_at, lifecycle, released_next))
+        Ok((canonical_key, nonce, expires_at, lifecycle, next_handle))
+    }
+
+    /// Promote a `Publishing` state to `InvoiceIssued` only if `nonce` still
+    /// owns the in-flight attempt. Returns `true` when the commit happened, in
+    /// which case the `pay_req` mapping has also been registered for settlement.
+    fn finalize_invoice(&self, canonical_key: &str, nonce: u64) -> bool {
+        let mut parking = self.inner.parking.lock();
+        let Some(entry) = parking.by_key.get_mut(canonical_key) else {
+            return false;
+        };
+        if !matches!(entry.state, PaymentState::Publishing { .. }) || entry.nonce != nonce {
+            return false;
+        }
+        let (pay_req, amount, pmi, ttl_secs, description) = match &entry.state {
+            PaymentState::Publishing {
+                pay_req,
+                amount,
+                pmi,
+                ttl_secs,
+                description,
+            } => (
+                pay_req.clone(),
+                *amount,
+                pmi.clone(),
+                *ttl_secs,
+                description.clone(),
+            ),
+            _ => return false,
+        };
+        entry.state = PaymentState::InvoiceIssued {
+            pay_req: pay_req.clone(),
+            amount,
+            pmi,
+            ttl_secs,
+            description,
+        };
+        parking.by_payreq.insert(pay_req, canonical_key.to_string());
+        true
     }
 
     /// Rollback an invoice transition when the transport publish fails.
     ///
-    /// Restores `AwaitingInvoice` and (in gating mode) the parked `Next`, resets the
-    /// TTL to the original park budget, and spawns a TTL worker so the consumer can
-    /// retry `submit_invoice` later.
+    /// Only the `Publishing` state owned by this `nonce` is reverted to
+    /// `AwaitingInvoice`. If a newer attempt is in flight, the state is left
+    /// untouched; if a newer attempt has already committed to `InvoiceIssued`,
+    /// this failed attempt releases its copy of the parked `Next` so the
+    /// successful response is not left with a dangling request.
     async fn rollback_invoice(
         &self,
         canonical_key: &str,
-        lifecycle: PaymentLifecyclePolicy,
-        released_next: Option<Box<dyn PaymentNext>>,
+        _lifecycle: PaymentLifecyclePolicy,
+        next_handle: Option<NextHandle>,
         nonce: u64,
     ) {
         let now = tokio::time::Instant::now();
         let expires_at = now + self.park_ttl();
 
-        let identity = {
+        let (identity, should_release_next) = {
             let mut parking = self.inner.parking.lock();
             if let Some(entry) = parking.by_key.get_mut(canonical_key) {
-                if matches!(entry.state, PaymentState::InvoiceIssued { .. }) {
-                    entry.state = PaymentState::AwaitingInvoice;
-                    entry.expires_at = expires_at;
-                    if lifecycle == PaymentLifecyclePolicy::Gating {
-                        if let Some(next) = released_next {
-                            entry.next_and_message =
-                                Some((next, JsonRpcMessage::Request(entry.request.clone())));
-                        }
+                match &entry.state {
+                    PaymentState::Publishing { .. } if entry.nonce == nonce => {
+                        entry.state = PaymentState::AwaitingInvoice;
+                        entry.expires_at = expires_at;
+                        (Some(entry.identity.clone()), false)
                     }
+                    PaymentState::Publishing { .. } => {
+                        // Another attempt is in flight and owns the state; leave
+                        // the `Next` for it.
+                        (None, false)
+                    }
+                    PaymentState::InvoiceIssued { .. }
+                    | PaymentState::Granted
+                    | PaymentState::Claiming => {
+                        // A newer attempt won. If this attempt holds the only
+                        // remaining `Next` handle, release the request now.
+                        (None, true)
+                    }
+                    PaymentState::AwaitingInvoice => (None, false),
                 }
-                Some(entry.identity.clone())
             } else {
-                None
+                // The entry was removed; release any request we still hold.
+                (None, true)
             }
         };
 
@@ -1391,6 +1547,18 @@ impl PaymentGate {
             self.inner
                 .auth_store
                 .update_pending_ttl(&identity, self.park_ttl_ms());
+        }
+
+        if should_release_next {
+            if let Some(handle) = next_handle {
+                let next = {
+                    let mut guard = handle.lock();
+                    guard.take()
+                };
+                if let Some(next) = next {
+                    next.release().await;
+                }
+            }
         }
 
         tokio::spawn(
@@ -1439,7 +1607,16 @@ impl PaymentGate {
             let client_pubkey = entry.client_pubkey.clone();
             let request_event_id = entry.request_event_id.clone();
             let mirrored_wrap_kind = entry.mirrored_wrap_kind;
-            let next_and_message = entry.next_and_message.take();
+            let next_and_message = match entry.next_and_message.take() {
+                Some((handle, message)) => {
+                    let next = {
+                        let mut guard = handle.lock();
+                        guard.take()
+                    };
+                    next.map(|next| (next, message))
+                }
+                None => None,
+            };
 
             Ok(SettleOutcome::Transparent {
                 identity,
@@ -1459,8 +1636,14 @@ impl PaymentGate {
 
             // Release the parked Next, if any, before returning. Gating already
             // answered `-32042` in `submit_invoice`, so this is just defensive cleanup.
-            if let Some((next, _)) = entry.next_and_message.take() {
-                next.release().await;
+            if let Some((handle, _)) = entry.next_and_message.take() {
+                let next = {
+                    let mut guard = handle.lock();
+                    guard.take()
+                };
+                if let Some(next) = next {
+                    next.release().await;
+                }
             }
 
             self.inner.auth_store.clear_pending(&identity);
@@ -1503,7 +1686,16 @@ impl PaymentGate {
         };
 
         self.inner.auth_store.clear_pending(&entry.identity);
-        let next_and_message = entry.next_and_message.take();
+        let next_and_message = match entry.next_and_message.take() {
+            Some((handle, message)) => {
+                let next = {
+                    let mut guard = handle.lock();
+                    guard.take()
+                };
+                next.map(|next| (next, message))
+            }
+            None => None,
+        };
 
         match entry.state {
             PaymentState::AwaitingInvoice => Ok(next_and_message),
@@ -1520,7 +1712,8 @@ fn canonical_key_for(identity: &CanonicalInvocationIdentity) -> String {
 
 fn payment_rejection_details(entry: &ParkedEntry) -> (&str, i64) {
     match &entry.state {
-        PaymentState::InvoiceIssued { pmi, amount, .. } => (pmi.as_str(), *amount),
+        PaymentState::InvoiceIssued { pmi, amount, .. }
+        | PaymentState::Publishing { pmi, amount, .. } => (pmi.as_str(), *amount),
         _ => (PMI_BITCOIN_LIGHTNING_BOLT11, entry.capability.amount_sats),
     }
 }
@@ -2623,5 +2816,183 @@ mod tests {
             recorder.lock().unwrap().is_some(),
             "the original parked Next was forwarded exactly once"
         );
+    }
+
+    #[tokio::test]
+    async fn concurrent_submit_invoice_rejected_attempt_cannot_clobber_invoice_transparent() {
+        let transport = Arc::new(FakeTransport::new());
+        let gate = Arc::new(
+            PaymentGate::new(
+                test_config(PaymentLifecyclePolicy::Transparent),
+                transport.clone(),
+            )
+            .unwrap(),
+        );
+        let (_next, recorder) = FakeNext::new();
+        let ctx = make_context("client", "e-concurrent-t", None);
+        gate.handle_inner(tools_call("1", "echo"), &ctx, boxed_next(recorder.clone()))
+            .await;
+        let event = gate.try_recv().unwrap();
+
+        // Use a barrier so both submit_invoice calls start together. They race
+        // on the same Publishing state; the winner is the one that still owns
+        // the nonce by the time it sends, the other is rejected and must not
+        // clobber the issued invoice.
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let request_event_id = event.request_event_id.clone();
+        let gate_a = gate.clone();
+        let gate_b = gate.clone();
+        let b = barrier.clone();
+
+        let request_event_id_a = request_event_id.clone();
+        let a = tokio::spawn(async move {
+            b.wait().await;
+            gate_a
+                .submit_invoice(
+                    &request_event_id_a,
+                    1000,
+                    "lnbc-concurrent-t",
+                    "bitcoin-lightning-bolt11",
+                    10,
+                    None,
+                )
+                .await
+        });
+        let b = tokio::spawn(async move {
+            barrier.wait().await;
+            gate_b
+                .submit_invoice(
+                    &request_event_id,
+                    1000,
+                    "lnbc-concurrent-t",
+                    "bitcoin-lightning-bolt11",
+                    10,
+                    None,
+                )
+                .await
+        });
+
+        let (a_res, b_res) = tokio::join!(a, b);
+        let a_res = a_res.unwrap();
+        let b_res = b_res.unwrap();
+        assert!(
+            (a_res.is_ok() && b_res.is_err()) || (a_res.is_err() && b_res.is_ok()),
+            "exactly one concurrent submit may succeed; got {a_res:?} and {b_res:?}"
+        );
+
+        // Settlement must still work; the rejected attempt did not clobber the
+        // successful issue.
+        gate.mark_settled("lnbc-concurrent-t", None).await.unwrap();
+        assert!(
+            recorder.lock().unwrap().is_some(),
+            "original request was forwarded exactly once"
+        );
+
+        let records = transport.records();
+        let required_count = records
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r,
+                    TransportRecord::Notification {
+                        notification: JsonRpcMessage::Notification(n),
+                        ..
+                    } if n.method == PAYMENT_REQUIRED_METHOD
+                )
+            })
+            .count();
+        assert_eq!(required_count, 1, "only one payment_required may be sent");
+    }
+
+    #[tokio::test]
+    async fn concurrent_submit_invoice_rejected_attempt_cannot_clobber_invoice_gating() {
+        let transport = Arc::new(FakeTransport::new());
+        let gate = Arc::new(
+            PaymentGate::new(
+                test_config(PaymentLifecyclePolicy::Gating),
+                transport.clone(),
+            )
+            .unwrap(),
+        );
+        let (_next, _recorder) = FakeNext::new();
+        let ctx = make_context(
+            "client",
+            "e-concurrent-g",
+            Some(PaymentInteractionMode::ExplicitGating),
+        );
+        gate.handle_inner(tools_call("1", "echo"), &ctx, boxed_next(_recorder.clone()))
+            .await;
+        let event = gate.try_recv().unwrap();
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let request_event_id = event.request_event_id.clone();
+        let gate_a = gate.clone();
+        let gate_b = gate.clone();
+        let b = barrier.clone();
+
+        let request_event_id_a = request_event_id.clone();
+        let a = tokio::spawn(async move {
+            b.wait().await;
+            gate_a
+                .submit_invoice(
+                    &request_event_id_a,
+                    1000,
+                    "lnbc-concurrent-g",
+                    "bitcoin-lightning-bolt11",
+                    10,
+                    None,
+                )
+                .await
+        });
+        let b = tokio::spawn(async move {
+            barrier.wait().await;
+            gate_b
+                .submit_invoice(
+                    &request_event_id,
+                    1000,
+                    "lnbc-concurrent-g",
+                    "bitcoin-lightning-bolt11",
+                    10,
+                    None,
+                )
+                .await
+        });
+
+        let (a_res, b_res) = tokio::join!(a, b);
+        let a_res = a_res.unwrap();
+        let b_res = b_res.unwrap();
+        assert!(
+            (a_res.is_ok() && b_res.is_err()) || (a_res.is_err() && b_res.is_ok()),
+            "exactly one concurrent submit may succeed; got {a_res:?} and {b_res:?}"
+        );
+
+        // Settlement stores a grant.
+        gate.mark_settled("lnbc-concurrent-g", None).await.unwrap();
+
+        // A retry with the same canonical identity but a new request_event_id
+        // must forward the original request.
+        let (_next2, recorder2) = FakeNext::new();
+        let ctx2 = make_context(
+            "client",
+            "e-retry",
+            Some(PaymentInteractionMode::ExplicitGating),
+        );
+        gate.handle_inner(
+            tools_call("2", "echo"),
+            &ctx2,
+            boxed_next(recorder2.clone()),
+        )
+        .await;
+        assert!(
+            recorder2.lock().unwrap().is_some(),
+            "paid grant must forward the request"
+        );
+
+        let records = transport.records();
+        let response_count = records
+            .iter()
+            .filter(|r| matches!(r, TransportRecord::Response { .. }))
+            .count();
+        assert_eq!(response_count, 1, "only one targeted -32042 may be sent");
     }
 }

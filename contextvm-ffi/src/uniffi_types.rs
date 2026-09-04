@@ -808,9 +808,15 @@ impl<'a> Drop for StartStateGuard<'a> {
     fn drop(&mut self) {
         // If close() won, leave the state CLOSED. Otherwise a failed or cancelled
         // start() should be retryable from CONFIGURING.
-        if self.0.state.load(Ordering::SeqCst) != STATE_CLOSED {
-            self.0.state.store(STATE_CONFIGURING, Ordering::SeqCst);
-        }
+        //
+        // Use compare_exchange so a concurrent close() that stores CLOSED between
+        // the load and store cannot be overwritten back to CONFIGURING.
+        let _ = self.0.state.compare_exchange(
+            STATE_STARTING,
+            STATE_CONFIGURING,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
     }
 }
 
@@ -2169,5 +2175,50 @@ mod tests {
 
         // close() after the dust settles is idempotent.
         assert!(server.close().is_ok());
+    }
+
+    // Real OS threads and real time: the guard's Drop is a few instructions, so
+    // this probe runs many rounds to force the interleaving where close() stores
+    // CLOSED between the guard's load and store. With the old load-then-store
+    // implementation the guard could overwrite close()'s CLOSED with CONFIGURING;
+    // with compare_exchange a closed server can never be resurrected.
+    #[test]
+    fn start_state_guard_drop_races_close_and_never_resurrects() {
+        let keys = Keys::generate();
+        let server = Arc::new(Server::new(&keys, &ServerConfig::default()).unwrap());
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+
+        const ROUNDS: usize = 10_000;
+
+        let closer = {
+            let server = Arc::clone(&server);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                for _ in 0..ROUNDS {
+                    barrier.wait();
+                    let _ = server.close();
+                    barrier.wait();
+                }
+            })
+        };
+
+        for _ in 0..ROUNDS {
+            server.state.store(STATE_STARTING, Ordering::SeqCst);
+            let guard = StartStateGuard::new(&server);
+
+            // Both threads are released together: one runs close(), the other
+            // drops the guard. The guard must never overwrite a close() win.
+            barrier.wait();
+            drop(guard);
+            barrier.wait();
+
+            assert_eq!(
+                server.state.load(Ordering::SeqCst),
+                STATE_CLOSED,
+                "close() must never be overwritten by StartStateGuard::drop"
+            );
+        }
+
+        closer.join().unwrap();
     }
 }
