@@ -179,6 +179,12 @@
   work stops when the transport closes. `send_notification`'s body moved into a shared
   publish that both it and the new injectable sender use, so the two cannot drift. A
   gated (dropped) request now releases the open-stream slot it reserved.
+- FFI bindings (`contextvm-ffi`): expose the CEP-8 payment gate through UniFFI with
+  `PaymentGateRequest`, `set_priced_capabilities_json`, `set_payment_interaction_policy`,
+  `recv_payment_gate_request`, `submit_invoice`, `mark_payment_settled`,
+  `mark_payment_failed`, and `mark_replayed`. `Server::start()` wires the gate, derives
+  the `cap`/`pmi`/`payment_interaction` announcement tags, and keeps the original
+  request route alive for transparent paid requests so the handler result is delivered.
 
 ## [0.2.2] - 2026-07-29
 
