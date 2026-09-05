@@ -244,9 +244,10 @@ impl PaymentNext for SdkNext {
 
 /// Shared handle to the parked request continuation.
 ///
-/// Multiple in-flight `submit_invoice` attempts for the same canonical id may
-/// hold clones of this `Arc`; only the one that successfully commits consumes
-/// and releases the `Next` so the original request is released exactly once.
+/// Publication is exclusive (a second `submit_invoice` while one is in flight
+/// is rejected), so exactly one attempt can commit or roll back; this handle
+/// lets rollback/failure paths release the `Next` exactly once when the entry
+/// is removed.
 type NextHandle = Arc<Mutex<Option<Box<dyn PaymentNext>>>>;
 
 /// The payment gate middleware.
@@ -1922,7 +1923,11 @@ mod tests {
         ) -> Pin<Box<dyn Future<Output = contextvm_sdk::Result<()>> + Send>> {
             let inner = self.inner.clone();
             let counter = self.fail_next_response.clone();
+            let delay_ms = self.notification_delay_ms.load(Ordering::SeqCst);
             Box::pin(async move {
+                if delay_ms > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                }
                 if counter
                     .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
                         if v > 0 {
@@ -2744,6 +2749,10 @@ mod tests {
         assert!(
             b_res.is_err(),
             "concurrent submit while publishing must be rejected"
+        );
+        assert!(
+            format!("{b_res:?}").contains("in flight"),
+            "gating duplicate must hit the Publishing coalescing arm, got {b_res:?}"
         );
 
         let a_res = a.await.unwrap();
