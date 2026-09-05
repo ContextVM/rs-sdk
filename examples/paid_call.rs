@@ -8,7 +8,10 @@ use contextvm_sdk::transport::client::NostrClientTransportConfig;
 #[tokio::main]
 async fn main() -> contextvm_sdk::Result<()> {
     let server_pubkey_hex = std::env::args().nth(1).expect("server pubkey");
-    let wait_secs: u64 = std::env::args().nth(2).map(|s| s.parse().unwrap()).unwrap_or(300);
+    let wait_secs: u64 = std::env::args()
+        .nth(2)
+        .map(|s| s.parse().unwrap())
+        .unwrap_or(300);
     let keys = signer::generate();
     let nostr_config = NostrClientTransportConfig::default()
         .with_server_pubkey(server_pubkey_hex)
@@ -31,12 +34,22 @@ async fn main() -> contextvm_sdk::Result<()> {
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait_secs);
     while std::time::Instant::now() < deadline {
-        let Ok(Some(msg)) = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await else { continue };
+        let Ok(Some(msg)) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await
+        else {
+            continue;
+        };
         let s = serde_json::to_string(&msg).unwrap();
         println!("<<< {s}");
         match &msg {
-            JsonRpcMessage::Response(r) if r.id == id => { println!("FINAL RESPONSE RECEIVED"); break; }
-            JsonRpcMessage::ErrorResponse(e) if e.id == id => { println!("ERROR RESPONSE RECEIVED"); break; }
+            JsonRpcMessage::Response(r) if r.id == id => {
+                println!("FINAL RESPONSE RECEIVED");
+                break;
+            }
+            JsonRpcMessage::ErrorResponse(e) if e.id == id => {
+                println!("ERROR RESPONSE RECEIVED");
+                break;
+            }
             _ => {}
         }
     }
