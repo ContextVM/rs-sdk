@@ -1,6 +1,6 @@
 [package]
 name = "contextvm-ffi"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "FFI bindings for the ContextVM SDK — C header + Python/Swift/Kotlin support"
 license = "MIT"
@@ -12,10 +12,16 @@ crate-type = ["cdylib", "staticlib", "lib"]
 [dependencies]
 contextvm-sdk = { path = ".." }
 nostr-sdk = { version = "0.44", features = ["nip59"] }
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["full", "test-util"] }
+tokio-util = { version = "0.7", default-features = false }
 serde_json = "1"
+serde = { version = "1", features = ["derive"] }
 uniffi = "0.31"
 parking_lot = "0.12"
+async-trait = "0.1"
+
+[dev-dependencies]
+contextvm-sdk = { path = "..", features = ["test-utils"] }
 
 [features]
 default = []

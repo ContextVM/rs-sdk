@@ -152,6 +152,35 @@ impl AuthorizationStore {
         }
     }
 
+    /// Atomically record a paid grant and immediately consume it.
+    ///
+    /// This is the primitive the transparent payment lifecycle uses for a settled
+    /// invoice: the single forward after settlement must win or fail cleanly, never
+    /// race a concurrent duplicate that could claim the grant between `grant` and
+    /// `claim`. Any live pending entry for the same identity is cleared because a
+    /// grant supersedes an in-flight offer cycle.
+    ///
+    /// Returns `true` if a live grant was inserted and claimed by this call, `false`
+    /// if the TTL was zero or the just-inserted grant was already expired.
+    pub fn grant_and_claim(&self, id: &CanonicalInvocationIdentity, ttl_ms: u64) -> bool {
+        if ttl_ms == 0 {
+            return false;
+        }
+        let now = Instant::now();
+        let expires_at = now + Duration::from_millis(ttl_ms);
+        let key = Self::key(id);
+
+        let mut inner = self.lock();
+        // A grant overwrites pending state: once settled, the canonical id is no longer
+        // waiting for payment.
+        inner.pending.pop(&key);
+        inner.authorizations.put(key.clone(), expires_at);
+        match inner.authorizations.pop(&key) {
+            None => false,
+            Some(expires_at) => now <= expires_at,
+        }
+    }
+
     /// Atomic check-and-set of pending state for `id`.
     ///
     /// Returns `true` if this call transitioned the identity to pending (the caller emits
@@ -638,6 +667,35 @@ mod tests {
             assert_eq!(pending_set, 1, "exactly one loser wins the pending slot");
             assert_eq!(already, N - 2, "everyone else parks behind the pending");
         }
+    }
+
+    #[test]
+    fn grant_and_claim_is_atomic() {
+        let store = AuthorizationStore::new();
+        let identity = default_id();
+
+        // Happy path: the grant is both recorded and consumed.
+        assert!(store.grant_and_claim(&identity, 10_000));
+        assert!(
+            !store.claim(&identity),
+            "the grant must be already consumed"
+        );
+
+        // A zero TTL should fail (the grant expires immediately).
+        let zero_ttl = id("client", "hash-zero");
+        assert!(!store.grant_and_claim(&zero_ttl, 0));
+    }
+
+    #[test]
+    fn grant_and_claim_clears_pending() {
+        let store = AuthorizationStore::new();
+        let id = default_id();
+
+        // A concurrent offer cycle set pending; settlement supersedes it.
+        assert!(store.try_set_pending(&id, 10_000));
+        assert!(store.grant_and_claim(&id, 10_000));
+        assert_eq!(store.get_pending_remaining_ms(&id), 0);
+        assert!(!store.claim(&id));
     }
 
     // Real threads and real time (no async): two OS threads rendezvous on a reused

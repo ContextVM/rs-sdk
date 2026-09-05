@@ -254,6 +254,15 @@ impl ServerOpenStreamState {
         }
     }
 
+    /// Reverse a previous `mark_forwarded` for `event_id`. Used by a middleware that kept a
+    /// request alive with `Next::keep_alive` and later decides to release it without forwarding.
+    /// A no-op when the request has no writer slot.
+    pub(crate) fn unmark_forwarded(&self, event_id: &str) {
+        if let Some(slot) = self.lock_slots().get_mut(event_id) {
+            slot.forwarded = false;
+        }
+    }
+
     /// Register one inbound chain run against `event_id`'s writer slot.
     ///
     /// Called from the seam's dispatch, on the event-loop task and before the chain is spawned,
@@ -626,6 +635,10 @@ pub struct IncomingRequest {
     pub event_id: String,
     /// Whether the original message was encrypted.
     pub is_encrypted: bool,
+    /// The canonical invocation identity (`client_pubkey:invocation_hash`) assigned by
+    /// a payment gate, if this request was forwarded by one. Non-gated requests carry
+    /// `None`.
+    pub canonical_invocation_id: Option<String>,
     /// The inbound (client-signed) Nostr event, if this request carried one.
     ///
     /// `Some` for real client requests: the inner, signature-verified gift-wrap

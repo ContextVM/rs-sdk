@@ -6,11 +6,17 @@
 
 use crate::builders::{
     build_sdk_client_config_from_fields, build_sdk_server_config_from_fields,
-    CapabilityExclusionParts, ClientConfigParts, ServerConfigParts,
+    build_server_config_parts, ClientConfigParts,
 };
 use crate::error::FfiError;
+use crate::payment_gate::{PaymentGate, PaymentGateConfig, PaymentGateTransport};
 use crate::runtime::global_runtime;
 use crate::types::json_rpc_id_to_string;
+use contextvm_sdk::transport::server::{PaymentNotificationSender, TargetedResponseSender};
+use parking_lot::Mutex as ParkingLotMutex;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -30,6 +36,16 @@ pub enum GiftWrapMode {
     Optional,
     Ephemeral,
     Persistent,
+}
+
+/// CEP-8 server payment-interaction policy.
+///
+/// `Optional` lets clients negotiate `explicit_gating`.
+/// `Transparent` rejects `explicit_gating` with a JSON-RPC `-32602`.
+#[derive(Debug, Clone, Copy, uniffi::Enum)]
+pub enum PaymentInteractionPolicy {
+    Optional,
+    Transparent,
 }
 
 /// JSON-RPC message type.
@@ -66,6 +82,7 @@ pub struct IncomingRequest {
     pub client_pubkey: String,
     pub event_id: String,
     pub is_encrypted: bool,
+    pub canonical_invocation_id: Option<String>,
 }
 
 /// A discovered server announcement.
@@ -133,15 +150,25 @@ pub struct ServerConfig {
     pub server_about: Option<String>,
     pub server_website: Option<String>,
     pub allowed_pubkeys: Vec<String>,
-    pub session_timeout_secs: u64,
+    /// `None` lets `Server::start()` derive a payment-aware default.
+    /// Some(v) uses the explicit value (validated against payment budget when payments are enabled).
+    pub session_timeout_secs: Option<u64>,
     pub cleanup_interval_secs: u64,
     pub excluded_capabilities: Vec<CapabilityExclusion>,
     pub max_sessions: u64,
-    pub request_timeout_secs: u64,
+    /// `None` lets `Server::start()` derive a payment-aware default.
+    /// Some(v) uses the explicit value (validated against payment budget when payments are enabled).
+    pub request_timeout_secs: Option<u64>,
     pub relay_list_urls: Vec<String>,
     pub bootstrap_relay_urls: Vec<String>,
     pub publish_relay_list: bool,
     pub profile_metadata_json: Option<String>,
+    /// Maximum payment invoice TTL (seconds) the operator is willing to wait for.
+    /// Used by `Server::start()` to derive request/session timeouts when payments are enabled.
+    pub payment_ttl_cap_secs: u64,
+    /// Estimated maximum execution budget (seconds) for a paid request.
+    /// Used by `Server::start()` to derive request/session timeouts when payments are enabled.
+    pub execution_budget_secs: u64,
 }
 
 impl Default for ServerConfig {
@@ -157,15 +184,17 @@ impl Default for ServerConfig {
             server_about: None,
             server_website: None,
             allowed_pubkeys: vec![],
-            session_timeout_secs: 300,
+            session_timeout_secs: None,
             cleanup_interval_secs: 60,
             excluded_capabilities: vec![],
             max_sessions: 1000,
-            request_timeout_secs: 60,
+            request_timeout_secs: None,
             relay_list_urls: vec![],
             bootstrap_relay_urls: vec![],
             publish_relay_list: true,
             profile_metadata_json: None,
+            payment_ttl_cap_secs: crate::builders::DEFAULT_PAYMENT_TTL_CAP_SECS,
+            execution_budget_secs: crate::builders::DEFAULT_EXECUTION_BUDGET_SECS,
         }
     }
 }
@@ -216,6 +245,19 @@ fn sdk_gift_wrap_mode(m: GiftWrapMode) -> contextvm_sdk::GiftWrapMode {
     }
 }
 
+fn sdk_payment_interaction_policy(
+    policy: PaymentInteractionPolicy,
+) -> contextvm_sdk::payments::PaymentInteractionPolicy {
+    match policy {
+        PaymentInteractionPolicy::Optional => {
+            contextvm_sdk::payments::PaymentInteractionPolicy::Optional
+        }
+        PaymentInteractionPolicy::Transparent => {
+            contextvm_sdk::payments::PaymentInteractionPolicy::Transparent
+        }
+    }
+}
+
 fn message_to_uniffi(msg: &contextvm_sdk::JsonRpcMessage) -> JsonRpcMessage {
     let msg_type = match msg {
         contextvm_sdk::JsonRpcMessage::Request(_) => JsonRpcMessageType::Request,
@@ -238,6 +280,7 @@ fn incoming_to_uniffi(req: &contextvm_sdk::IncomingRequest) -> IncomingRequest {
         client_pubkey: req.client_pubkey.clone(),
         event_id: req.event_id.clone(),
         is_encrypted: req.is_encrypted,
+        canonical_invocation_id: req.canonical_invocation_id.clone(),
         // req.event (the full client-signed Nostr event) is deliberately not
         // forwarded — see the note on `IncomingRequest` above.
     }
@@ -397,6 +440,105 @@ fn parse_tags_json(json: &str) -> Result<Vec<nostr_sdk::prelude::Tag>, FfiError>
         .collect()
 }
 
+/// Parse a JSON array of priced capabilities, validating each row.
+fn parse_priced_capabilities_json(
+    json: &str,
+) -> Result<Vec<contextvm_sdk::payments::types::PricedCapability>, FfiError> {
+    let rows: Vec<serde_json::Value> = serde_json::from_str(json).map_err(|e| FfiError {
+        code: crate::error::ErrorCode::Serialization,
+        message: format!("invalid priced_capabilities_json: {e}"),
+    })?;
+
+    rows.into_iter()
+        .enumerate()
+        .map(|(i, row)| parse_priced_capability_row(i, row))
+        .collect()
+}
+
+fn parse_priced_capability_row(
+    index: usize,
+    row: serde_json::Value,
+) -> Result<contextvm_sdk::payments::types::PricedCapability, FfiError> {
+    let obj = row.as_object().ok_or_else(|| FfiError {
+        code: crate::error::ErrorCode::Validation,
+        message: format!("priced capability[{index}] is not an object"),
+    })?;
+
+    let method = obj
+        .get("method")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| FfiError {
+            code: crate::error::ErrorCode::Validation,
+            message: format!("priced capability[{index}] missing 'method'"),
+        })?
+        .to_string();
+
+    let name = obj.get("name").and_then(|v| v.as_str()).map(String::from);
+
+    let amount = obj
+        .get("amount")
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| FfiError {
+            code: crate::error::ErrorCode::Validation,
+            message: format!("priced capability[{index}] missing or non-integer 'amount'"),
+        })?;
+    if amount <= 0 {
+        return Err(FfiError {
+            code: crate::error::ErrorCode::Validation,
+            message: format!("priced capability[{index}] 'amount' must be positive"),
+        });
+    }
+
+    let max_amount = match obj.get("maxAmount") {
+        Some(v) => {
+            let max = v.as_i64().ok_or_else(|| FfiError {
+                code: crate::error::ErrorCode::Validation,
+                message: format!("priced capability[{index}] 'maxAmount' must be an integer"),
+            })?;
+            if max < amount {
+                return Err(FfiError {
+                    code: crate::error::ErrorCode::Validation,
+                    message: format!(
+                        "priced capability[{index}] 'maxAmount' ({max}) must be >= 'amount' ({amount})"
+                    ),
+                });
+            }
+            Some(max)
+        }
+        None => None,
+    };
+
+    let currency_unit = obj
+        .get("currencyUnit")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| FfiError {
+            code: crate::error::ErrorCode::Validation,
+            message: format!("priced capability[{index}] missing 'currencyUnit'"),
+        })?;
+    if currency_unit != "sats" {
+        return Err(FfiError {
+            code: crate::error::ErrorCode::Validation,
+            message: format!(
+                "priced capability[{index}] unsupported 'currencyUnit': {currency_unit} (only 'sats' is supported)"
+            ),
+        });
+    }
+
+    let description = obj
+        .get("description")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
+    Ok(contextvm_sdk::payments::types::PricedCapability {
+        method,
+        name,
+        amount,
+        max_amount,
+        currency_unit: currency_unit.to_string(),
+        description,
+    })
+}
+
 // ─── High-level UniFFI objects ─────────────────────────────────────────
 
 /// A Nostr keypair.
@@ -470,85 +612,481 @@ impl RelayPool {
 }
 
 /// A server transport that receives MCP requests over Nostr.
+///
+/// `Server` now has a two-phase lifecycle:
+/// 1. **Configuring** — construct with `new`, call pre-start setters.
+/// 2. **Started** — call `start()` to build the transport and begin listening.
+/// 3. **Closed** — call `close()` to shut down.
 #[derive(uniffi::Object)]
 pub struct Server {
-    transport: Arc<tokio::sync::Mutex<contextvm_sdk::NostrServerTransport>>,
-    receiver: Arc<
-        tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<contextvm_sdk::IncomingRequest>>,
+    state: AtomicU8,
+    keys: contextvm_sdk::signer::Keys,
+    inner: ParkingLotMutex<ServerInner>,
+}
+
+struct ServerInner {
+    /// Pending configuration supplied to `new()` and mutated by pre-start setters.
+    pending_config: ServerConfig,
+    /// Announcement tags set before `start()`.
+    extra_tags: Vec<nostr_sdk::prelude::Tag>,
+    /// Pricing announcement tags set before `start()`.
+    pricing_tags: Vec<nostr_sdk::prelude::Tag>,
+    /// Parsed priced capabilities; a non-empty list at `start()` enables payment handling.
+    priced_capabilities: Vec<contextvm_sdk::payments::types::PricedCapability>,
+    /// CEP-8 payment interaction policy applied inside `start()`.
+    payment_policy: Option<contextvm_sdk::payments::PaymentInteractionPolicy>,
+    /// Live transport after `start()`.
+    transport: Option<Arc<tokio::sync::Mutex<contextvm_sdk::NostrServerTransport>>>,
+    /// Request receiver after `start()`.
+    receiver: Option<
+        Arc<
+            tokio::sync::Mutex<
+                tokio::sync::mpsc::UnboundedReceiver<contextvm_sdk::IncomingRequest>,
+            >,
+        >,
     >,
+    /// Payment gate after `start()` if priced capabilities are non-empty.
+    payment_gate: Option<crate::payment_gate::PaymentGate>,
+    /// Optional override for the relay pool (tests only).
+    relay_pool_override: Option<Arc<dyn contextvm_sdk::relay::RelayPoolTrait>>,
+}
+
+const STATE_CONFIGURING: u8 = 0;
+const STATE_STARTING: u8 = 1;
+const STATE_STARTED: u8 = 2;
+const STATE_CLOSED: u8 = 3;
+
+/// Real transport bridge used by the payment gate.
+///
+/// Captures the SDK's injectable notification and targeted-response senders so
+/// the gate can emit CEP-8 lifecycle events and explicit-gating errors.
+#[derive(Clone)]
+struct ServerPaymentTransport {
+    notification_sender: PaymentNotificationSender,
+    targeted_sender: TargetedResponseSender,
+}
+
+impl PaymentGateTransport for ServerPaymentTransport {
+    fn send_payment_notification(
+        &self,
+        client_pubkey: String,
+        request_event_id: String,
+        mirrored_wrap_kind: Option<u16>,
+        notification: contextvm_sdk::JsonRpcMessage,
+    ) -> Pin<Box<dyn Future<Output = contextvm_sdk::Result<()>> + Send>> {
+        (self.notification_sender)(
+            client_pubkey,
+            request_event_id,
+            mirrored_wrap_kind,
+            notification,
+        )
+    }
+
+    fn send_targeted_response(
+        &self,
+        client_pubkey: String,
+        request_event_id: String,
+        response: contextvm_sdk::JsonRpcMessage,
+    ) -> Pin<Box<dyn Future<Output = contextvm_sdk::Result<()>> + Send>> {
+        (self.targeted_sender)(client_pubkey, request_event_id, response)
+    }
+}
+
+impl Server {
+    fn not_started_error() -> FfiError {
+        FfiError {
+            code: crate::error::ErrorCode::NotStarted,
+            message: "server has not been started".into(),
+        }
+    }
+
+    fn closed_error() -> FfiError {
+        FfiError {
+            code: crate::error::ErrorCode::Closed,
+            message: "server is closed".into(),
+        }
+    }
+
+    fn not_configuring_error() -> FfiError {
+        FfiError {
+            code: crate::error::ErrorCode::Validation,
+            message: "server is not in the configuring state".into(),
+        }
+    }
+
+    fn start_state_error(current: u8) -> FfiError {
+        match current {
+            STATE_STARTED => FfiError {
+                code: crate::error::ErrorCode::Validation,
+                message: "server already started".into(),
+            },
+            STATE_STARTING => FfiError {
+                code: crate::error::ErrorCode::Validation,
+                message: "server is already starting".into(),
+            },
+            STATE_CLOSED => Self::closed_error(),
+            _ => FfiError {
+                code: crate::error::ErrorCode::Validation,
+                message: "server cannot be started from its current state".into(),
+            },
+        }
+    }
+
+    fn require_started(&self) -> Result<(), FfiError> {
+        match self.state.load(Ordering::SeqCst) {
+            STATE_STARTED => Ok(()),
+            STATE_CLOSED => Err(Self::closed_error()),
+            _ => Err(Self::not_started_error()),
+        }
+    }
+
+    fn require_configuring(&self) -> Result<(), FfiError> {
+        match self.state.load(Ordering::SeqCst) {
+            STATE_CONFIGURING => Ok(()),
+            STATE_CLOSED => Err(Self::closed_error()),
+            _ => Err(Self::not_configuring_error()),
+        }
+    }
+
+    fn transport_ref(
+        &self,
+    ) -> Option<Arc<tokio::sync::Mutex<contextvm_sdk::NostrServerTransport>>> {
+        self.inner.lock().transport.clone()
+    }
+
+    fn receiver_ref(
+        &self,
+    ) -> Option<
+        Arc<
+            tokio::sync::Mutex<
+                tokio::sync::mpsc::UnboundedReceiver<contextvm_sdk::IncomingRequest>,
+            >,
+        >,
+    > {
+        self.inner.lock().receiver.clone()
+    }
+
+    fn no_payment_gate_error() -> FfiError {
+        FfiError {
+            code: crate::error::ErrorCode::Payment,
+            message: "payments not configured".into(),
+        }
+    }
+
+    /// Test-only constructor that injects a mock relay pool.
+    #[doc(hidden)]
+    pub fn new_with_relay_pool(
+        keys: &Keys,
+        config: &ServerConfig,
+        relay_pool: Arc<dyn contextvm_sdk::relay::RelayPoolTrait>,
+    ) -> Result<Self, FfiError> {
+        let server = Self::new(keys, config)?;
+        server.inner.lock().relay_pool_override = Some(relay_pool);
+        Ok(server)
+    }
+}
+
+/// RAII guard that rolls a `STARTING` server back to `CONFIGURING` if `start()`
+/// exits before it reaches `STATE_STARTED` and `close()` did not win the race.
+///
+/// This keeps a post-CAS validation or transport-build failure from stranding
+/// the server in `STATE_STARTING` and allows the caller to reconfigure and retry.
+/// Disarm the guard with [`StartStateGuard::disarm`] once the server is started.
+struct StartStateGuard<'a>(&'a Server);
+
+impl<'a> StartStateGuard<'a> {
+    fn new(server: &'a Server) -> Self {
+        Self(server)
+    }
+
+    fn disarm(self) {
+        std::mem::forget(self);
+    }
+}
+
+impl<'a> Drop for StartStateGuard<'a> {
+    fn drop(&mut self) {
+        // If close() won, leave the state CLOSED. Otherwise a failed or cancelled
+        // start() should be retryable from CONFIGURING.
+        //
+        // Use compare_exchange so a concurrent close() that stores CLOSED between
+        // the load and store cannot be overwritten back to CONFIGURING.
+        let _ = self.0.state.compare_exchange(
+            STATE_STARTING,
+            STATE_CONFIGURING,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+    }
 }
 
 #[uniffi::export]
 impl Server {
-    /// Create and start a server transport.
+    /// Create a server but do not start it yet.
+    ///
+    /// The returned `Server` is in the `Configuring` state. Call pre-start setters,
+    /// then `start()` to begin listening.
     #[uniffi::constructor]
     pub fn new(keys: &Keys, config: &ServerConfig) -> Result<Self, FfiError> {
-        let sdk_config = build_sdk_server_config_from_fields(ServerConfigParts {
-            relay_urls: config.relay_urls.clone(),
-            encryption_mode: sdk_encryption_mode(config.encryption_mode),
-            gift_wrap_mode: sdk_gift_wrap_mode(config.gift_wrap_mode),
-            server_name: config.server_name.clone(),
-            server_version: config.server_version.clone(),
-            server_picture: config.server_picture.clone(),
-            server_about: config.server_about.clone(),
-            server_website: config.server_website.clone(),
-            is_announced_server: config.is_announced_server,
-            allowed_pubkeys: config.allowed_pubkeys.clone(),
-            session_timeout_secs: config.session_timeout_secs,
-            cleanup_interval_secs: config.cleanup_interval_secs,
-            excluded_capabilities: config
-                .excluded_capabilities
-                .iter()
-                .map(|cap| CapabilityExclusionParts {
-                    method: cap.method.clone(),
-                    name: cap.name.clone(),
-                })
-                .collect(),
-            max_sessions: config.max_sessions as usize,
-            request_timeout_secs: config.request_timeout_secs,
-            relay_list_urls: config.relay_list_urls.clone(),
-            bootstrap_relay_urls: config.bootstrap_relay_urls.clone(),
-            publish_relay_list: config.publish_relay_list,
-            profile_metadata_json: config.profile_metadata_json.clone(),
-        })?;
+        // Fail fast on obviously invalid configuration, but do not build the transport
+        // or open any relay connections until `start()`.
+        build_sdk_server_config_from_fields(build_server_config_parts(config))?;
 
-        global_runtime()
-            .block_on(async {
-                let mut transport =
-                    contextvm_sdk::NostrServerTransport::new(keys.inner.clone(), sdk_config)
-                        .await?;
-                transport.start().await?;
-                transport.spawn_discoverability_publication();
-                let receiver = transport
-                    .take_message_receiver()
-                    .ok_or_else(|| contextvm_sdk::Error::Other("receiver already taken".into()))?;
-                Ok::<_, contextvm_sdk::Error>(Self {
-                    transport: Arc::new(tokio::sync::Mutex::new(transport)),
-                    receiver: Arc::new(tokio::sync::Mutex::new(receiver)),
-                })
-            })
-            .map_err(FfiError::from)
+        Ok(Self {
+            state: AtomicU8::new(STATE_CONFIGURING),
+            keys: keys.inner.clone(),
+            inner: ParkingLotMutex::new(ServerInner {
+                pending_config: config.clone(),
+                extra_tags: Vec::new(),
+                pricing_tags: Vec::new(),
+                priced_capabilities: Vec::new(),
+                payment_policy: None,
+                transport: None,
+                receiver: None,
+                payment_gate: None,
+                relay_pool_override: None,
+            }),
+        })
+    }
+
+    /// Start the server transport.
+    ///
+    /// This applies the pending configuration, derives payment-adjusted timeouts
+    /// if payments are enabled, builds the transport, and begins listening.
+    /// May only be called once from the `Configuring` state.
+    pub fn start(&self) -> Result<(), FfiError> {
+        let prev = self.state.compare_exchange(
+            STATE_CONFIGURING,
+            STATE_STARTING,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+        match prev {
+            Ok(_) => {}
+            Err(current) => return Err(Self::start_state_error(current)),
+        }
+
+        // If start() exits before we set STATE_STARTED and close() did not win,
+        // roll the state back to CONFIGURING so the caller can reconfigure/retry.
+        let guard = StartStateGuard::new(self);
+
+        // Snapshot pending configuration; no setters can run while we are STARTING.
+        let (
+            pending_config,
+            extra_tags,
+            pricing_tags,
+            priced_capabilities,
+            payment_policy,
+            relay_pool_override,
+        ) = {
+            let inner = self.inner.lock();
+            (
+                inner.pending_config.clone(),
+                inner.extra_tags.clone(),
+                inner.pricing_tags.clone(),
+                inner.priced_capabilities.clone(),
+                inner.payment_policy,
+                inner.relay_pool_override.clone(),
+            )
+        };
+
+        let mut sdk_config =
+            build_sdk_server_config_from_fields(build_server_config_parts(&pending_config))?;
+
+        let payment_enabled = !priced_capabilities.is_empty() || payment_policy.is_some();
+        let ttl_cap = pending_config.payment_ttl_cap_secs;
+        let exec = pending_config.execution_budget_secs;
+        let margin = crate::builders::PAYMENT_BUDGET_MARGIN_SECS;
+        let lower_bound = crate::builders::payment_timeout_lower_bound(ttl_cap, exec, margin);
+
+        let request = match pending_config.request_timeout_secs {
+            Some(0) => {
+                return Err(FfiError {
+                    code: crate::error::ErrorCode::Validation,
+                    message: "request_timeout_secs must be > 0".into(),
+                });
+            }
+            Some(v) => {
+                if payment_enabled {
+                    crate::builders::validate_explicit_timeout(v, lower_bound)?;
+                }
+                v
+            }
+            None => {
+                if payment_enabled {
+                    crate::builders::derive_payment_request_timeout(ttl_cap, exec, margin)
+                } else {
+                    sdk_config.request_timeout.as_secs()
+                }
+            }
+        };
+        let session = match pending_config.session_timeout_secs {
+            Some(0) => {
+                return Err(FfiError {
+                    code: crate::error::ErrorCode::Validation,
+                    message: "session_timeout_secs must be > 0".into(),
+                });
+            }
+            Some(v) => {
+                if payment_enabled {
+                    crate::builders::validate_explicit_timeout(v, lower_bound)?;
+                }
+                v
+            }
+            None => {
+                if payment_enabled {
+                    crate::builders::derive_payment_session_timeout(ttl_cap, exec, margin)
+                } else {
+                    sdk_config.session_timeout.as_secs()
+                }
+            }
+        };
+        sdk_config.request_timeout = Duration::from_secs(request);
+        sdk_config.session_timeout = Duration::from_secs(session);
+
+        let mut payment_extra = extra_tags;
+        if payment_enabled {
+            payment_extra.extend(contextvm_sdk::payments::tags::pmi_tags(&[
+                contextvm_sdk::payments::constants::PMI_BITCOIN_LIGHTNING_BOLT11.into(),
+            ]));
+            if matches!(
+                payment_policy,
+                Some(contextvm_sdk::payments::PaymentInteractionPolicy::Optional)
+            ) {
+                payment_extra.push(contextvm_sdk::payments::tags::payment_interaction_tag(
+                    contextvm_sdk::core::types::PaymentInteractionMode::ExplicitGating,
+                ));
+            }
+        }
+
+        let gate_caps: Vec<crate::payment_gate::PricedCapability> =
+            priced_capabilities.iter().map(|c| c.into()).collect();
+        let gate_config = PaymentGateConfig {
+            payment_ttl_cap_secs: ttl_cap,
+            execution_budget_secs: exec,
+            request_timeout_secs: request,
+            session_timeout_secs: session,
+            parked_cap: 128,
+            event_queue_bound: 64,
+            policy: crate::payment_gate::PaymentLifecyclePolicy::Transparent,
+            priced_capabilities: gate_caps,
+        };
+
+        let result = global_runtime().block_on(async move {
+            let mut transport = if let Some(pool) = relay_pool_override {
+                contextvm_sdk::NostrServerTransport::with_relay_pool(sdk_config, pool).await
+            } else {
+                contextvm_sdk::NostrServerTransport::new(self.keys.clone(), sdk_config).await
+            }
+            .map_err(FfiError::from)?;
+
+            if !payment_extra.is_empty() {
+                transport.set_announcement_extra_tags(payment_extra);
+            }
+            if !pricing_tags.is_empty() {
+                transport.set_announcement_pricing_tags(pricing_tags);
+            }
+            if let Some(policy) = payment_policy {
+                transport.set_supported_payment_interaction(policy);
+            }
+
+            // Build and register the payment gate before start() so its senders capture
+            // the tag sets set above and the middleware chain is frozen in place.
+            let payment_gate = if !priced_capabilities.is_empty() {
+                let notification_sender =
+                    transport.payment_notification_sender(Duration::from_secs(ttl_cap));
+                let targeted_sender = transport.targeted_response_sender();
+                let gate_transport = Arc::new(ServerPaymentTransport {
+                    notification_sender,
+                    targeted_sender,
+                });
+                let gate = PaymentGate::new(gate_config, gate_transport)?;
+                let middleware: Arc<dyn contextvm_sdk::transport::server::InboundMiddleware> =
+                    Arc::new(gate.clone());
+                transport.add_inbound_middleware(middleware);
+                Some(gate)
+            } else {
+                None
+            };
+
+            transport.start().await.map_err(FfiError::from)?;
+            transport.spawn_discoverability_publication();
+
+            Ok::<_, FfiError>((transport, payment_gate))
+        });
+
+        match result {
+            Ok((mut transport, payment_gate)) => {
+                let receiver = transport.take_message_receiver().ok_or_else(|| FfiError {
+                    code: crate::error::ErrorCode::Other,
+                    message: "receiver already taken".into(),
+                })?;
+
+                let mut inner = self.inner.lock();
+                match self.state.load(Ordering::SeqCst) {
+                    STATE_CLOSED => {
+                        // close() won the race while we were building the transport.
+                        // Drop the payment gate first so its parked Nextes can be
+                        // released, then close the transport we built and give up.
+                        drop(payment_gate);
+                        drop(inner);
+                        global_runtime()
+                            .block_on(async { transport.close().await })
+                            .ok();
+                        Err(Self::closed_error())
+                    }
+                    STATE_STARTING => {
+                        inner.transport = Some(Arc::new(tokio::sync::Mutex::new(transport)));
+                        inner.receiver = Some(Arc::new(tokio::sync::Mutex::new(receiver)));
+                        inner.payment_gate = payment_gate;
+                        self.state.store(STATE_STARTED, Ordering::SeqCst);
+                        guard.disarm();
+                        Ok(())
+                    }
+                    other => {
+                        drop(payment_gate);
+                        drop(inner);
+                        global_runtime()
+                            .block_on(async { transport.close().await })
+                            .ok();
+                        Err(Self::start_state_error(other))
+                    }
+                }
+            }
+            Err(e) => {
+                // The StartStateGuard resets the state to CONFIGURING (unless close()
+                // already set it to CLOSED) when this function returns.
+                Err(e)
+            }
+        }
     }
 
     /// Receive the next incoming request.  Blocks until one is available.
     pub fn recv(&self) -> Result<IncomingRequest, FfiError> {
-        recv_incoming(self.receiver.clone())
+        self.require_started()?;
+        let receiver = self.receiver_ref().ok_or_else(Self::not_started_error)?;
+        recv_incoming(receiver)
     }
 
     /// Receive the next incoming request, timing out after `timeout_secs`.
     pub fn recv_timeout(&self, timeout_secs: u64) -> Result<IncomingRequest, FfiError> {
-        recv_incoming_timeout(self.receiver.clone(), timeout_secs)
+        self.require_started()?;
+        let receiver = self.receiver_ref().ok_or_else(Self::not_started_error)?;
+        recv_incoming_timeout(receiver, timeout_secs)
     }
 
     /// Return the next incoming request if one is already buffered.
     pub fn recv_try(&self) -> Result<Option<IncomingRequest>, FfiError> {
-        recv_incoming_try(self.receiver.clone())
+        self.require_started()?;
+        let receiver = self.receiver_ref().ok_or_else(Self::not_started_error)?;
+        recv_incoming_try(receiver)
     }
 
     /// Send a response for a given event ID.
     pub fn send_response(&self, event_id: &str, payload_json: &str) -> Result<(), FfiError> {
+        self.require_started()?;
         let message = parse_json_rpc(payload_json)?;
-        let transport = self.transport.clone();
+        let transport = self.transport_ref().ok_or_else(Self::not_started_error)?;
         global_runtime()
             .block_on(async {
                 let guard = transport.lock().await;
@@ -564,8 +1102,9 @@ impl Server {
         payload_json: &str,
         correlated_event_id: Option<String>,
     ) -> Result<(), FfiError> {
+        self.require_started()?;
         let message = parse_json_rpc(payload_json)?;
-        let transport = self.transport.clone();
+        let transport = self.transport_ref().ok_or_else(Self::not_started_error)?;
         global_runtime()
             .block_on(async {
                 let guard = transport.lock().await;
@@ -578,8 +1117,9 @@ impl Server {
 
     /// Broadcast a notification to all initialized clients.
     pub fn broadcast_notification(&self, payload_json: &str) -> Result<(), FfiError> {
+        self.require_started()?;
         let message = parse_json_rpc(payload_json)?;
-        let transport = self.transport.clone();
+        let transport = self.transport_ref().ok_or_else(Self::not_started_error)?;
         global_runtime()
             .block_on(async {
                 let guard = transport.lock().await;
@@ -590,29 +1130,142 @@ impl Server {
 
     /// Sets extra announcement/discovery tags from a JSON array of tag arrays.
     pub fn set_announcement_extra_tags(&self, tags_json: &str) -> Result<(), FfiError> {
+        self.require_configuring()?;
         let tags = parse_tags_json(tags_json)?;
-        let transport = self.transport.clone();
-        global_runtime().block_on(async {
-            let mut guard = transport.lock().await;
-            guard.set_announcement_extra_tags(tags);
-        });
+        let mut inner = self.inner.lock();
+        inner.extra_tags = tags;
         Ok(())
     }
 
     /// Sets pricing tags from a JSON array of tag arrays.
     pub fn set_announcement_pricing_tags(&self, tags_json: &str) -> Result<(), FfiError> {
+        self.require_configuring()?;
         let tags = parse_tags_json(tags_json)?;
-        let transport = self.transport.clone();
-        global_runtime().block_on(async {
-            let mut guard = transport.lock().await;
-            guard.set_announcement_pricing_tags(tags);
-        });
+        let mut inner = self.inner.lock();
+        inner.pricing_tags = tags;
         Ok(())
+    }
+
+    /// Register priced capabilities from a JSON array.
+    ///
+    /// Parsed and validated immediately, and the announcement `cap` pricing tags are
+    /// derived from the same source of truth used by the payment gate.
+    pub fn set_priced_capabilities_json(&self, json: &str) -> Result<(), FfiError> {
+        self.require_configuring()?;
+        let caps = parse_priced_capabilities_json(json)?;
+        let tags = contextvm_sdk::payments::tags::cap_tags_from_priced_capabilities(&caps);
+        let mut inner = self.inner.lock();
+        inner.priced_capabilities = caps;
+        inner.pricing_tags = tags;
+        Ok(())
+    }
+
+    /// Set the supported CEP-8 payment-interaction policy.
+    pub fn set_payment_interaction_policy(
+        &self,
+        policy: PaymentInteractionPolicy,
+    ) -> Result<(), FfiError> {
+        self.require_configuring()?;
+        let mut inner = self.inner.lock();
+        inner.payment_policy = Some(sdk_payment_interaction_policy(policy));
+        Ok(())
+    }
+
+    /// Receive the next payment-gate request, timing out after `timeout_secs`.
+    ///
+    /// Returns `None` on timeout (or when no payment gate is configured).
+    pub fn recv_payment_gate_request(
+        &self,
+        timeout_secs: u64,
+    ) -> Result<Option<crate::payment_gate::PaymentGateRequest>, FfiError> {
+        self.require_started()?;
+        let gate = self.inner.lock().payment_gate.clone();
+        match gate {
+            Some(gate) => Ok(global_runtime()
+                .block_on(async { gate.recv_timeout(Duration::from_secs(timeout_secs)).await })),
+            None => Ok(None),
+        }
+    }
+
+    /// Submit an invoice for a parked payment-gate request.
+    pub fn submit_invoice(
+        &self,
+        request_event_id: String,
+        amount_sats: i64,
+        pay_req: String,
+        pmi: String,
+        ttl_secs: u64,
+        description: Option<String>,
+    ) -> Result<(), FfiError> {
+        self.require_started()?;
+        let gate = self
+            .inner
+            .lock()
+            .payment_gate
+            .clone()
+            .ok_or_else(Self::no_payment_gate_error)?;
+        global_runtime().block_on(async {
+            gate.submit_invoice(
+                &request_event_id,
+                amount_sats,
+                &pay_req,
+                &pmi,
+                ttl_secs,
+                description.as_deref(),
+            )
+            .await
+        })
+    }
+
+    /// Mark a previously submitted invoice as settled.
+    pub fn mark_payment_settled(
+        &self,
+        pay_req: String,
+        meta_json: Option<String>,
+    ) -> Result<(), FfiError> {
+        self.require_started()?;
+        let gate = self
+            .inner
+            .lock()
+            .payment_gate
+            .clone()
+            .ok_or_else(Self::no_payment_gate_error)?;
+        global_runtime().block_on(async { gate.mark_settled(&pay_req, meta_json.as_deref()).await })
+    }
+
+    /// Mark a previously submitted invoice as failed.
+    pub fn mark_payment_failed(
+        &self,
+        pay_req: String,
+        message: Option<String>,
+    ) -> Result<(), FfiError> {
+        self.require_started()?;
+        let gate = self
+            .inner
+            .lock()
+            .payment_gate
+            .clone()
+            .ok_or_else(Self::no_payment_gate_error)?;
+        let message = message.as_deref().unwrap_or("");
+        global_runtime().block_on(async { gate.mark_failed(&pay_req, message).await })
+    }
+
+    /// Mark a parked paid request as already completed so it can be replayed for free.
+    pub fn mark_replayed(&self, request_event_id: String) -> Result<(), FfiError> {
+        self.require_started()?;
+        let gate = self
+            .inner
+            .lock()
+            .payment_gate
+            .clone()
+            .ok_or_else(Self::no_payment_gate_error)?;
+        global_runtime().block_on(async { gate.mark_replayed(&request_event_id).await })
     }
 
     /// Publish server announcement.
     pub fn announce(&self) -> Result<(), FfiError> {
-        let transport = self.transport.clone();
+        self.require_started()?;
+        let transport = self.transport_ref().ok_or_else(Self::not_started_error)?;
         global_runtime()
             .block_on(async {
                 let guard = transport.lock().await;
@@ -624,7 +1277,8 @@ impl Server {
 
     /// Publish server announcement and return the Nostr event ID.
     pub fn announce_event_id(&self) -> Result<String, FfiError> {
-        let transport = self.transport.clone();
+        self.require_started()?;
+        let transport = self.transport_ref().ok_or_else(Self::not_started_error)?;
         global_runtime()
             .block_on(async {
                 let guard = transport.lock().await;
@@ -636,8 +1290,9 @@ impl Server {
 
     /// Publish tools list and return the Nostr event ID.
     pub fn publish_tools(&self, tools_json: &str) -> Result<String, FfiError> {
+        self.require_started()?;
         let tools = parse_json_value_array(tools_json, "tools_json")?;
-        let transport = self.transport.clone();
+        let transport = self.transport_ref().ok_or_else(Self::not_started_error)?;
         global_runtime()
             .block_on(async {
                 let guard = transport.lock().await;
@@ -649,8 +1304,9 @@ impl Server {
 
     /// Publish resources list and return the Nostr event ID.
     pub fn publish_resources(&self, resources_json: &str) -> Result<String, FfiError> {
+        self.require_started()?;
         let resources = parse_json_value_array(resources_json, "resources_json")?;
-        let transport = self.transport.clone();
+        let transport = self.transport_ref().ok_or_else(Self::not_started_error)?;
         global_runtime()
             .block_on(async {
                 let guard = transport.lock().await;
@@ -662,8 +1318,9 @@ impl Server {
 
     /// Publish prompts list and return the Nostr event ID.
     pub fn publish_prompts(&self, prompts_json: &str) -> Result<String, FfiError> {
+        self.require_started()?;
         let prompts = parse_json_value_array(prompts_json, "prompts_json")?;
-        let transport = self.transport.clone();
+        let transport = self.transport_ref().ok_or_else(Self::not_started_error)?;
         global_runtime()
             .block_on(async {
                 let guard = transport.lock().await;
@@ -675,8 +1332,9 @@ impl Server {
 
     /// Publish resource templates list and return the Nostr event ID.
     pub fn publish_resource_templates(&self, templates_json: &str) -> Result<String, FfiError> {
+        self.require_started()?;
         let templates = parse_json_value_array(templates_json, "templates_json")?;
-        let transport = self.transport.clone();
+        let transport = self.transport_ref().ok_or_else(Self::not_started_error)?;
         global_runtime()
             .block_on(async {
                 let guard = transport.lock().await;
@@ -688,7 +1346,8 @@ impl Server {
 
     /// Delete previously published server announcements.
     pub fn delete_announcements(&self, reason: &str) -> Result<(), FfiError> {
-        let transport = self.transport.clone();
+        self.require_started()?;
+        let transport = self.transport_ref().ok_or_else(Self::not_started_error)?;
         global_runtime()
             .block_on(async {
                 let guard = transport.lock().await;
@@ -698,14 +1357,38 @@ impl Server {
     }
 
     /// Close the server transport.
+    ///
+    /// Exported as `shutdown` in UniFFI languages because `close` conflicts with the
+    /// `AutoCloseable` method generated for every object.
+    #[uniffi::method(name = "shutdown")]
     pub fn close(&self) -> Result<(), FfiError> {
-        let transport = self.transport.clone();
-        global_runtime()
-            .block_on(async {
-                let mut guard = transport.lock().await;
-                guard.close().await
-            })
-            .map_err(FfiError::from)
+        let (transport, payment_gate) = {
+            let mut inner = self.inner.lock();
+            let prev = self.state.load(Ordering::SeqCst);
+            if prev == STATE_CLOSED {
+                return Ok(());
+            }
+            self.state.store(STATE_CLOSED, Ordering::SeqCst);
+            let transport = inner.transport.take();
+            inner.receiver = None;
+            let payment_gate = inner.payment_gate.take();
+            (transport, payment_gate)
+        };
+
+        // Drop the payment gate before closing the transport so any parked Nextes
+        // can run their Drop cleanup against live transport state.
+        drop(payment_gate);
+
+        if let Some(transport) = transport {
+            global_runtime()
+                .block_on(async {
+                    let mut guard = transport.lock().await;
+                    guard.close().await
+                })
+                .map_err(FfiError::from)?;
+        }
+
+        Ok(())
     }
 }
 
@@ -815,6 +1498,10 @@ impl Client {
     }
 
     /// Close the client transport.
+    ///
+    /// Exported as `shutdown` in UniFFI languages because `close` conflicts with the
+    /// `AutoCloseable` method generated for every object.
+    #[uniffi::method(name = "shutdown")]
     pub fn close(&self) -> Result<(), FfiError> {
         let transport = self.transport.clone();
         global_runtime()
@@ -840,34 +1527,7 @@ impl Gateway {
     /// Create and start a gateway transport.
     #[uniffi::constructor]
     pub fn new(keys: &Keys, config: &ServerConfig) -> Result<Self, FfiError> {
-        let sdk_config = build_sdk_server_config_from_fields(ServerConfigParts {
-            relay_urls: config.relay_urls.clone(),
-            encryption_mode: sdk_encryption_mode(config.encryption_mode),
-            gift_wrap_mode: sdk_gift_wrap_mode(config.gift_wrap_mode),
-            server_name: config.server_name.clone(),
-            server_version: config.server_version.clone(),
-            server_picture: config.server_picture.clone(),
-            server_about: config.server_about.clone(),
-            server_website: config.server_website.clone(),
-            is_announced_server: config.is_announced_server,
-            allowed_pubkeys: config.allowed_pubkeys.clone(),
-            session_timeout_secs: config.session_timeout_secs,
-            cleanup_interval_secs: config.cleanup_interval_secs,
-            excluded_capabilities: config
-                .excluded_capabilities
-                .iter()
-                .map(|cap| CapabilityExclusionParts {
-                    method: cap.method.clone(),
-                    name: cap.name.clone(),
-                })
-                .collect(),
-            max_sessions: config.max_sessions as usize,
-            request_timeout_secs: config.request_timeout_secs,
-            relay_list_urls: config.relay_list_urls.clone(),
-            bootstrap_relay_urls: config.bootstrap_relay_urls.clone(),
-            publish_relay_list: config.publish_relay_list,
-            profile_metadata_json: config.profile_metadata_json.clone(),
-        })?;
+        let sdk_config = build_sdk_server_config_from_fields(build_server_config_parts(config))?;
         let gateway_config = contextvm_sdk::gateway::GatewayConfig::new(sdk_config);
 
         global_runtime()
@@ -1196,6 +1856,7 @@ pub fn make_response(id: String, result: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
 
     fn request() -> contextvm_sdk::JsonRpcMessage {
         contextvm_sdk::JsonRpcMessage::Request(contextvm_sdk::JsonRpcRequest {
@@ -1244,5 +1905,320 @@ mod tests {
         let _guard = global_runtime().block_on(rx.lock());
 
         assert!(recv_message_try(rx.clone()).unwrap().is_none());
+    }
+
+    #[test]
+    fn server_config_default_uses_payment_budget_defaults() {
+        let config = ServerConfig::default();
+        assert!(config.session_timeout_secs.is_none());
+        assert!(config.request_timeout_secs.is_none());
+        assert_eq!(config.payment_ttl_cap_secs, 300);
+        assert_eq!(config.execution_budget_secs, 600);
+    }
+
+    #[test]
+    fn payment_interaction_policy_maps_to_sdk() {
+        assert_eq!(
+            sdk_payment_interaction_policy(PaymentInteractionPolicy::Optional),
+            contextvm_sdk::payments::PaymentInteractionPolicy::Optional
+        );
+        assert_eq!(
+            sdk_payment_interaction_policy(PaymentInteractionPolicy::Transparent),
+            contextvm_sdk::payments::PaymentInteractionPolicy::Transparent
+        );
+    }
+
+    #[test]
+    fn priced_capabilities_validation() {
+        let good = r#"[{"method":"tools/call","amount":1000,"currencyUnit":"sats"}]"#;
+        let caps = parse_priced_capabilities_json(good).unwrap();
+        assert_eq!(caps.len(), 1);
+        assert_eq!(caps[0].amount, 1000);
+        assert_eq!(caps[0].currency_unit, "sats");
+
+        let bad_unit = r#"[{"method":"tools/call","amount":1000,"currencyUnit":"msat"}]"#;
+        let err = parse_priced_capabilities_json(bad_unit).unwrap_err();
+        assert_eq!(err.code, crate::error::ErrorCode::Validation);
+
+        let zero_amount = r#"[{"method":"tools/call","amount":0,"currencyUnit":"sats"}]"#;
+        let err = parse_priced_capabilities_json(zero_amount).unwrap_err();
+        assert_eq!(err.code, crate::error::ErrorCode::Validation);
+
+        let max_bad =
+            r#"[{"method":"tools/call","amount":1000,"maxAmount":500,"currencyUnit":"sats"}]"#;
+        let err = parse_priced_capabilities_json(max_bad).unwrap_err();
+        assert_eq!(err.code, crate::error::ErrorCode::Validation);
+    }
+
+    #[test]
+    fn payment_timeout_derivation() {
+        use crate::builders;
+
+        let lower = builders::payment_timeout_lower_bound(300, 600, 60);
+        assert_eq!(lower, 960);
+        let request = builders::derive_payment_request_timeout(300, 600, 60);
+        assert_eq!(request, 1020);
+        let session = builders::derive_payment_session_timeout(300, 600, 60);
+        assert_eq!(session, 1080);
+
+        assert!(builders::validate_explicit_timeout(1020, 960).is_ok());
+        assert!(builders::validate_explicit_timeout(960, 960).is_err());
+        assert!(builders::validate_explicit_timeout(900, 960).is_err());
+    }
+
+    #[test]
+    fn server_state_machine_enforces_lifecycle() {
+        use contextvm_sdk::relay::MockRelayPool;
+
+        let keys = Keys::generate();
+        let server_pool = MockRelayPool::with_keys(keys.inner.clone());
+        let config = ServerConfig {
+            relay_urls: vec![],
+            ..Default::default()
+        };
+        let server = Server::new_with_relay_pool(&keys, &config, Arc::new(server_pool)).unwrap();
+
+        // Setters work before start.
+        server.set_announcement_extra_tags("[]").unwrap();
+        server
+            .set_payment_interaction_policy(PaymentInteractionPolicy::Optional)
+            .unwrap();
+
+        // Operations that need a started server are rejected.
+        let err = server.recv_timeout(0).unwrap_err();
+        assert_eq!(err.code, crate::error::ErrorCode::NotStarted);
+
+        // Start succeeds.
+        server.start().unwrap();
+
+        // Second start is rejected.
+        let err = server.start().unwrap_err();
+        assert_eq!(err.code, crate::error::ErrorCode::Validation);
+
+        // Setters after start are rejected.
+        let err = server.set_announcement_extra_tags("[]").unwrap_err();
+        assert_eq!(err.code, crate::error::ErrorCode::Validation);
+
+        // Close succeeds and subsequent calls report Closed.
+        server.close().unwrap();
+
+        let err = server.recv_timeout(0).unwrap_err();
+        assert_eq!(err.code, crate::error::ErrorCode::Closed);
+
+        let err = server.start().unwrap_err();
+        assert_eq!(err.code, crate::error::ErrorCode::Closed);
+    }
+
+    #[test]
+    fn server_close_before_start_is_allowed() {
+        let keys = Keys::generate();
+        let server = Server::new(&keys, &ServerConfig::default()).unwrap();
+
+        server.close().unwrap();
+
+        let err = server
+            .set_payment_interaction_policy(PaymentInteractionPolicy::Optional)
+            .unwrap_err();
+        assert_eq!(err.code, crate::error::ErrorCode::Closed);
+    }
+
+    #[test]
+    fn server_zero_timeout_is_rejected_and_state_is_retryable() {
+        let keys = Keys::generate();
+
+        let config = ServerConfig {
+            request_timeout_secs: Some(0),
+            ..Default::default()
+        };
+        let server = Server::new(&keys, &config).unwrap();
+        let err = server.start().unwrap_err();
+        assert_eq!(err.code, crate::error::ErrorCode::Validation);
+        assert!(err.message.contains("request_timeout_secs"));
+
+        // A post-CAS validation failure must roll back to CONFIGURING, not
+        // strand the server in STARTING. The second call must fail with the
+        // same validation error, not "server is already starting".
+        let err = server.start().unwrap_err();
+        assert_eq!(err.code, crate::error::ErrorCode::Validation);
+        assert!(err.message.contains("request_timeout_secs"));
+
+        let config = ServerConfig {
+            session_timeout_secs: Some(0),
+            ..Default::default()
+        };
+        let server = Server::new(&keys, &config).unwrap();
+        let err = server.start().unwrap_err();
+        assert_eq!(err.code, crate::error::ErrorCode::Validation);
+        assert!(err.message.contains("session_timeout_secs"));
+
+        let err = server.start().unwrap_err();
+        assert_eq!(err.code, crate::error::ErrorCode::Validation);
+        assert!(err.message.contains("session_timeout_secs"));
+    }
+
+    /// A `RelayPoolTrait` wrapper whose `connect()` sleeps, so a test can win a
+    /// `close()` race against `start()` while the server is mid-build.
+    struct SlowRelayPool {
+        inner: contextvm_sdk::relay::MockRelayPool,
+        connect_delay: Duration,
+    }
+
+    impl SlowRelayPool {
+        fn new(delay: Duration) -> Self {
+            Self {
+                inner: contextvm_sdk::relay::MockRelayPool::new(),
+                connect_delay: delay,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl contextvm_sdk::relay::RelayPoolTrait for SlowRelayPool {
+        async fn connect(&self, relay_urls: &[String]) -> contextvm_sdk::Result<()> {
+            tokio::time::sleep(self.connect_delay).await;
+            self.inner.connect(relay_urls).await
+        }
+
+        async fn disconnect(&self) -> contextvm_sdk::Result<()> {
+            self.inner.disconnect().await
+        }
+
+        async fn publish_event(
+            &self,
+            event: &nostr_sdk::Event,
+        ) -> contextvm_sdk::Result<nostr_sdk::EventId> {
+            self.inner.publish_event(event).await
+        }
+
+        async fn publish(
+            &self,
+            builder: nostr_sdk::EventBuilder,
+        ) -> contextvm_sdk::Result<nostr_sdk::EventId> {
+            self.inner.publish(builder).await
+        }
+
+        async fn sign(
+            &self,
+            builder: nostr_sdk::EventBuilder,
+        ) -> contextvm_sdk::Result<nostr_sdk::Event> {
+            self.inner.sign(builder).await
+        }
+
+        async fn signer(&self) -> contextvm_sdk::Result<Arc<dyn nostr_sdk::NostrSigner>> {
+            self.inner.signer().await
+        }
+
+        fn notifications(
+            &self,
+        ) -> tokio::sync::broadcast::Receiver<nostr_sdk::RelayPoolNotification> {
+            self.inner.notifications()
+        }
+
+        async fn public_key(&self) -> contextvm_sdk::Result<nostr_sdk::PublicKey> {
+            self.inner.public_key().await
+        }
+
+        async fn subscribe(&self, filters: Vec<nostr_sdk::Filter>) -> contextvm_sdk::Result<()> {
+            self.inner.subscribe(filters).await
+        }
+
+        async fn publish_to(
+            &self,
+            urls: &[String],
+            builder: nostr_sdk::EventBuilder,
+        ) -> contextvm_sdk::Result<nostr_sdk::EventId> {
+            self.inner.publish_to(urls, builder).await
+        }
+
+        async fn fetch_events(
+            &self,
+            filters: Vec<nostr_sdk::Filter>,
+            timeout: Duration,
+        ) -> contextvm_sdk::Result<Vec<nostr_sdk::Event>> {
+            self.inner.fetch_events(filters, timeout).await
+        }
+    }
+
+    #[test]
+    fn server_close_race_during_start_leaves_state_closed() {
+        let keys = Keys::generate();
+        let pool = Arc::new(SlowRelayPool::new(Duration::from_millis(200)));
+        let config = ServerConfig {
+            relay_urls: vec!["wss://example.com".into()],
+            ..Default::default()
+        };
+        let server = Arc::new(
+            Server::new_with_relay_pool(
+                &keys,
+                &config,
+                pool as Arc<dyn contextvm_sdk::relay::RelayPoolTrait>,
+            )
+            .unwrap(),
+        );
+
+        let start_server = Arc::clone(&server);
+        let start_handle = std::thread::spawn(move || start_server.start());
+
+        // Let the start thread reach connect() before closing.
+        std::thread::sleep(Duration::from_millis(50));
+
+        // close() can be called while start() is mid-build.
+        server.close().unwrap();
+
+        let start_result = start_handle.join().unwrap();
+
+        // The winner must be close(); start() reports the loss.
+        assert_eq!(
+            start_result.unwrap_err().code,
+            crate::error::ErrorCode::Closed
+        );
+
+        // close() after the dust settles is idempotent.
+        assert!(server.close().is_ok());
+    }
+
+    // Real OS threads and real time: the guard's Drop is a few instructions, so
+    // this probe runs many rounds to force the interleaving where close() stores
+    // CLOSED between the guard's load and store. With the old load-then-store
+    // implementation the guard could overwrite close()'s CLOSED with CONFIGURING;
+    // with compare_exchange a closed server can never be resurrected.
+    #[test]
+    fn start_state_guard_drop_races_close_and_never_resurrects() {
+        let keys = Keys::generate();
+        let server = Arc::new(Server::new(&keys, &ServerConfig::default()).unwrap());
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+
+        const ROUNDS: usize = 10_000;
+
+        let closer = {
+            let server = Arc::clone(&server);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                for _ in 0..ROUNDS {
+                    barrier.wait();
+                    let _ = server.close();
+                    barrier.wait();
+                }
+            })
+        };
+
+        for _ in 0..ROUNDS {
+            server.state.store(STATE_STARTING, Ordering::SeqCst);
+            let guard = StartStateGuard::new(&server);
+
+            // Both threads are released together: one runs close(), the other
+            // drops the guard. The guard must never overwrite a close() win.
+            barrier.wait();
+            drop(guard);
+            barrier.wait();
+
+            assert_eq!(
+                server.state.load(Ordering::SeqCst),
+                STATE_CLOSED,
+                "close() must never be overwritten by StartStateGuard::drop"
+            );
+        }
+
+        closer.join().unwrap();
     }
 }

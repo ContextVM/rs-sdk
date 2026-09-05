@@ -20,6 +20,7 @@ mod discovery;
 pub mod error;
 pub mod handle;
 mod kv;
+mod payment_gate;
 mod runtime;
 pub mod types;
 mod uniffi_types;
@@ -47,6 +48,18 @@ pub use channel::{
 pub use error::{ErrorCode, FfiError};
 #[doc(hidden)]
 pub use handle::FfiHandle;
+// Re-export core UniFFI objects so Rust integration tests can drive the two-phase
+// server lifecycle (e.g. with a mock relay pool). These are not a stable public API.
+#[doc(hidden)]
+pub use payment_gate::PaymentGateRequest;
+#[doc(hidden)]
+pub use uniffi_types::{
+    CapabilityExclusion, Client, ClientConfig, EncryptionMode, GiftWrapMode, IncomingRequest,
+    JsonRpcMessage, Keys, PaymentInteractionPolicy, Server, ServerConfig,
+};
+// Expose the global runtime for integration tests that need to drive async SDK clients.
+#[doc(hidden)]
+pub use runtime::global_runtime;
 
 // Re-export types module functions for integration testing (see note above).
 #[doc(hidden)]

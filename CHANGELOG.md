@@ -4,6 +4,18 @@
 
 ### Added
 
+- `AuthorizationStore::grant_and_claim` — atomically records a paid grant and
+  consumes it in one lock, so a transparent payment lifecycle can settle and
+  forward exactly once without a concurrent duplicate claiming the grant between
+  `grant` and `claim`.
+
+- `InboundContext::new(...)` — supported public constructor for the (previously
+  test-only-constructible, `#[non_exhaustive]`) inbound middleware context, needed
+  by downstream middleware consumers such as the FFI payment gate.
+- `Next::keep_alive()` — allows an inbound middleware to hold a request route
+  open while parking the message (used by the FFI payment gate's transparent
+  lifecycle to keep the parked request deliverable after settlement).
+
 - CEP-8 capability pricing and payments (in progress; foundational pieces, not yet a
   usable payment flow):
   - Server-side payment-interaction negotiation and advertisement: the server transport
@@ -110,6 +122,11 @@
 
 ### Fixed
 
+- Inbound middleware `Next::run` no longer marks the continuation `released` before
+  terminal delivery succeeds. If the worker send fails (e.g., the server is closing),
+  `run` now calls `release()` synchronously so the request's route, wrap-kind entry,
+  and open-stream slot are never leaked.
+
 - Client transport: the response-correlation entry was consumed by the FIRST correlated
   inbound message of any kind, so a server that emitted a correlated notification before
   its response (a CEP-8 payment notification, or any custom correlated notification) cost
@@ -152,6 +169,17 @@
   effective-mode disclosure behind the same one-shot latches, and `cap` pricing tags on a
   capability-list result.
 
+- Payment error payloads (`-32042` Payment Required and `-32043` Payment Pending) are now
+  built through shared SDK helpers, `build_payment_required_error` and
+  `build_payment_pending_error`, so the FFI targeted responses and the server middleware
+  produce byte-identical error objects. The helpers are now public in
+  `contextvm_sdk::payments`.
+
+- `IncomingRequest` and the `Next` inbound middleware continuation now carry an optional
+  `canonical_invocation_id`, threaded from canonical identity computation through to the
+  FFI `PaymentGateRequest`. This lets foreign payment handlers key their durable
+  `PaymentRecord` by canonical identity.
+
 ### Changed
 
 - rmcp server worker: every client now receives the handler's declared `protocolVersion` in its
@@ -179,6 +207,22 @@
   work stops when the transport closes. `send_notification`'s body moved into a shared
   publish that both it and the new injectable sender use, so the two cannot drift. A
   gated (dropped) request now releases the open-stream slot it reserved.
+- FFI bindings (`contextvm-ffi`): expose the CEP-8 payment gate through UniFFI with
+  `PaymentGateRequest`, `set_priced_capabilities_json`, `set_payment_interaction_policy`,
+  `recv_payment_gate_request`, `submit_invoice`, `mark_payment_settled`,
+  `mark_payment_failed`, and `mark_replayed`. `Server::start()` wires the gate, derives
+  the `cap`/`pmi`/`payment_interaction` announcement tags, and keeps the original
+  request route alive for transparent paid requests so the handler result is delivered.
+- **Breaking (contextvm-ffi 0.2.0):** the UniFFI `Server` is now two-phase. `Server::new`
+  only stores the configuration; `Server::start()` builds and starts the transport.
+  Pre-start setters (`set_announcement_extra_tags`, `set_priced_capabilities_json`,
+  `set_payment_interaction_policy`) must be called before `start()` and are enforced by
+  a release-build `Configuring / Started / Closed` state machine. `ErrorCode` gains
+  `NotStarted` and `Closed`, returned by runtime and payment methods before `start()` or
+  after `close()` instead of blocking or panicking. `ServerConfig.request_timeout_secs`
+  and `session_timeout_secs` are now `Option<u64>`: `None` lets `start()` derive
+  payment-aware defaults; `Some(v)` is validated against the route budget and never
+  silently bumped. See `contextvm-ffi/CHANGELOG.md` for the full 0.2.0 release notes.
 
 ## [0.2.2] - 2026-07-29
 
