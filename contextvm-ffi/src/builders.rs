@@ -12,6 +12,59 @@ use crate::types::{
     ffi_gift_wrap_mode_to_sdk, optional_c_str_to_string_checked, FfiCapabilityExclusion,
     FfiClientConfig, FfiServerConfig,
 };
+use crate::uniffi_types::ServerConfig;
+
+/// Default payment TTL cap (seconds) used to auto-derive request/session timeouts.
+pub(crate) const DEFAULT_PAYMENT_TTL_CAP_SECS: u64 = 300;
+/// Default execution budget (seconds) used to auto-derive request/session timeouts.
+pub(crate) const DEFAULT_EXECUTION_BUDGET_SECS: u64 = 600;
+/// Margin added to payment-adjusted timeouts to leave room for network round-trips.
+pub(crate) const PAYMENT_BUDGET_MARGIN_SECS: u64 = 60;
+
+/// Lower bound for a route timeout when payments are enabled.
+///
+/// Per-invoice TTLs and execution time must fit inside this with room to spare.
+pub(crate) fn payment_timeout_lower_bound(
+    payment_ttl_cap: u64,
+    execution_budget: u64,
+    margin: u64,
+) -> u64 {
+    payment_ttl_cap
+        .saturating_add(execution_budget)
+        .saturating_add(margin)
+}
+
+/// Auto-derived request timeout when payments are enabled and no explicit value was set.
+pub(crate) fn derive_payment_request_timeout(
+    payment_ttl_cap: u64,
+    execution_budget: u64,
+    margin: u64,
+) -> u64 {
+    payment_timeout_lower_bound(payment_ttl_cap, execution_budget, margin).saturating_add(margin)
+}
+
+/// Auto-derived session timeout when payments are enabled and no explicit value was set.
+pub(crate) fn derive_payment_session_timeout(
+    payment_ttl_cap: u64,
+    execution_budget: u64,
+    margin: u64,
+) -> u64 {
+    derive_payment_request_timeout(payment_ttl_cap, execution_budget, margin).saturating_add(margin)
+}
+
+/// Validate an explicit timeout against the payment-budget lower bound.
+pub(crate) fn validate_explicit_timeout(value: u64, lower_bound: u64) -> Result<u64, FfiError> {
+    if value > lower_bound {
+        Ok(value)
+    } else {
+        Err(FfiError {
+            code: ErrorCode::Validation,
+            message: format!(
+                "explicit timeout {value}s must exceed payment budget lower bound {lower_bound}s"
+            ),
+        })
+    }
+}
 
 pub struct ServerConfigParts {
     pub relay_urls: Vec<String>,
@@ -24,15 +77,64 @@ pub struct ServerConfigParts {
     pub server_website: Option<String>,
     pub is_announced_server: bool,
     pub allowed_pubkeys: Vec<String>,
-    pub session_timeout_secs: u64,
+    pub session_timeout_secs: Option<u64>,
     pub cleanup_interval_secs: u64,
     pub excluded_capabilities: Vec<CapabilityExclusionParts>,
     pub max_sessions: usize,
-    pub request_timeout_secs: u64,
+    pub request_timeout_secs: Option<u64>,
     pub relay_list_urls: Vec<String>,
     pub bootstrap_relay_urls: Vec<String>,
     pub publish_relay_list: bool,
     pub profile_metadata_json: Option<String>,
+}
+
+/// Convert a UniFFI `ServerConfig` record into the builder struct used by both
+/// the C ABI and the `Server`/`Gateway` objects.
+pub fn build_server_config_parts(config: &ServerConfig) -> ServerConfigParts {
+    ServerConfigParts {
+        relay_urls: config.relay_urls.clone(),
+        encryption_mode: match config.encryption_mode {
+            crate::uniffi_types::EncryptionMode::Optional => {
+                contextvm_sdk::EncryptionMode::Optional
+            }
+            crate::uniffi_types::EncryptionMode::Required => {
+                contextvm_sdk::EncryptionMode::Required
+            }
+            crate::uniffi_types::EncryptionMode::Disabled => {
+                contextvm_sdk::EncryptionMode::Disabled
+            }
+        },
+        gift_wrap_mode: match config.gift_wrap_mode {
+            crate::uniffi_types::GiftWrapMode::Optional => contextvm_sdk::GiftWrapMode::Optional,
+            crate::uniffi_types::GiftWrapMode::Ephemeral => contextvm_sdk::GiftWrapMode::Ephemeral,
+            crate::uniffi_types::GiftWrapMode::Persistent => {
+                contextvm_sdk::GiftWrapMode::Persistent
+            }
+        },
+        server_name: config.server_name.clone(),
+        server_version: config.server_version.clone(),
+        server_picture: config.server_picture.clone(),
+        server_about: config.server_about.clone(),
+        server_website: config.server_website.clone(),
+        is_announced_server: config.is_announced_server,
+        allowed_pubkeys: config.allowed_pubkeys.clone(),
+        session_timeout_secs: config.session_timeout_secs,
+        cleanup_interval_secs: config.cleanup_interval_secs,
+        excluded_capabilities: config
+            .excluded_capabilities
+            .iter()
+            .map(|cap| CapabilityExclusionParts {
+                method: cap.method.clone(),
+                name: cap.name.clone(),
+            })
+            .collect(),
+        max_sessions: config.max_sessions as usize,
+        request_timeout_secs: config.request_timeout_secs,
+        relay_list_urls: config.relay_list_urls.clone(),
+        bootstrap_relay_urls: config.bootstrap_relay_urls.clone(),
+        publish_relay_list: config.publish_relay_list,
+        profile_metadata_json: config.profile_metadata_json.clone(),
+    }
 }
 
 pub struct ClientConfigParts {
@@ -138,7 +240,6 @@ pub fn build_sdk_server_config(
         .with_gift_wrap_mode(gift_wrap_mode)
         .with_announced_server(config.is_announced_server)
         .with_allowed_public_keys(allowed)
-        .with_session_timeout(Duration::from_secs(config.session_timeout_secs.max(1)))
         .with_cleanup_interval(Duration::from_secs(config.cleanup_interval_secs.max(1)))
         .with_publish_relay_list(config.publish_relay_list);
 
@@ -146,11 +247,24 @@ pub fn build_sdk_server_config(
         sdk_config = sdk_config.with_server_info(server_info);
     }
 
+    // C ABI uses 0 to mean "keep the SDK default".
+    let session_timeout_secs = if config.session_timeout_secs == 0 {
+        None
+    } else {
+        Some(config.session_timeout_secs)
+    };
+    let request_timeout_secs = if config.request_timeout_secs == 0 {
+        None
+    } else {
+        Some(config.request_timeout_secs)
+    };
+
     sdk_config = apply_extended_server_config(
         sdk_config,
         excluded,
         config.max_sessions,
-        config.request_timeout_secs,
+        session_timeout_secs,
+        request_timeout_secs,
         relay_list_urls,
         bootstrap_relay_urls,
         profile_metadata,
@@ -214,7 +328,6 @@ pub fn build_sdk_server_config_from_fields(
         .with_gift_wrap_mode(parts.gift_wrap_mode)
         .with_announced_server(parts.is_announced_server)
         .with_allowed_public_keys(parts.allowed_pubkeys)
-        .with_session_timeout(Duration::from_secs(parts.session_timeout_secs.max(1)))
         .with_cleanup_interval(Duration::from_secs(parts.cleanup_interval_secs.max(1)))
         .with_publish_relay_list(parts.publish_relay_list);
 
@@ -226,6 +339,7 @@ pub fn build_sdk_server_config_from_fields(
         sdk_config,
         parts.excluded_capabilities,
         parts.max_sessions,
+        parts.session_timeout_secs,
         parts.request_timeout_secs,
         parts.relay_list_urls,
         parts.bootstrap_relay_urls,
@@ -257,11 +371,13 @@ pub fn build_sdk_client_config_from_fields(
     config
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_extended_server_config(
     mut config: contextvm_sdk::NostrServerTransportConfig,
     excluded_capabilities: Vec<CapabilityExclusionParts>,
     max_sessions: usize,
-    request_timeout_secs: u64,
+    session_timeout_secs: Option<u64>,
+    request_timeout_secs: Option<u64>,
     relay_list_urls: Vec<String>,
     bootstrap_relay_urls: Vec<String>,
     profile_metadata: Option<contextvm_sdk::ProfileMetadata>,
@@ -280,8 +396,15 @@ fn apply_extended_server_config(
     if max_sessions > 0 {
         config = config.with_max_sessions(max_sessions);
     }
-    if request_timeout_secs > 0 {
-        config = config.with_request_timeout(Duration::from_secs(request_timeout_secs));
+    if let Some(v) = session_timeout_secs {
+        if v > 0 {
+            config = config.with_session_timeout(Duration::from_secs(v));
+        }
+    }
+    if let Some(v) = request_timeout_secs {
+        if v > 0 {
+            config = config.with_request_timeout(Duration::from_secs(v));
+        }
     }
     if !relay_list_urls.is_empty() {
         config = config.with_relay_list_urls(relay_list_urls);
@@ -408,11 +531,11 @@ mod tests {
             server_website: None,
             is_announced_server: false,
             allowed_pubkeys: vec![],
-            session_timeout_secs: 300,
+            session_timeout_secs: Some(300),
             cleanup_interval_secs: 60,
             excluded_capabilities: vec![],
             max_sessions: 0,
-            request_timeout_secs: 0,
+            request_timeout_secs: None,
             relay_list_urls: vec![],
             bootstrap_relay_urls: vec![],
             publish_relay_list: true,
@@ -454,14 +577,14 @@ mod tests {
             server_website: None,
             is_announced_server: false,
             allowed_pubkeys: vec![],
-            session_timeout_secs: 300,
+            session_timeout_secs: Some(300),
             cleanup_interval_secs: 60,
             excluded_capabilities: vec![CapabilityExclusionParts {
                 method: "tools/call".to_string(),
                 name: Some("get_weather".to_string()),
             }],
             max_sessions: 42,
-            request_timeout_secs: 17,
+            request_timeout_secs: Some(17),
             relay_list_urls: vec!["wss://relay-list.example.com".to_string()],
             bootstrap_relay_urls: vec!["wss://bootstrap.example.com".to_string()],
             publish_relay_list: false,

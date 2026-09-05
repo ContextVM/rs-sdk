@@ -114,6 +114,10 @@ pub extern "C" fn cvm_server_ch_recv(
                         client_pubkey: string_to_c(incoming.client_pubkey),
                         event_id: string_to_c(incoming.event_id),
                         is_encrypted: incoming.is_encrypted,
+                        canonical_invocation_id: incoming
+                            .canonical_invocation_id
+                            .as_ref()
+                            .map_or_else(std::ptr::null_mut, |s| string_to_c(s.clone())),
                     };
                 }
             }
@@ -166,6 +170,10 @@ pub extern "C" fn cvm_server_ch_recv_timeout(
                         client_pubkey: string_to_c(incoming.client_pubkey),
                         event_id: string_to_c(incoming.event_id),
                         is_encrypted: incoming.is_encrypted,
+                        canonical_invocation_id: incoming
+                            .canonical_invocation_id
+                            .as_ref()
+                            .map_or_else(std::ptr::null_mut, |s| string_to_c(s.clone())),
                     };
                 }
             }
@@ -931,6 +939,10 @@ pub extern "C" fn cvm_gateway_ch_recv(
                         client_pubkey: string_to_c(incoming.client_pubkey),
                         event_id: string_to_c(incoming.event_id),
                         is_encrypted: incoming.is_encrypted,
+                        canonical_invocation_id: incoming
+                            .canonical_invocation_id
+                            .as_ref()
+                            .map_or_else(std::ptr::null_mut, |s| string_to_c(s.clone())),
                     };
                 }
             }
@@ -983,6 +995,10 @@ pub extern "C" fn cvm_gateway_ch_recv_timeout(
                         client_pubkey: string_to_c(incoming.client_pubkey),
                         event_id: string_to_c(incoming.event_id),
                         is_encrypted: incoming.is_encrypted,
+                        canonical_invocation_id: incoming
+                            .canonical_invocation_id
+                            .as_ref()
+                            .map_or_else(std::ptr::null_mut, |s| string_to_c(s.clone())),
                     };
                 }
             }
@@ -1750,6 +1766,9 @@ mod tests {
             assert_eq!(ErrorCode::Validation as i32, 5, "CVM_VALIDATION");
             assert_eq!(ErrorCode::Unauthorized as i32, 6, "CVM_UNAUTHORIZED");
             assert_eq!(ErrorCode::Serialization as i32, 7, "CVM_SERIALIZATION");
+            assert_eq!(ErrorCode::Payment as i32, 8, "CVM_PAYMENT");
+            assert_eq!(ErrorCode::NotStarted as i32, 9, "CVM_NOT_STARTED");
+            assert_eq!(ErrorCode::Closed as i32, 10, "CVM_CLOSED");
             assert_eq!(ErrorCode::Other as i32, 99, "CVM_OTHER");
         }
     }

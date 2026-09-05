@@ -24,6 +24,10 @@ pub enum ErrorCode {
     Serialization = 7,
     /// Payment (CEP-8) error.
     Payment = 8,
+    /// Operation requires a started server but it has not been started.
+    NotStarted = 9,
+    /// Operation requires an open server but it has been closed.
+    Closed = 10,
     /// Generic / unknown error.
     Other = 99,
 }

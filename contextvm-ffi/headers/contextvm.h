@@ -84,6 +84,8 @@ typedef enum {
     CVM_UNAUTHORIZED = 6,
     CVM_SERIALIZATION = 7,
     CVM_PAYMENT = 8,
+    CVM_NOT_STARTED = 9,
+    CVM_CLOSED = 10,
     CVM_OTHER = 99,
 } CvmErrorCode;
 
@@ -121,9 +123,10 @@ typedef struct {
 
 typedef struct {
     CvmJsonRpcMessage message;
-    char *client_pubkey; /* owned hex string */
-    char *event_id;      /* owned hex string */
+    char *client_pubkey;           /* owned hex string */
+    char *event_id;                /* owned hex string */
     bool is_encrypted;
+    char *canonical_invocation_id; /* owned, may be NULL */
 } CvmIncomingRequest;
 
 typedef struct {

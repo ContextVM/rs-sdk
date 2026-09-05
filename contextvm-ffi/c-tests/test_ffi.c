@@ -156,6 +156,8 @@ TEST(constant_values) {
     ASSERT(CVM_UNAUTHORIZED == 6);
     ASSERT(CVM_SERIALIZATION == 7);
     ASSERT(CVM_PAYMENT == 8);
+    ASSERT(CVM_NOT_STARTED == 9);
+    ASSERT(CVM_CLOSED == 10);
     ASSERT(CVM_OTHER == 99);
 
     ASSERT(CVM_ENCRYPTION_DISABLED == 2);
@@ -189,7 +191,8 @@ TEST(null_safety) {
         .message = msg,
         .client_pubkey = NULL,
         .event_id = NULL,
-        .is_encrypted = 0
+        .is_encrypted = 0,
+        .canonical_invocation_id = NULL
     };
     cvm_incoming_request_free(req);
 }

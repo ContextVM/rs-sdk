@@ -233,6 +233,7 @@ fn test_mock_relay_incoming_request_structure() {
             client_pubkey,
             event_id,
             is_encrypted: true,
+            canonical_invocation_id: ptr::null_mut(),
         };
 
         assert!(req.is_encrypted);

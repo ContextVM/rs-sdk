@@ -238,6 +238,7 @@ fn test_e2e_memory_safety_edge_cases() {
         client_pubkey: ptr::null_mut(),
         event_id: ptr::null_mut(),
         is_encrypted: false,
+        canonical_invocation_id: ptr::null_mut(),
     };
     cvm_incoming_request_free(req);
 }
