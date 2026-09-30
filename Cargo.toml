@@ -60,6 +60,9 @@ default = ["rmcp"]
 rmcp = ["dep:rmcp"]
 ## Exposes `MockRelayPool` for use in downstream integration tests.
 test-utils = []
+## CEP-8 Lightning rail over NIP-47 (Nostr Wallet Connect). Off by default.
+## Switches on an existing `nostr-sdk` NIP; adds no new crate to the tree.
+nwc = ["nostr-sdk/nip47"]
 
 [[example]]
 name = "rmcp_integration_test"
