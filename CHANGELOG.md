@@ -24,6 +24,23 @@
     `MockWallet` behind `test-utils` scripts answers, errors, silence, delays and malformed
     replies over a linked `MockRelayPool`, and can publish a `payment_received`
     notification to drive settlement.
+  - The NWC payment processor, `LnBolt11NwcPaymentProcessor`, the server side of the
+    Phase B Lightning rail for PMI `bitcoin-lightning-bolt11`, behind the same
+    off-by-default `nwc` feature. `create_payment_required` mints a BOLT11 invoice via
+    `make_invoice` in msats with an expiry, caches the invoice to `payment_hash` mapping,
+    and advertises the configured TTL rather than the wallet's own `expires_at`, which
+    providers return in non-standard forms. `verify_payment` waits for settlement either
+    by polling `lookup_invoice` on the ts backoff schedule, floored at the configured poll
+    interval and jittered, or by listening for a `payment_received` notification when the
+    wallet advertises one on its info event. Concurrent verifications of the same invoice
+    are deduplicated onto one shared future so duplicate delivery cannot multiply wallet
+    and relay load. A lagging wallet answering `NOT_FOUND` is treated as still pending
+    while every other wallet error is fatal, `expired` and `failed` are terminal, and an
+    invoice counts as settled on either `state == "settled"` or a positive `settled_at`.
+    Every wait selects on the middleware's cancellation token, and a cancelled
+    verification always returns an error, never an empty success that the middleware
+    would read as payment. Amounts are validated before any wallet call, and no tracing
+    call carries the invoice, which is a bearer payment request.
   - Server-side payment-interaction negotiation and advertisement: the server transport
     now parses client `pmi` and `payment_interaction` tags, negotiates the effective
     session mode (`transparent` by default, `explicit_gating` when the server policy
