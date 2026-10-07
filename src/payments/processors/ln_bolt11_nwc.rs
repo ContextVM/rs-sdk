@@ -108,6 +108,55 @@ impl Default for LnBolt11NwcPaymentProcessorOptions {
     }
 }
 
+impl LnBolt11NwcPaymentProcessorOptions {
+    /// Options with the ts defaults.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the TTL advertised on `payment_required`.
+    pub fn with_ttl(mut self, ttl: Duration) -> Self {
+        self.ttl = ttl;
+        self
+    }
+
+    /// Set `make_invoice.expiry`, which otherwise follows the TTL.
+    pub fn with_invoice_expiry(mut self, expiry: Duration) -> Self {
+        self.invoice_expiry = Some(expiry);
+        self
+    }
+
+    /// Set the floor under the `lookup_invoice` backoff schedule.
+    pub fn with_poll_interval(mut self, poll_interval: Duration) -> Self {
+        self.poll_interval = poll_interval;
+        self
+    }
+
+    /// Set the per-request wallet response timeout.
+    pub fn with_response_timeout(mut self, response_timeout: Duration) -> Self {
+        self.response_timeout = response_timeout;
+        self
+    }
+
+    /// Force notification-mode verification on or off, skipping auto-detection.
+    pub fn with_notification_verification(mut self, enabled: bool) -> Self {
+        self.notification_verification = Some(enabled);
+        self
+    }
+
+    /// Set the cap on concurrently deduplicated verifications.
+    pub fn with_max_in_flight_verifications(mut self, max: usize) -> Self {
+        self.max_in_flight_verifications = max;
+        self
+    }
+
+    /// Set the cap on cached invoice to payment-hash mappings.
+    pub fn with_invoice_hash_cache_size(mut self, size: usize) -> Self {
+        self.invoice_hash_cache_size = size;
+        self
+    }
+}
+
 /// A deduplicated verification. `PaymentError` is not `Clone`, so the shared
 /// output is an `Arc` and joiners re-wrap the error by message.
 type VerifyInFlight = Shared<BoxFuture<'static, Arc<Result<VerifyOutcome, PaymentError>>>>;

@@ -228,10 +228,13 @@ keepalive timer model.
 Both CEP-8 payment lifecycles run end to end: servers price capabilities and
 gate them through the transparent or explicit-gating lifecycle via
 `with_server_payments`, and clients auto-pay, keep paying requests alive, and
-drive the gated retry flow via `with_client_payments`. Payment rails ship as pluggable traits with
-deterministic fakes; real rails are a later phase. See
+drive the gated retry flow via `with_client_payments`. Payment rails plug into
+the same traits: the first real rail, Lightning BOLT11 over NWC (NIP-47),
+ships behind the off-by-default `nwc` feature as
+`LnBolt11NwcPaymentProcessor` and `LnBolt11NwcPaymentHandler`, alongside the
+deterministic fakes for wallet-free testing. See
 [docs/payments.md](docs/payments.md) for both lifecycles, the client shapes,
-and the operational notes.
+the NWC rail and its operational notes.
 
 ### Server Transport Config
 

@@ -125,6 +125,14 @@ name = "payments_bilateral_e2e"
 required-features = ["test-utils"]
 
 [[test]]
+name = "payments_nwc_e2e"
+required-features = ["nwc", "test-utils"]
+
+[[test]]
+name = "payments_nwc_real_wallet"
+required-features = ["nwc", "test-utils"]
+
+[[test]]
 name = "rmcp_handshake_survival"
 required-features = ["rmcp", "test-utils"]
 
