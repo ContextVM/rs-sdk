@@ -142,47 +142,50 @@ fn is_local_relay_url(url: &str) -> bool {
 
 /// Publish profile and relay-list builders to the discoverability relay set.
 ///
-/// Each event is retried until accepted or until
-/// [`DISCOVERABILITY_PUBLISH_DEADLINE`] passes; failures are logged and the
-/// task completes either way.
+/// The two events publish concurrently with independent retry budgets, so a
+/// refusing profile can never delay the relay list clients need for discovery.
+/// Each is retried until accepted or until [`DISCOVERABILITY_PUBLISH_DEADLINE`]
+/// passes; failures are logged and the task completes either way.
 async fn publish_discoverability_events(
     relay_pool: Arc<dyn RelayPoolTrait>,
     target_urls: Vec<String>,
     profile_event: Option<EventBuilder>,
     relay_list_event: Option<EventBuilder>,
 ) {
-    if let Some(builder) = profile_event {
-        match publish_with_retry(&relay_pool, &target_urls, builder).await {
-            Ok(id) => tracing::info!(
-                target: LOG_TARGET,
-                event_id = %id,
-                "Published profile metadata (kind 0)"
-            ),
-            Err(e) => tracing::warn!(
-                target: LOG_TARGET,
-                error = %e,
-                "Failed to publish profile metadata"
-            ),
-        }
-    }
-    if let Some(builder) = relay_list_event {
-        match publish_with_retry(&relay_pool, &target_urls, builder).await {
-            Ok(id) => tracing::info!(
-                target: LOG_TARGET,
-                event_id = %id,
-                "Published relay list (kind 10002)"
-            ),
-            Err(e) => tracing::warn!(
-                target: LOG_TARGET,
-                error = %e,
-                "Failed to publish relay list"
-            ),
-        }
-    }
+    tokio::join!(
+        publish_one(
+            &relay_pool,
+            &target_urls,
+            profile_event,
+            "profile metadata (kind 0)"
+        ),
+        publish_one(
+            &relay_pool,
+            &target_urls,
+            relay_list_event,
+            "relay list (kind 10002)"
+        ),
+    );
     tracing::info!(
         target: LOG_TARGET,
         "Discoverability event publishing complete"
     );
+}
+
+/// Publish one optional discoverability event with retries, logging the
+/// outcome under `label`.
+async fn publish_one(
+    relay_pool: &Arc<dyn RelayPoolTrait>,
+    target_urls: &[String],
+    event: Option<EventBuilder>,
+    label: &str,
+) {
+    if let Some(builder) = event {
+        match publish_with_retry(relay_pool, target_urls, builder).await {
+            Ok(id) => tracing::info!(target: LOG_TARGET, event_id = %id, "Published {label}"),
+            Err(e) => tracing::warn!(target: LOG_TARGET, error = %e, "Failed to publish {label}"),
+        }
+    }
 }
 
 /// Publish one event to the discoverability relay set with bounded retries.
@@ -1974,6 +1977,99 @@ mod tests {
             pool.calls.load(Ordering::SeqCst) > 1,
             "publication must have retried before giving up"
         );
+    }
+
+    #[tokio::test]
+    async fn relay_list_publish_does_not_wait_for_a_stuck_profile() {
+        use tokio::sync::Notify;
+
+        /// A pool whose kind-0 publishes block until `release` is signaled.
+        struct BlockingProfilePool {
+            inner: MockRelayPool,
+            release: Notify,
+        }
+
+        #[async_trait::async_trait]
+        impl RelayPoolTrait for BlockingProfilePool {
+            async fn connect(&self, urls: &[String]) -> Result<()> {
+                self.inner.connect(urls).await
+            }
+            async fn disconnect(&self) -> Result<()> {
+                self.inner.disconnect().await
+            }
+            async fn publish_event(&self, event: &Event) -> Result<EventId> {
+                self.inner.publish_event(event).await
+            }
+            async fn publish(&self, builder: EventBuilder) -> Result<EventId> {
+                self.inner.publish(builder).await
+            }
+            async fn sign(&self, builder: EventBuilder) -> Result<Event> {
+                self.inner.sign(builder).await
+            }
+            async fn signer(&self) -> Result<Arc<dyn NostrSigner>> {
+                self.inner.signer().await
+            }
+            fn notifications(&self) -> tokio::sync::broadcast::Receiver<RelayPoolNotification> {
+                self.inner.notifications()
+            }
+            async fn public_key(&self) -> Result<PublicKey> {
+                self.inner.public_key().await
+            }
+            async fn subscribe(&self, filters: Vec<Filter>) -> Result<()> {
+                self.inner.subscribe(filters).await
+            }
+            async fn publish_to(&self, urls: &[String], builder: EventBuilder) -> Result<EventId> {
+                // EventBuilder hides its kind; sign to inspect it.
+                let event = self.inner.sign(builder.clone()).await?;
+                if event.kind == Kind::Custom(0) {
+                    self.release.notified().await;
+                }
+                self.inner.publish_to(urls, builder).await
+            }
+            async fn fetch_events(
+                &self,
+                filters: Vec<Filter>,
+                timeout: Duration,
+            ) -> Result<Vec<Event>> {
+                self.inner.fetch_events(filters, timeout).await
+            }
+        }
+
+        let pool = Arc::new(BlockingProfilePool {
+            inner: MockRelayPool::new(),
+            release: Notify::new(),
+        });
+        let relay_pool: Arc<dyn RelayPoolTrait> = pool.clone();
+        let handle = tokio::spawn(publish_discoverability_events(
+            relay_pool,
+            vec!["wss://relay.example.com".to_string()],
+            Some(EventBuilder::new(Kind::Custom(0), "{}")),
+            Some(EventBuilder::new(
+                Kind::Custom(RELAY_LIST_METADATA_KIND),
+                "",
+            )),
+        ));
+
+        // The relay list must land while the profile publish is still stuck;
+        // a serialized publish path panics here.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let events = pool.inner.stored_events().await;
+            if events
+                .iter()
+                .any(|e| e.kind == Kind::Custom(RELAY_LIST_METADATA_KIND))
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "relay list must publish while the profile publish is stuck"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        pool.release.notify_one();
+        handle.await.expect("discoverability task should finish");
     }
 
     #[tokio::test]

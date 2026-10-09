@@ -156,11 +156,13 @@
   of the publish set: the events were sent through the main relay pool, which rejects any
   targeted send that includes a relay it isn't connected to, and the bootstrap relays are
   never added to that pool. Publication now goes through a short-lived dedicated
-  connection to exactly the target relays (advertised + bootstrap), waits up to 10 s for
-  the first socket before the first send round, retries rounds that earn no acceptance
-  every 30 s for up to 5 minutes, and logs each refusing relay's own reason instead of
-  swallowing it. A round where at least one relay accepts is a success even if others
-  refused; total refusal now surfaces as an error instead of being reported as published.
+  connection to exactly the target relays (advertised + bootstrap); each round waits up
+  to 10 s for a socket before sending and retries rounds that earn no acceptance
+  every 30 s for up to 5 minutes, and each refusing relay's own reason is logged
+  instead of swallowed. The two events publish concurrently, so a failing profile
+  never delays the relay list. A round where at least one relay accepts is a success
+  even if others refused; total refusal now surfaces as an error instead of being
+  reported as published.
 
 ### Changed
 

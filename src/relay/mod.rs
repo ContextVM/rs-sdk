@@ -153,9 +153,8 @@ impl RelayPool {
     /// Sign and publish an event to specific relay URLs.
     ///
     /// Publishes through a short-lived dedicated connection to exactly these
-    /// relays — they do not need to be members of this pool. Waits up to
-    /// [`PUBLISH_TO_CONNECT_WAIT`] for at least one socket before sending, so a
-    /// still-connecting relay reports a real outcome instead of a silent
+    /// relays — they do not need to be members of this pool. Waits up to 10
+    /// seconds for at least one socket before sending, so a still-connecting relay reports a real outcome instead of a silent
     /// no-answer. Per-relay refusals are logged with the relay's own reason;
     /// returns [`Error::Transport`] when no relay accepted the event.
     pub async fn publish_to(&self, urls: &[String], builder: EventBuilder) -> Result<EventId> {
