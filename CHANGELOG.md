@@ -6,9 +6,10 @@
 
 - CEP-8 capability pricing and payments (in progress; foundational pieces, not yet a
   usable payment flow):
-  - NIP-47 (Nostr Wallet Connect) client infrastructure for the Phase B Lightning rail,
-    behind the off-by-default `nwc` feature. The feature only switches on an existing
-    `nostr-sdk` NIP and adds no new crate to the dependency tree. `parse_nwc_uri` reads a
+  - NIP-47 (Nostr Wallet Connect) client infrastructure, letting a server issue and a
+    client pay Lightning BOLT11 invoices through a Nostr Wallet Connect wallet, behind
+    the off-by-default `nwc` feature. Enabling it pulls in NIP-04 and so adds `aes`,
+    `cbc` and `cipher` to the dependency tree. `parse_nwc_uri` reads a
     connection string in either shape wallets emit, including the
     `nostr+walletconnect:<pubkey>?...` pathname form that
     `NostrWalletConnectURI::parse` rejects and the ts-sdk accepts. `NwcClient` speaks

@@ -42,6 +42,13 @@ futures = "0.3"
 # Nostr SDK with NIP-59 (Gift Wrap) support
 nostr-sdk = { version = "0.44", features = ["nip59"] }
 
+# Direct floor on the transitive `nostr` crate, not used directly: `nostr-sdk`
+# accepts "0.44", and 0.44.5 and earlier panic on a malformed NIP-04 payload.
+# The NWC rail decrypts wallet-controlled NIP-04 content on its reader task, so
+# that panic is remotely reachable. Raising the floor here is the only way to
+# refuse those versions.
+nostr = { version = ">=0.44.7, <0.45", default-features = false, features = ["std"] }
+
 # Logging
 tracing = "0.1"
 
@@ -61,7 +68,8 @@ rmcp = ["dep:rmcp"]
 ## Exposes `MockRelayPool` for use in downstream integration tests.
 test-utils = []
 ## CEP-8 Lightning rail over NIP-47 (Nostr Wallet Connect). Off by default.
-## Switches on an existing `nostr-sdk` NIP; adds no new crate to the tree.
+## Enables `nostr-sdk/nip47`, which pulls in NIP-04 and therefore adds three
+## crates to the tree: `aes`, `cbc` and `cipher`. Measured with `cargo tree`.
 nwc = ["nostr-sdk/nip47"]
 
 [[example]]

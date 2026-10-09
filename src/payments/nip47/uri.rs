@@ -3,9 +3,11 @@
 //! [`NostrWalletConnectURI::parse`](nostr_sdk::nips::nip47::NostrWalletConnectURI::parse)
 //! reads the wallet pubkey from the URI *host* only, so it rejects the
 //! `nostr+walletconnect:<pubkey>?...` form (no `//`, pubkey in the path) that
-//! ts-sdk accepts. Wallets in the wild emit both, and a connection string the
-//! ts-sdk takes must not fail here, so this module parses both shapes and then
-//! hands the pieces to the upstream type.
+//! ts-sdk accepts, and it rejects the legacy `nostrwalletconnect://` scheme
+//! outright. Wallets in the wild emit all three, and a connection string the
+//! ts-sdk takes must not fail here, so this module does its own parsing and
+//! builds a [`NwcConnection`] directly. Nothing is handed to the upstream
+//! type.
 //!
 //! Parity note: ts `parseNwcConnectionString` prefers the pathname and falls
 //! back to the host (`url.pathname?.replace(/^\//, '') || url.host`). This
@@ -13,10 +15,13 @@
 
 use nostr_sdk::prelude::*;
 
-use crate::payments::errors::PaymentError;
+use crate::payments::nip47::error::NwcError;
 
-/// URI scheme for a NWC connection string.
+/// Canonical URI scheme for a NWC connection string.
 const NWC_URI_SCHEME: &str = "nostr+walletconnect";
+/// Legacy scheme still emitted by some wallets and accepted by ts-sdk's
+/// `new URL()` parse, which never checks the protocol.
+const NWC_URI_SCHEME_LEGACY: &str = "nostrwalletconnect";
 
 /// A parsed NWC connection string: which wallet to talk to, over which relays,
 /// under which client identity.
@@ -45,8 +50,10 @@ impl NwcConnection {
     }
 }
 
-fn invalid(reason: &str) -> PaymentError {
-    PaymentError::Processor(format!("Invalid NWC connection string: {reason}"))
+fn invalid(reason: &str) -> NwcError {
+    NwcError::Config {
+        reason: format!("invalid NWC connection string: {reason}"),
+    }
 }
 
 /// Parse a NWC connection string.
@@ -63,15 +70,17 @@ fn invalid(reason: &str) -> PaymentError {
 ///
 /// # Errors
 ///
-/// Returns [`PaymentError::Processor`] when the scheme is not
-/// `nostr+walletconnect`, the pubkey or secret is missing or malformed, or no
-/// relay is present. A relay value that does not parse is skipped, matching
+/// Returns [`NwcError::Config`] when the scheme is neither
+/// `nostr+walletconnect` nor the legacy `nostrwalletconnect`, the pubkey or
+/// secret is missing or malformed, or no relay is present. A relay value that does not parse is skipped, matching
 /// upstream; an empty resulting relay set is an error.
-pub fn parse_nwc_uri(uri: &str) -> Result<NwcConnection, PaymentError> {
+pub fn parse_nwc_uri(uri: &str) -> Result<NwcConnection, NwcError> {
     let url = Url::parse(uri.trim()).map_err(|_| invalid("not a URL"))?;
 
-    if url.scheme() != NWC_URI_SCHEME {
-        return Err(invalid("scheme is not nostr+walletconnect"));
+    if url.scheme() != NWC_URI_SCHEME && url.scheme() != NWC_URI_SCHEME_LEGACY {
+        return Err(invalid(
+            "scheme is neither nostr+walletconnect nor nostrwalletconnect",
+        ));
     }
 
     // ts precedence: a non-empty pathname wins, else the host. The `//` form
@@ -104,6 +113,10 @@ pub fn parse_nwc_uri(uri: &str) -> Result<NwcConnection, PaymentError> {
                     relays.push(relay);
                 }
             }
+            // Last-wins on a duplicate, deliberately: a later parameter is
+            // the more likely correction, and ts's `searchParams.get` takes
+            // the FIRST. Divergence noted rather than inherited, since no
+            // conformant wallet emits two.
             "secret" => secret = SecretKey::from_hex(value.trim()).ok(),
             "lud16" => lud16 = Some(value.to_string()),
             _ => {}
@@ -202,6 +215,43 @@ mod tests {
             c.wallet_pubkey,
             "client identity is not the wallet identity"
         );
+    }
+
+    /// Some wallets still emit the pre-standard scheme, and ts accepts it
+    /// because `new URL()` never checks the protocol.
+    #[test]
+    fn parses_the_legacy_nostrwalletconnect_scheme() {
+        let uri = format!(
+            "nostrwalletconnect://{PUBKEY}?relay=wss%3A%2F%2Frelay.example&secret={SECRET}"
+        );
+        assert!(
+            nostr_sdk::nips::nip47::NostrWalletConnectURI::parse(&uri).is_err(),
+            "precondition: upstream rejects the legacy scheme"
+        );
+        let c = parse_nwc_uri(&uri).expect("legacy scheme should parse");
+        assert_eq!(c.wallet_pubkey.to_hex(), PUBKEY);
+        assert_eq!(c.secret.to_secret_hex(), SECRET);
+    }
+
+    /// ts-sdk's own tested shape, verbatim from `connection.test.ts`.
+    #[test]
+    fn parses_the_shape_ts_pins_in_its_tests() {
+        let uri =
+            format!("nostr+walletconnect://{PUBKEY}?relay=wss://relay.example&secret={SECRET}");
+        let c = parse_nwc_uri(&uri).expect("ts's shape must parse");
+        assert_eq!(c.wallet_pubkey.to_hex(), PUBKEY);
+        assert_eq!(c.relays.len(), 1);
+    }
+
+    /// Deliberate divergence from ts, which takes the first.
+    #[test]
+    fn a_duplicate_secret_is_last_wins() {
+        let other = "0000000000000000000000000000000000000000000000000000000000000002";
+        let uri = format!(
+            "nostr+walletconnect://{PUBKEY}?relay=wss%3A%2F%2Fa.example&secret={other}&secret={SECRET}"
+        );
+        let c = parse_nwc_uri(&uri).unwrap();
+        assert_eq!(c.secret.to_secret_hex(), SECRET, "the later secret wins");
     }
 
     #[test]

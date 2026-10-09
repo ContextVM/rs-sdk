@@ -5,10 +5,12 @@
 //! [`NwcClient`], a request/response and notification client over an injected
 //! [`RelayPoolTrait`](crate::relay::RelayPoolTrait).
 //!
-//! Behind the off-by-default `nwc` feature, which only switches on
-//! `nostr-sdk/nip47` and adds no new crate to the tree.
+//! Behind the off-by-default `nwc` feature. It enables `nostr-sdk/nip47`,
+//! which pulls in NIP-04 and therefore adds `aes`, `cbc` and `cipher` to the
+//! dependency tree.
 
 pub mod client;
+pub mod error;
 pub mod types;
 pub mod uri;
 
@@ -16,8 +18,9 @@ pub mod uri;
 pub mod mock_wallet;
 
 pub use client::{NwcClient, NwcClientOptions, DEFAULT_RESPONSE_TIMEOUT};
+pub use error::NwcError;
 pub use types::{
-    sats_to_msats, NwcError, NwcInvoiceResult, NwcNotificationPayload, NwcPayInvoiceResult,
+    sats_to_msats, NwcErrorBody, NwcInvoiceResult, NwcNotificationPayload, NwcPayInvoiceResult,
     NwcResponseEnvelope, NOTIFICATION_PAYMENT_RECEIVED,
 };
 pub use uri::{parse_nwc_uri, NwcConnection};

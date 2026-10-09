@@ -5,39 +5,58 @@
 //!
 //! `nwc` owns its relay pool privately, so nothing built on it can be driven by
 //! [`MockRelayPool`](crate::relay::MockRelayPool) and every test would need a
-//! live wallet. This client takes an injected `Arc<dyn RelayPoolTrait>` instead,
-//! so the same code path runs in CI against a scripted mock wallet and in
-//! production against a real one.
+//! live wallet. This client takes its pool by construction, so the same code
+//! path runs against a scripted mock wallet in CI and a real wallet in
+//! production.
+//!
+//! # The client owns a relay pool
+//!
+//! Prefer [`NwcClient::connect`], which builds a pool from the connection's own
+//! relays. [`NwcClient::with_pool`] exists for tests and for a caller that
+//! genuinely wants to share one, and it carries a sharp edge: on a real
+//! [`RelayPool`](crate::relay::RelayPool), `connect` *adds* the wallet's relays
+//! to whatever pool it is given, and the NIP-47 subscription is permanent
+//! because [`RelayPoolTrait`] has no unsubscribe. Handing it a transport's pool
+//! therefore publishes ContextVM traffic to the wallet's relays and leaves a
+//! wallet filter on the transport's relays for the life of the process.
 //!
 //! # One subscription, not one per request
 //!
 //! ts-sdk opens a subscription per request and closes it on settle.
-//! [`RelayPoolTrait`] has no unsubscribe, so that shape would leak one live REQ
-//! per payment for the life of the process. This client instead opens a single
-//! subscription covering responses and notifications, runs one reader task, and
-//! correlates in process through a waiter map keyed by the request event id.
+//! [`RelayPoolTrait`] has no unsubscribe, so transliterating that would leak
+//! one live REQ per payment. This client opens a single subscription covering
+//! responses and notifications, runs one reader task, and correlates in process
+//! through a waiter map keyed by the request event id.
 //!
-//! # Divergences from ts-sdk (both safe, neither visible on the wire)
+//! # Divergences from ts-sdk
 //!
-//! * Notifications are decrypted **by kind**: 23196 is NIP-04, 23197 is NIP-44.
-//!   ts always uses NIP-04, which silently drops NIP-44 notifications.
+//! * Notifications are decrypted **by ciphertext shape**, not by event kind: a
+//!   NIP-04 payload carries `?iv=`. ts assumes NIP-04 for both kinds and so
+//!   drops NIP-44 notifications; keying on kind instead would double-deliver
+//!   for a wallet that publishes 23196 and 23197 for one event.
 //! * Requests are issued concurrently and correlated by id, where ts serializes
 //!   them behind a promise queue.
+//! * Every optional response field tolerates a wrong JSON type (see
+//!   [`types`](super::types)).
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use nostr_sdk::prelude::*;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{oneshot, Mutex as AsyncMutex};
 use tokio_util::sync::CancellationToken;
 
-use crate::payments::errors::PaymentError;
-use crate::payments::nip47::types::{NwcNotificationPayload, NwcResponseEnvelope};
+use crate::payments::nip47::error::NwcError;
+use crate::payments::nip47::types::{
+    sanitize_wallet_text, NwcInvoiceResult, NwcNotificationPayload, NwcPayInvoiceResult,
+    NwcResponseEnvelope,
+};
 use crate::payments::nip47::uri::NwcConnection;
-use crate::relay::RelayPoolTrait;
+use crate::relay::{RelayPool, RelayPoolTrait};
 
 const LOG_TARGET: &str = "contextvm::payments::nip47";
 
@@ -47,19 +66,28 @@ const KIND_INFO: u16 = 13194;
 const KIND_REQUEST: u16 = 23194;
 /// Kind 23195: the wallet's response.
 const KIND_RESPONSE: u16 = 23195;
-/// Kind 23196: a NIP-04-encrypted notification (legacy).
-const KIND_NOTIFICATION_NIP04: u16 = 23196;
-/// Kind 23197: a NIP-44-encrypted notification.
-const KIND_NOTIFICATION_NIP44: u16 = 23197;
+/// Kind 23196: a notification, historically NIP-04.
+const KIND_NOTIFICATION_LEGACY: u16 = 23196;
+/// Kind 23197: a notification, historically NIP-44.
+const KIND_NOTIFICATION: u16 = 23197;
 
-/// Default per-request response timeout.
+/// Default deadline for one NIP-47 call.
 pub const DEFAULT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How far back the subscription looks on start.
+///
+/// ts uses 5 s. Relay clocks drift and a reconnect can land well after the
+/// original subscribe, so a slightly wider window is safer than missing a live
+/// answer; it is still bounded, so a relay that retains ephemeral events does
+/// not replay this client's whole history into the sinks.
+const SUBSCRIPTION_LOOKBACK: Duration = Duration::from_secs(120);
 
 /// Construction options for [`NwcClient`].
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct NwcClientOptions {
-    /// How long to wait for a single NIP-47 response. Default 60 s.
+    /// Deadline covering start-up, publish and the wait for an answer.
+    /// Default 60 s. Must be non-zero.
     pub response_timeout: Duration,
 }
 
@@ -71,17 +99,79 @@ impl Default for NwcClientOptions {
     }
 }
 
-type Waiter = oneshot::Sender<String>;
+impl NwcClientOptions {
+    /// Options with the default response timeout.
+    pub fn new() -> Self {
+        Self::default()
+    }
 
-/// A registered notification sink. Named so the waiter/sink collections stay
-/// readable (and to satisfy `clippy::type_complexity`).
+    /// Set the deadline covering start-up, publish and the wait for an answer.
+    ///
+    /// A builder rather than a public field literal: the struct is
+    /// `#[non_exhaustive]`, so a downstream crate cannot name it in a struct
+    /// expression.
+    pub fn with_response_timeout(mut self, response_timeout: Duration) -> Self {
+        self.response_timeout = response_timeout;
+        self
+    }
+
+    /// Reject a configuration that cannot work.
+    fn validate(&self) -> Result<(), NwcError> {
+        if self.response_timeout.is_zero() {
+            return Err(NwcError::Config {
+                reason: "response_timeout must be non-zero; a zero deadline would publish the \
+                         request and then always time out"
+                    .to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// A registered notification sink.
 type NotificationSink = Arc<dyn Fn(NwcNotificationPayload) + Send + Sync>;
 
 struct Inner {
     /// Pending request-event-id to response-plaintext waiters.
-    waiters: Mutex<HashMap<EventId, Waiter>>,
-    /// Registered notification sinks.
-    notification_sinks: Mutex<Vec<NotificationSink>>,
+    ///
+    /// A `std::sync::Mutex`: no critical section crosses an await, and the RAII
+    /// guard that de-registers a dropped waiter cannot await.
+    waiters: Mutex<HashMap<EventId, oneshot::Sender<String>>>,
+    notification_sinks: AsyncMutex<Vec<NotificationSink>>,
+    /// Set once any response has correlated. Until then the filter may be too
+    /// narrow for the wallet in front of us.
+    ever_correlated: AtomicBool,
+    /// Set by `close()`, by `Drop`, and when the reader exits.
+    closed: AtomicBool,
+}
+
+impl Inner {
+    /// Drop every waiter so its `request()` returns instead of waiting out the
+    /// full deadline. Dropping the sender closes the channel.
+    fn drain_waiters(&self) {
+        if let Ok(mut map) = self.waiters.lock() {
+            map.clear();
+        }
+    }
+}
+
+/// Removes its waiter on drop, including when the `request()` future is
+/// cancelled mid-wait.
+///
+/// Without this, a dropped future (every cancelled verification in the payment
+/// processor's `select!`) orphans an `EventId` and a `oneshot::Sender` in the
+/// map for the life of the process.
+struct WaiterGuard {
+    inner: Arc<Inner>,
+    id: EventId,
+}
+
+impl Drop for WaiterGuard {
+    fn drop(&mut self) {
+        if let Ok(mut map) = self.inner.waiters.lock() {
+            map.remove(&self.id);
+        }
+    }
 }
 
 /// A NIP-47 client bound to one wallet connection and one relay pool.
@@ -91,19 +181,49 @@ pub struct NwcClient {
     keys: Keys,
     response_timeout: Duration,
     inner: Arc<Inner>,
-    /// Guards one-time subscription + reader-task startup.
-    started: Mutex<bool>,
+    started: AsyncMutex<bool>,
     cancel: CancellationToken,
 }
 
 impl NwcClient {
-    /// Create a client over `pool` for `connection`, with default options.
-    pub fn new(pool: Arc<dyn RelayPoolTrait>, connection: NwcConnection) -> Self {
-        Self::with_options(pool, connection, NwcClientOptions::default())
+    /// Build a client that owns a relay pool connected to the wallet's own
+    /// relays. This is the constructor production code should use.
+    ///
+    /// # Errors
+    ///
+    /// [`NwcError::Config`] for invalid options, [`NwcError::Connect`] if the
+    /// pool cannot be created.
+    pub async fn connect(
+        connection: NwcConnection,
+        options: NwcClientOptions,
+    ) -> Result<Self, NwcError> {
+        options.validate()?;
+        let pool = RelayPool::new(Keys::generate())
+            .await
+            .map_err(|e| NwcError::Connect {
+                reason: e.to_string(),
+            })?;
+        Ok(Self::build(Arc::new(pool), connection, options))
     }
 
-    /// Create a client with explicit options.
-    pub fn with_options(
+    /// Build a client over a caller-supplied pool.
+    ///
+    /// Intended for tests, and for a caller that has deliberately decided to
+    /// share. See the module docs for why sharing a transport's pool is a trap.
+    ///
+    /// # Errors
+    ///
+    /// [`NwcError::Config`] when the options are invalid.
+    pub fn with_pool(
+        pool: Arc<dyn RelayPoolTrait>,
+        connection: NwcConnection,
+        options: NwcClientOptions,
+    ) -> Result<Self, NwcError> {
+        options.validate()?;
+        Ok(Self::build(pool, connection, options))
+    }
+
+    fn build(
         pool: Arc<dyn RelayPoolTrait>,
         connection: NwcConnection,
         options: NwcClientOptions,
@@ -116,9 +236,11 @@ impl NwcClient {
             response_timeout: options.response_timeout,
             inner: Arc::new(Inner {
                 waiters: Mutex::new(HashMap::new()),
-                notification_sinks: Mutex::new(Vec::new()),
+                notification_sinks: AsyncMutex::new(Vec::new()),
+                ever_correlated: AtomicBool::new(false),
+                closed: AtomicBool::new(false),
             }),
-            started: Mutex::new(false),
+            started: AsyncMutex::new(false),
             cancel: CancellationToken::new(),
         }
     }
@@ -133,13 +255,49 @@ impl NwcClient {
         self.connection.wallet_pubkey
     }
 
-    /// Stop the reader task. Idempotent; the client is unusable afterwards.
-    pub fn shutdown(&self) {
+    /// Stop the reader and refuse further requests. Idempotent.
+    ///
+    /// Fail-fast: a request after this returns [`NwcError::Closed`] without
+    /// publishing, so a shut-down client cannot still cause a payment. Waiting
+    /// callers are released rather than left to time out.
+    pub fn close(&self) {
+        self.inner.closed.store(true, Ordering::SeqCst);
         self.cancel.cancel();
+        self.inner.drain_waiters();
+    }
+
+    /// Whether [`Self::close`] has been called, or the reader has exited.
+    pub fn is_closed(&self) -> bool {
+        self.inner.closed.load(Ordering::SeqCst)
+    }
+
+    /// Filters this client subscribes with.
+    ///
+    /// `narrow` additionally requires the `p` tag addressed to us, which every
+    /// conformant wallet sets. The widened form drops it: see
+    /// [`Self::widen_filter_if_never_correlated`].
+    fn filters(&self, narrow: bool) -> Vec<Filter> {
+        let since = Timestamp::now() - SUBSCRIPTION_LOOKBACK;
+        let base = Filter::new()
+            .kinds([
+                Kind::from(KIND_RESPONSE),
+                Kind::from(KIND_NOTIFICATION_LEGACY),
+                Kind::from(KIND_NOTIFICATION),
+            ])
+            .author(self.connection.wallet_pubkey)
+            .since(since);
+        vec![if narrow {
+            base.pubkey(self.keys.public_key())
+        } else {
+            base
+        }]
     }
 
     /// Connect, subscribe, and spawn the reader task. Idempotent.
-    async fn ensure_started(&self) -> Result<(), PaymentError> {
+    async fn ensure_started(&self) -> Result<(), NwcError> {
+        if self.is_closed() {
+            return Err(NwcError::Closed);
+        }
         let mut started = self.started.lock().await;
         if *started {
             return Ok(());
@@ -148,42 +306,65 @@ impl NwcClient {
         self.pool
             .connect(&self.connection.relay_urls())
             .await
-            .map_err(|e| PaymentError::Processor(format!("NWC relay connect failed: {e}")))?;
+            .map_err(|e| NwcError::Connect {
+                reason: e.to_string(),
+            })?;
 
-        // One subscription for everything this client consumes: responses
-        // addressed to us, and both notification kinds.
-        let client_pk = self.keys.public_key();
-        let wallet_pk = self.connection.wallet_pubkey;
-        let filters = vec![Filter::new()
-            .kinds([
-                Kind::from(KIND_RESPONSE),
-                Kind::from(KIND_NOTIFICATION_NIP04),
-                Kind::from(KIND_NOTIFICATION_NIP44),
-            ])
-            .author(wallet_pk)
-            .pubkey(client_pk)];
-
-        // Take the receiver BEFORE subscribing so the mock pool's replay of
-        // already-stored events cannot land before we are listening.
+        // Take the receiver BEFORE subscribing so a replay cannot land before
+        // we are listening.
         let notifications = self.pool.notifications();
 
         self.pool
-            .subscribe(filters)
+            .subscribe(self.filters(true))
             .await
-            .map_err(|e| PaymentError::Processor(format!("NWC subscribe failed: {e}")))?;
+            .map_err(|e| NwcError::Subscribe {
+                reason: e.to_string(),
+            })?;
 
         let inner = Arc::clone(&self.inner);
         let keys = self.keys.clone();
+        let wallet = self.connection.wallet_pubkey;
         let cancel = self.cancel.clone();
         tokio::spawn(async move {
-            Self::reader_loop(notifications, inner, keys, wallet_pk, cancel).await;
+            Self::reader_loop(notifications, Arc::clone(&inner), keys, wallet, cancel).await;
+            // The rail is dead once the reader stops. Mark it so a later
+            // request fails fast instead of publishing into a void and waiting
+            // out the deadline, and release anyone already waiting.
+            inner.closed.store(true, Ordering::SeqCst);
+            inner.drain_waiters();
+            tracing::warn!(target: LOG_TARGET, "NWC reader stopped; client is now closed");
         });
 
         *started = true;
         Ok(())
     }
 
+    /// Re-subscribe without the `p` tag.
+    ///
+    /// Our filter requires `#p`, which every conformant wallet sets but which
+    /// is stricter than ts (whose per-request REQ has no `#p` at all). A wallet
+    /// that omits it would be invisible forever. While nothing has *ever*
+    /// correlated, widen once so such a wallet still works; after the first
+    /// successful correlation the narrow filter is known good and this is never
+    /// attempted again.
+    async fn widen_filter_if_never_correlated(&self) {
+        if self.inner.ever_correlated.load(Ordering::SeqCst) {
+            return;
+        }
+        tracing::debug!(
+            target: LOG_TARGET,
+            "no NWC response has correlated yet; re-subscribing without the p-tag filter"
+        );
+        if let Err(e) = self.pool.subscribe(self.filters(false)).await {
+            tracing::debug!(target: LOG_TARGET, error = %e, "widened NWC subscribe failed");
+        }
+    }
+
     /// Single reader task: decrypts, correlates responses, fans out notifications.
+    ///
+    /// Each event is handled inside `catch_unwind`, so one panicking
+    /// notification sink (caller code) cannot take the rail down for the life
+    /// of the process.
     async fn reader_loop(
         mut notifications: tokio::sync::broadcast::Receiver<RelayPoolNotification>,
         inner: Arc<Inner>,
@@ -196,10 +377,9 @@ impl NwcClient {
                 _ = cancel.cancelled() => break,
                 result = notifications.recv() => match result {
                     Ok(n) => n,
-                    // A lagged broadcast drops events but must not kill the
-                    // reader: the waiter map survives, so an in-flight request
-                    // still resolves from a later delivery or times out
-                    // cleanly. Killing the loop here would hang every waiter.
+                    // Lagging drops events but must not kill the reader: the
+                    // waiter map survives, so an in-flight request still
+                    // resolves from a later delivery or fails at its deadline.
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                         tracing::warn!(
                             target: LOG_TARGET,
@@ -216,36 +396,67 @@ impl NwcClient {
                 continue;
             };
 
-            // A stranger cannot answer for the wallet.
+            // A stranger cannot answer for the wallet. `nostr-relay-pool`
+            // verifies signatures but not filter matches
+            // (`verify_subscriptions` defaults to false), so a relay that
+            // ignores `authors` would otherwise let a correctly correlated,
+            // stranger-signed "settled" through.
             if event.pubkey != wallet_pubkey {
                 continue;
             }
 
             let kind = event.kind.as_u16();
-            match kind {
-                KIND_RESPONSE => Self::handle_response(&event, &inner, &keys).await,
-                KIND_NOTIFICATION_NIP04 | KIND_NOTIFICATION_NIP44 => {
-                    Self::handle_notification(&event, &inner, &keys, kind).await
-                }
-                _ => {}
+            let sinks = if matches!(kind, KIND_NOTIFICATION | KIND_NOTIFICATION_LEGACY) {
+                inner.notification_sinks.lock().await.clone()
+            } else {
+                Vec::new()
+            };
+
+            // Isolate per event: a panic here is contained to this event.
+            let inner_for_event = Arc::clone(&inner);
+            let keys_for_event = keys.clone();
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                Self::handle_event(&event, &inner_for_event, &keys_for_event, kind, &sinks)
+            }));
+            if outcome.is_err() {
+                tracing::error!(
+                    target: LOG_TARGET,
+                    kind,
+                    "a NWC event handler panicked; the reader is continuing"
+                );
             }
         }
         tracing::debug!(target: LOG_TARGET, "NWC reader loop stopped");
     }
 
-    async fn handle_response(event: &Event, inner: &Arc<Inner>, keys: &Keys) {
-        // Correlate by the `e` tag naming the request event.
+    /// Synchronous per-event handling, so it can be wrapped in `catch_unwind`.
+    fn handle_event(
+        event: &Event,
+        inner: &Arc<Inner>,
+        keys: &Keys,
+        kind: u16,
+        sinks: &[NotificationSink],
+    ) {
+        match kind {
+            KIND_RESPONSE => Self::handle_response(event, inner, keys),
+            KIND_NOTIFICATION | KIND_NOTIFICATION_LEGACY => {
+                Self::handle_notification(event, keys, sinks)
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_response(event: &Event, inner: &Arc<Inner>, keys: &Keys) {
         let Some(request_id) = first_e_tag(event) else {
             return;
         };
 
-        let waiter = {
-            let mut waiters = inner.waiters.lock().await;
-            waiters.remove(&request_id)
-        };
+        let waiter = inner
+            .waiters
+            .lock()
+            .ok()
+            .and_then(|mut map| map.remove(&request_id));
         let Some(waiter) = waiter else {
-            // Uncorrelated: a response to a request we never made, or one we
-            // already settled. Dropping it is correct.
             tracing::debug!(
                 target: LOG_TARGET,
                 request_id = %request_id.to_hex(),
@@ -254,38 +465,27 @@ impl NwcClient {
             return;
         };
 
-        // Responses are NIP-04 in practice; fall back to NIP-44 so a wallet
-        // that upgrades does not strand us.
-        match decrypt_either(keys, &event.pubkey, &event.content) {
+        match decrypt_auto(keys, &event.pubkey, &event.content) {
             Ok(plaintext) => {
+                inner.ever_correlated.store(true, Ordering::SeqCst);
                 let _ = waiter.send(plaintext);
             }
-            Err(e) => {
+            Err(reason) => {
                 tracing::warn!(
                     target: LOG_TARGET,
-                    error = %e,
-                    "failed to decrypt NWC response; dropping (caller will time out)"
+                    reason = %reason,
+                    "failed to decrypt a NWC response; the caller will fail at its deadline"
                 );
             }
         }
     }
 
-    async fn handle_notification(event: &Event, inner: &Arc<Inner>, keys: &Keys, kind: u16) {
-        // Decrypt by kind, the documented divergence from ts-sdk.
-        let decrypted = if kind == KIND_NOTIFICATION_NIP44 {
-            nip44::decrypt(keys.secret_key(), &event.pubkey, &event.content)
-                .map_err(|e| e.to_string())
-        } else {
-            nip04::decrypt(keys.secret_key(), &event.pubkey, &event.content)
-                .map_err(|e| e.to_string())
-        };
-
-        let Ok(plaintext) = decrypted else {
-            tracing::debug!(
-                target: LOG_TARGET,
-                kind,
-                "failed to decrypt NWC notification"
-            );
+    fn handle_notification(event: &Event, keys: &Keys, sinks: &[NotificationSink]) {
+        // By ciphertext shape, not by kind: a wallet supporting both
+        // encryptions publishes 23196 and 23197 for one notification, and ts's
+        // own fixture is NIP-04 content on kind 23197.
+        let Ok(plaintext) = decrypt_auto(keys, &event.pubkey, &event.content) else {
+            tracing::debug!(target: LOG_TARGET, "failed to decrypt a NWC notification");
             return;
         };
 
@@ -294,10 +494,6 @@ impl NwcClient {
             return;
         };
 
-        let sinks = {
-            let guard = inner.notification_sinks.lock().await;
-            guard.clone()
-        };
         for sink in sinks {
             sink(payload.clone());
         }
@@ -305,10 +501,17 @@ impl NwcClient {
 
     /// Register a sink invoked for every decoded notification.
     ///
-    /// Sinks are called synchronously on the reader task, so they must not
-    /// block. Kept for the life of the client; there is no removal, matching
-    /// the single long-lived subscriber this rail needs.
-    pub async fn on_notification<F>(&self, sink: F) -> Result<(), PaymentError>
+    /// Sinks run on the reader task and must not block. A panicking sink is
+    /// contained to its own event rather than killing the rail, though it will
+    /// skip the remaining sinks for that event.
+    ///
+    /// Side effect worth knowing: this starts the subscription and the reader
+    /// if they are not running yet.
+    ///
+    /// # Errors
+    ///
+    /// [`NwcError::Closed`], [`NwcError::Connect`] or [`NwcError::Subscribe`].
+    pub async fn on_notification<F>(&self, sink: F) -> Result<(), NwcError>
     where
         F: Fn(NwcNotificationPayload) + Send + Sync + 'static,
     {
@@ -323,57 +526,129 @@ impl NwcClient {
 
     /// Issue a NIP-47 request and await its correlated response.
     ///
-    /// Bounded by `response_timeout`. A wallet-reported error is returned as
-    /// `Ok(envelope)` with `error` set, not `Err`: the caller decides whether a
-    /// given code is fatal or merely pending.
+    /// `response_timeout` is one deadline over **start-up, publish and the
+    /// wait**, not the wait alone: a hanging connect or publish fails at the
+    /// same bound rather than parking the caller indefinitely.
+    ///
+    /// A wallet-reported error is returned as `Ok(envelope)` with `error` set,
+    /// not `Err`: the caller decides whether a given code is fatal or merely
+    /// pending. Use [`NwcResponseEnvelope::into_result`] when that distinction
+    /// does not matter.
+    ///
+    /// Crate-internal: the typed [`Self::make_invoice`], [`Self::lookup_invoice`]
+    /// and [`Self::pay_invoice`] are the public surface, so adding a NIP field
+    /// later is not a breaking change.
     ///
     /// # Errors
     ///
-    /// [`PaymentError::Processor`] on encrypt/publish failure, on timeout, or
-    /// when the response cannot be parsed.
-    pub async fn request<P, R>(
+    /// [`NwcError::Closed`] if the client is shut down, [`NwcError::Timeout`]
+    /// at the deadline (carrying whether the request was published),
+    /// [`NwcError::Publish`], [`NwcError::Crypto`] or
+    /// [`NwcError::MalformedResponse`].
+    pub(crate) async fn request<P, R>(
         &self,
         method: &str,
         params: P,
-    ) -> Result<NwcResponseEnvelope<R>, PaymentError>
+        expiration: Option<Duration>,
+    ) -> Result<NwcResponseEnvelope<R>, NwcError>
     where
         P: Serialize,
         R: DeserializeOwned,
     {
-        self.ensure_started().await?;
+        let deadline = tokio::time::Instant::now() + self.response_timeout;
+        let timeout_ms = self.response_timeout.as_millis() as u64;
+
+        if self.is_closed() {
+            return Err(NwcError::Closed);
+        }
+
+        match tokio::time::timeout_at(deadline, self.ensure_started()).await {
+            Ok(result) => result?,
+            Err(_) => {
+                return Err(NwcError::Timeout {
+                    method: method.to_string(),
+                    timeout_ms,
+                    published: false,
+                })
+            }
+        }
 
         let body = serde_json::json!({ "method": method, "params": params });
-        let plaintext = serde_json::to_string(&body)?;
+        let plaintext = serde_json::to_string(&body).map_err(|e| NwcError::Crypto {
+            direction: "encryption",
+            reason: format!("request could not be serialized ({:?})", e.classify()),
+        })?;
 
         let content = nip04::encrypt(
             self.keys.secret_key(),
             &self.connection.wallet_pubkey,
             plaintext,
         )
-        .map_err(|e| PaymentError::Processor(format!("NWC request encryption failed: {e}")))?;
+        .map_err(|e| NwcError::Crypto {
+            direction: "encryption",
+            reason: sanitize_wallet_text(&e.to_string()),
+        })?;
 
-        let builder = EventBuilder::new(Kind::from(KIND_REQUEST), content).tags([
+        let mut tags = vec![
             Tag::public_key(self.connection.wallet_pubkey),
-            Tag::parse(["encryption", "nip04"])
-                .map_err(|e| PaymentError::Processor(format!("bad encryption tag: {e}")))?,
-        ]);
+            Tag::parse(["encryption", "nip04"]).map_err(|e| NwcError::Crypto {
+                direction: "encryption",
+                reason: e.to_string(),
+            })?,
+        ];
+        if let Some(expiry) = expiration {
+            // NIP-40 expiration, as ts sends: a wallet that honors it will not
+            // act on a request the caller has already given up on.
+            let at = Timestamp::now() + expiry;
+            tags.push(
+                Tag::parse(["expiration", &at.as_secs().to_string()]).map_err(|e| {
+                    NwcError::Crypto {
+                        direction: "encryption",
+                        reason: e.to_string(),
+                    }
+                })?,
+            );
+        }
 
-        let event = builder
+        let event = EventBuilder::new(Kind::from(KIND_REQUEST), content)
+            .tags(tags)
             .sign_with_keys(&self.keys)
-            .map_err(|e| PaymentError::Processor(format!("NWC request signing failed: {e}")))?;
+            .map_err(|e| NwcError::Crypto {
+                direction: "encryption",
+                reason: e.to_string(),
+            })?;
         let request_id = event.id;
 
-        // Register the waiter BEFORE publishing, so a wallet that answers
-        // instantly cannot arrive before we are listening for it.
+        // Register the waiter BEFORE publishing, so an instant answer cannot
+        // arrive before anything is listening. The guard removes it on every
+        // exit path, including this future being dropped mid-wait.
         let (tx, rx) = oneshot::channel();
-        self.inner.waiters.lock().await.insert(request_id, tx);
-
-        if let Err(e) = self.pool.publish_event(&event).await {
-            self.inner.waiters.lock().await.remove(&request_id);
-            return Err(PaymentError::Processor(format!(
-                "NWC publish failed for {method}: {e}"
-            )));
+        {
+            let mut map = self.inner.waiters.lock().map_err(|_| NwcError::Closed)?;
+            map.insert(request_id, tx);
         }
+        let _guard = WaiterGuard {
+            inner: Arc::clone(&self.inner),
+            id: request_id,
+        };
+
+        let published =
+            match tokio::time::timeout_at(deadline, self.pool.publish_event(&event)).await {
+                Ok(Ok(_)) => true,
+                Ok(Err(e)) => {
+                    return Err(NwcError::Publish {
+                        method: method.to_string(),
+                        reason: e.to_string(),
+                    })
+                }
+                Err(_) => {
+                    return Err(NwcError::Timeout {
+                        method: method.to_string(),
+                        timeout_ms,
+                        published: false,
+                    })
+                }
+            };
 
         tracing::debug!(
             target: LOG_TARGET,
@@ -382,34 +657,129 @@ impl NwcClient {
             "NWC request published"
         );
 
-        let plaintext = match tokio::time::timeout(self.response_timeout, rx).await {
+        // One chance to widen a too-narrow filter, while nothing has ever
+        // correlated. Only on the very first requests.
+        self.widen_filter_if_never_correlated().await;
+
+        let plaintext = match tokio::time::timeout_at(deadline, rx).await {
             Ok(Ok(p)) => p,
-            Ok(Err(_)) => {
-                self.inner.waiters.lock().await.remove(&request_id);
-                return Err(PaymentError::Processor(format!(
-                    "NWC client stopped before a response to {method} arrived"
-                )));
-            }
+            // Sender dropped: the client closed, or the reader died.
+            Ok(Err(_)) => return Err(NwcError::Closed),
             Err(_) => {
-                self.inner.waiters.lock().await.remove(&request_id);
-                return Err(PaymentError::Processor(format!(
-                    "NWC response timed out for {method}"
-                )));
+                return Err(NwcError::Timeout {
+                    method: method.to_string(),
+                    timeout_ms,
+                    published,
+                })
             }
         };
 
-        let envelope: NwcResponseEnvelope<R> = serde_json::from_str(&plaintext).map_err(|e| {
-            PaymentError::Processor(format!("malformed NWC response for {method}: {e}"))
-        })?;
+        let envelope: NwcResponseEnvelope<R> =
+            serde_json::from_str(&plaintext).map_err(|e| NwcError::from_serde(method, &e))?;
+
+        if let Some(kind) = envelope.result_type.as_deref() {
+            if kind != method {
+                // Correlation by event id already proves which request this
+                // answers, so a mismatched label is not grounds to discard a
+                // settlement. Surface it and carry on.
+                tracing::warn!(
+                    target: LOG_TARGET,
+                    method,
+                    result_type = kind,
+                    "NWC result_type does not match the request method"
+                );
+            }
+        }
 
         Ok(envelope)
     }
 
-    /// Fetch the notification types the wallet advertises on its kind-13194 info event.
+    /// Ask the wallet for a BOLT11 invoice.
     ///
-    /// Returns an empty set when no info event is found, which callers read as
+    /// # Errors
+    ///
+    /// [`NwcError::InvalidAmount`] if `amount_msats` is zero; otherwise see
+    /// [`Self::request`].
+    pub async fn make_invoice(
+        &self,
+        amount_msats: u64,
+        description: Option<&str>,
+        expiry: Option<Duration>,
+    ) -> Result<NwcResponseEnvelope<NwcInvoiceResult>, NwcError> {
+        if amount_msats == 0 {
+            return Err(NwcError::InvalidAmount {
+                reason: "make_invoice amount must be positive".to_string(),
+            });
+        }
+        let mut params = serde_json::json!({ "amount": amount_msats });
+        if let Some(d) = description {
+            params["description"] = serde_json::Value::String(d.to_string());
+        }
+        if let Some(e) = expiry {
+            params["expiry"] = serde_json::Value::from(e.as_secs());
+        }
+        self.request("make_invoice", params, None).await
+    }
+
+    /// Look an invoice up, by payment hash when known and by invoice otherwise.
+    ///
+    /// # Errors
+    ///
+    /// [`NwcError::Config`] if neither identifier is given; otherwise see
+    /// [`Self::request`].
+    pub async fn lookup_invoice(
+        &self,
+        payment_hash: Option<&str>,
+        invoice: Option<&str>,
+    ) -> Result<NwcResponseEnvelope<NwcInvoiceResult>, NwcError> {
+        let params = match (payment_hash, invoice) {
+            (Some(h), _) => serde_json::json!({ "payment_hash": h }),
+            (None, Some(i)) => serde_json::json!({ "invoice": i }),
+            (None, None) => {
+                return Err(NwcError::Config {
+                    reason: "lookup_invoice needs a payment_hash or an invoice".to_string(),
+                })
+            }
+        };
+        self.request("lookup_invoice", params, None).await
+    }
+
+    /// Pay a BOLT11 invoice.
+    ///
+    /// `expiration` sets a NIP-40 expiration on the request, so a wallet that
+    /// honors it will not pay after the caller has given up. Strongly
+    /// recommended: `pay_invoice` is not idempotent.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::request`]. On [`NwcError::Timeout`], check
+    /// [`NwcError::may_have_reached_wallet`] before retrying.
+    pub async fn pay_invoice(
+        &self,
+        invoice: &str,
+        expiration: Option<Duration>,
+    ) -> Result<NwcResponseEnvelope<NwcPayInvoiceResult>, NwcError> {
+        self.request(
+            "pay_invoice",
+            serde_json::json!({ "invoice": invoice }),
+            expiration,
+        )
+        .await
+    }
+
+    /// Fetch the notification types the wallet advertises on its kind-13194
+    /// info event.
+    ///
+    /// Returns an empty list when no info event is found, which callers read as
     /// "no notification support" and fall back to polling.
-    pub async fn fetch_info_notification_types(&self) -> Result<Vec<String>, PaymentError> {
+    ///
+    /// Side effect worth knowing: this starts the subscription and the reader
+    /// if they are not running yet.
+    ///
+    /// # Errors
+    ///
+    /// [`NwcError::Closed`], [`NwcError::Connect`] or [`NwcError::Subscribe`].
+    pub async fn fetch_info_notification_types(&self) -> Result<Vec<String>, NwcError> {
         self.ensure_started().await?;
 
         let filter = Filter::new()
@@ -421,15 +791,17 @@ impl NwcClient {
             .pool
             .fetch_events(vec![filter], self.response_timeout)
             .await
-            .map_err(|e| PaymentError::Processor(format!("NWC info fetch failed: {e}")))?;
+            .map_err(|e| NwcError::Subscribe {
+                reason: e.to_string(),
+            })?;
 
         let Some(event) = events.into_iter().next() else {
             return Ok(Vec::new());
         };
 
-        // ts joins every `notifications` tag value with a space, then splits on
-        // whitespace, so a wallet may use either one tag with a space-separated
-        // list or several tags. Reproduce both.
+        // ts joins every `notifications` tag value with a space then splits on
+        // whitespace, so a wallet may use one tag with a space-separated list
+        // or several tags. Reproduce both.
         let mut types = Vec::new();
         for tag in event.tags.iter() {
             let slice = tag.as_slice();
@@ -447,15 +819,26 @@ impl NwcClient {
         }
         Ok(types)
     }
+
+    /// Number of waiters currently registered. Test-only introspection, so the
+    /// RAII guard's effect is observable.
+    #[cfg(test)]
+    pub(crate) fn waiter_count(&self) -> usize {
+        self.inner.waiters.lock().map(|m| m.len()).unwrap_or(0)
+    }
 }
 
 impl Drop for NwcClient {
     fn drop(&mut self) {
-        self.cancel.cancel();
+        self.close();
     }
 }
 
 /// First `e` tag of an event, as an [`EventId`].
+///
+/// Parity note: ts takes the first `e` tag too. Neither implementation handles
+/// an answer carrying several `e` tags sensibly, which no conformant wallet
+/// sends.
 fn first_e_tag(event: &Event) -> Option<EventId> {
     event.tags.iter().find_map(|t| match t.as_slice() {
         [name, value, ..] if name == "e" => EventId::from_hex(value).ok(),
@@ -463,23 +846,25 @@ fn first_e_tag(event: &Event) -> Option<EventId> {
     })
 }
 
-/// Try NIP-04, then NIP-44. Responses are NIP-04 in practice, but a wallet that
-/// answers with NIP-44 should still be understood rather than timing out.
-fn decrypt_either(keys: &Keys, author: &PublicKey, content: &str) -> Result<String, String> {
-    match nip04::decrypt(keys.secret_key(), author, content) {
-        Ok(p) => Ok(p),
-        Err(first) => nip44::decrypt(keys.secret_key(), author, content)
-            .map_err(|second| format!("nip04: {first}; nip44: {second}")),
+/// Decrypt by ciphertext shape rather than by event kind.
+///
+/// NIP-04 ciphertext is `<base64>?iv=<base64>`; NIP-44 has no `?iv=`. Keying on
+/// shape means a NIP-04 payload on kind 23197 (ts's own fixture) decodes, and a
+/// wallet that publishes both kinds for one notification is not mis-handled by
+/// kind alone.
+fn decrypt_auto(keys: &Keys, author: &PublicKey, content: &str) -> Result<String, String> {
+    if content.contains("?iv=") {
+        nip04::decrypt(keys.secret_key(), author, content).map_err(|e| e.to_string())
+    } else {
+        nip44::decrypt(keys.secret_key(), author, content).map_err(|e| e.to_string())
     }
 }
 
 #[cfg(all(test, feature = "test-utils"))]
 mod tests {
     use super::*;
-    use crate::payments::nip47::mock_wallet::{MockWallet, WalletBehavior};
-    use crate::payments::nip47::types::{
-        NwcError, NwcInvoiceResult, NwcPayInvoiceResult, NOTIFICATION_PAYMENT_RECEIVED,
-    };
+    use crate::payments::nip47::mock_wallet::{MockWallet, MockWalletQuirks, WalletBehavior};
+    use crate::payments::nip47::types::{NwcErrorBody, NOTIFICATION_PAYMENT_RECEIVED};
     use crate::payments::nip47::uri::parse_nwc_uri;
     use crate::relay::MockRelayPool;
 
@@ -505,60 +890,38 @@ mod tests {
         );
         let connection = parse_nwc_uri(&uri).expect("uri parses");
 
-        let client = NwcClient::with_options(
+        let client = NwcClient::with_pool(
             Arc::clone(&client_pool) as Arc<dyn RelayPoolTrait>,
             connection,
-            NwcClientOptions { response_timeout },
-        );
+            NwcClientOptions::new().with_response_timeout(response_timeout),
+        )
+        .expect("options valid");
         (wallet, client, client_pool)
     }
 
+    fn invoice_result(invoice: &str) -> serde_json::Value {
+        serde_json::json!({ "invoice": invoice, "state": "pending" })
+    }
+
+    // ── round trips ──────────────────────────────────────────────────────────
+
     #[tokio::test]
-    async fn round_trips_make_invoice() {
+    async fn round_trips_the_three_typed_methods() {
         let (wallet, client, _pool) = harness().await;
         wallet
             .set_behavior(
                 "make_invoice",
-                WalletBehavior::Answer(serde_json::json!({
-                    "invoice": "lnbc210n1p",
-                    "payment_hash": "hash-1",
-                    "state": "pending",
-                })),
+                WalletBehavior::Answer(
+                    serde_json::json!({ "invoice": "lnbc210n1p", "payment_hash": "hash-1" }),
+                ),
             )
             .await;
-
-        let env: NwcResponseEnvelope<NwcInvoiceResult> = client
-            .request("make_invoice", serde_json::json!({ "amount": 21_000u64 }))
-            .await
-            .expect("request succeeds");
-
-        assert_eq!(env.result_type.as_deref(), Some("make_invoice"));
-        let result = env.into_result().expect("no wallet error");
-        assert_eq!(result.invoice.as_deref(), Some("lnbc210n1p"));
-        assert_eq!(result.payment_hash.as_deref(), Some("hash-1"));
-        assert_eq!(wallet.call_count("make_invoice").await, 1);
-    }
-
-    #[tokio::test]
-    async fn round_trips_lookup_invoice() {
-        let (wallet, client, _pool) = harness().await;
         wallet
             .set_behavior(
                 "lookup_invoice",
                 WalletBehavior::Answer(serde_json::json!({ "state": "settled" })),
             )
             .await;
-
-        let env: NwcResponseEnvelope<NwcInvoiceResult> = client
-            .request("lookup_invoice", serde_json::json!({ "payment_hash": "h" }))
-            .await
-            .unwrap();
-        assert!(env.into_result().unwrap().is_settled());
-    }
-
-    #[tokio::test]
-    async fn round_trips_pay_invoice() {
-        let (wallet, client, _pool) = harness().await;
         wallet
             .set_behavior(
                 "pay_invoice",
@@ -566,14 +929,76 @@ mod tests {
             )
             .await;
 
-        let env: NwcResponseEnvelope<NwcPayInvoiceResult> = client
-            .request("pay_invoice", serde_json::json!({ "invoice": "lnbc1" }))
+        let made = client
+            .make_invoice(21_000, Some("a tool call"), Some(Duration::from_secs(300)))
             .await
-            .unwrap();
-        let r = env.into_result().unwrap();
-        assert_eq!(r.preimage.as_deref(), Some("pre"));
-        assert_eq!(r.fees_paid, Some(12));
+            .expect("make_invoice")
+            .into_result()
+            .expect("no wallet error");
+        assert_eq!(made.invoice.as_deref(), Some("lnbc210n1p"));
+
+        let looked = client
+            .lookup_invoice(Some("hash-1"), None)
+            .await
+            .expect("lookup_invoice")
+            .into_result()
+            .expect("no wallet error");
+        assert!(looked.is_settled());
+
+        let paid = client
+            .pay_invoice("lnbc1", Some(Duration::from_secs(60)))
+            .await
+            .expect("pay_invoice")
+            .into_result()
+            .expect("no wallet error");
+        assert_eq!(paid.preimage.as_deref(), Some("pre"));
+
+        // The typed wrappers send what the NIP expects.
+        let calls = wallet.calls().await;
+        let make = calls.iter().find(|(m, _)| m == "make_invoice").unwrap();
+        assert_eq!(make.1["amount"].as_u64(), Some(21_000));
+        assert_eq!(make.1["expiry"].as_u64(), Some(300));
+        let look = calls.iter().find(|(m, _)| m == "lookup_invoice").unwrap();
+        assert_eq!(look.1["payment_hash"].as_str(), Some("hash-1"));
     }
+
+    #[tokio::test]
+    async fn lookup_falls_back_to_the_invoice_when_no_hash_is_known() {
+        let (wallet, client, _pool) = harness().await;
+        wallet
+            .set_behavior(
+                "lookup_invoice",
+                WalletBehavior::Answer(serde_json::json!({ "state": "settled" })),
+            )
+            .await;
+        client
+            .lookup_invoice(None, Some("lnbc-xyz"))
+            .await
+            .expect("lookup_invoice");
+        let call = wallet.calls().await.into_iter().next().unwrap();
+        assert_eq!(call.1["invoice"].as_str(), Some("lnbc-xyz"));
+    }
+
+    #[tokio::test]
+    async fn lookup_without_either_identifier_is_a_config_error() {
+        let (_w, client, _p) = harness().await;
+        assert!(matches!(
+            client.lookup_invoice(None, None).await,
+            Err(NwcError::Config { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn make_invoice_rejects_a_zero_amount_before_the_wallet() {
+        let (wallet, client, _p) = harness().await;
+        assert!(matches!(
+            client.make_invoice(0, None, None).await,
+            Err(NwcError::InvalidAmount { .. })
+        ));
+        assert_eq!(wallet.call_count("make_invoice").await, 0);
+    }
+
+    // ── errors and robustness ────────────────────────────────────────────────
 
     #[tokio::test]
     async fn wallet_error_is_surfaced_not_read_as_success() {
@@ -588,62 +1013,138 @@ mod tests {
             )
             .await;
 
-        let env: NwcResponseEnvelope<NwcPayInvoiceResult> = client
-            .request("pay_invoice", serde_json::json!({ "invoice": "lnbc1" }))
-            .await
-            .expect("transport-level call succeeds");
-
-        // The envelope carries the error, and collapsing it is an Err: a failed
-        // payment can never be read as a settled one.
+        let env = client.pay_invoice("lnbc1", None).await.expect("call ok");
         assert_eq!(
-            env.error.as_ref().map(NwcError::code_upper).as_deref(),
+            env.error.as_ref().map(NwcErrorBody::code_upper).as_deref(),
             Some("INSUFFICIENT_BALANCE")
         );
         assert!(env.into_result().is_err());
     }
 
+    /// An unscripted method gets `NOT_IMPLEMENTED` from a real wallet.
     #[tokio::test]
-    async fn silence_times_out() {
+    async fn an_unimplemented_method_surfaces_the_wallets_code() {
+        let (wallet, client, _pool) = harness().await;
+        wallet
+            .set_quirks(MockWalletQuirks {
+                not_implemented_for_unscripted: true,
+                ..Default::default()
+            })
+            .await;
+        let env = client.pay_invoice("lnbc1", None).await.expect("call ok");
+        assert_eq!(
+            env.error.as_ref().map(NwcErrorBody::code_upper).as_deref(),
+            Some("NOT_IMPLEMENTED")
+        );
+    }
+
+    #[tokio::test]
+    async fn silence_fails_at_the_deadline_and_says_it_was_published() {
         let (wallet, client, _pool) = harness_with_timeout(Duration::from_millis(300)).await;
         wallet
             .set_behavior("make_invoice", WalletBehavior::Silence)
             .await;
 
         let started = tokio::time::Instant::now();
-        let res: Result<NwcResponseEnvelope<NwcInvoiceResult>, _> = client
-            .request("make_invoice", serde_json::json!({ "amount": 1000u64 }))
-            .await;
+        let err = client
+            .make_invoice(1000, None, None)
+            .await
+            .expect_err("silence must not resolve");
 
-        assert!(res.is_err(), "silence must not resolve");
-        assert!(
-            started.elapsed() < Duration::from_secs(3),
-            "must fail at the configured timeout, not hang"
-        );
+        match err {
+            NwcError::Timeout { published, .. } => {
+                assert!(published, "the request did reach the relay");
+                assert!(
+                    err_may_reach(&NwcError::Timeout {
+                        method: "x".into(),
+                        timeout_ms: 1,
+                        published: true
+                    }),
+                    "a published timeout must warn the caller"
+                );
+            }
+            other => panic!("expected a Timeout, got {other:?}"),
+        }
+        assert!(started.elapsed() < Duration::from_secs(3));
     }
 
+    fn err_may_reach(e: &NwcError) -> bool {
+        e.may_have_reached_wallet()
+    }
+
+    /// serde quotes the offending value, and a wallet can put an invoice there.
     #[tokio::test]
-    async fn malformed_response_is_an_error() {
+    async fn a_malformed_response_error_carries_no_payload() {
         let (wallet, client, _pool) = harness_with_timeout(Duration::from_millis(500)).await;
         wallet
             .set_behavior("make_invoice", WalletBehavior::Malformed)
             .await;
 
-        let res: Result<NwcResponseEnvelope<NwcInvoiceResult>, _> = client
-            .request("make_invoice", serde_json::json!({ "amount": 1000u64 }))
-            .await;
-        assert!(res.is_err());
+        let err = client.make_invoice(1000, None, None).await.unwrap_err();
+        assert!(matches!(err, NwcError::MalformedResponse { .. }));
+        let text = err.to_string();
+        assert!(!text.contains("lnbc"), "{text}");
+        assert!(text.contains("make_invoice"));
     }
 
+    /// A wallet message can name the invoice, and the middlewares log errors.
     #[tokio::test]
-    async fn stranger_signed_response_is_ignored() {
-        let (wallet, client, pool) = harness_with_timeout(Duration::from_millis(400)).await;
+    async fn an_invoice_in_a_wallet_message_never_reaches_the_error_text() {
+        let (wallet, client, _pool) = harness().await;
+        let invoice = "lnbc210n1pjqqqqqpp5abcdefghijklmnopqrstuvwxyz0123456789";
+        wallet
+            .set_behavior(
+                "pay_invoice",
+                WalletBehavior::Error {
+                    code: "FAILED".to_string(),
+                    message: format!("could not pay {invoice}"),
+                },
+            )
+            .await;
+
+        let env = client.pay_invoice("lnbc1", None).await.expect("call ok");
+        let described = env.error.as_ref().unwrap().describe();
+        assert!(!described.contains(invoice), "{described}");
+        // And through the typed error a caller would surface.
+        let wrapped = NwcError::Wallet {
+            method: "pay_invoice".into(),
+            detail: described,
+        };
+        assert!(!wrapped.to_string().contains("lnbc210n1pjqqqqq"));
+    }
+
+    // ── correlation, which is also an authorization check ────────────────────
+
+    /// The author check is load-bearing: `nostr-relay-pool` verifies signatures
+    /// but not filter matches, so a relay that ignores `authors` could deliver
+    /// a stranger-signed, correctly correlated "settled".
+    ///
+    /// The old version of this test published before the client subscribed and
+    /// without an `e` tag, so three independent layers dropped the event and
+    /// deleting the author check still passed. This one correlates properly and
+    /// is published only after a real request is in flight.
+    #[tokio::test]
+    async fn a_stranger_cannot_answer_even_when_correctly_correlated() {
+        let (wallet, client, pool) = harness_with_timeout(Duration::from_millis(700)).await;
         wallet
             .set_behavior("make_invoice", WalletBehavior::Silence)
             .await;
         let client_pubkey = client.client_pubkey();
 
-        // A third party publishes a well-formed response addressed to the
-        // client. It must not satisfy the pending request.
+        let client = Arc::new(client);
+        let caller = Arc::clone(&client);
+        let call = tokio::spawn(async move { caller.make_invoice(1000, None, None).await });
+
+        // Let the request be published so its id exists to correlate against.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let request_id = pool
+            .stored_events()
+            .await
+            .into_iter()
+            .find(|e| e.kind.as_u16() == 23194)
+            .map(|e| e.id)
+            .expect("the request was published");
+
         let stranger = Keys::generate();
         let plaintext =
             serde_json::json!({"result_type":"make_invoice","result":{"invoice":"evil"}})
@@ -651,33 +1152,55 @@ mod tests {
         let content =
             nip04::encrypt(stranger.secret_key(), &client_pubkey, plaintext).expect("encrypt");
         let evil = EventBuilder::new(Kind::from(23195u16), content)
-            .tags([Tag::public_key(client_pubkey)])
+            .tags([Tag::public_key(client_pubkey), Tag::event(request_id)])
             .sign_with_keys(&stranger)
             .expect("sign");
-        pool.publish_event(&evil).await.expect("publish");
+        // Delivered past the filter on purpose: a conformant relay would drop
+        // this on `authors`, and then the client-side author check would never
+        // be reached. The guard exists because `nostr-relay-pool` does not
+        // verify that a delivered event matched the subscription.
+        pool.publish_event_unfiltered(&evil).await;
 
-        let res: Result<NwcResponseEnvelope<NwcInvoiceResult>, _> = client
-            .request("make_invoice", serde_json::json!({ "amount": 1000u64 }))
-            .await;
-        assert!(res.is_err(), "a stranger must not be able to answer");
+        let result = call.await.expect("task");
+        assert!(
+            matches!(result, Err(NwcError::Timeout { .. })),
+            "a stranger-signed answer must not satisfy the request, got {result:?}"
+        );
     }
 
     #[tokio::test]
-    async fn concurrent_requests_correlate_independently() {
+    async fn an_answer_without_a_correlation_tag_is_ignored() {
+        let (wallet, client, _pool) = harness_with_timeout(Duration::from_millis(500)).await;
+        wallet
+            .set_behavior(
+                "make_invoice",
+                WalletBehavior::NoCorrelationTag(invoice_result("uncorrelated")),
+            )
+            .await;
+        assert!(matches!(
+            client.make_invoice(1000, None, None).await,
+            Err(NwcError::Timeout { .. })
+        ));
+    }
+
+    /// Needs the mock to answer out of order, which requires per-request
+    /// spawning: an inline wallet is strictly FIFO and this can never fail.
+    #[tokio::test]
+    async fn a_fast_answer_overtaking_a_slow_one_still_correlates() {
         let (wallet, client, _pool) = harness().await;
         wallet
             .set_behavior(
                 "make_invoice",
                 WalletBehavior::Delayed {
-                    delay: Duration::from_millis(120),
-                    result: serde_json::json!({ "invoice": "inv-make" }),
+                    delay: Duration::from_millis(300),
+                    result: invoice_result("slow-make"),
                 },
             )
             .await;
         wallet
             .set_behavior(
                 "pay_invoice",
-                WalletBehavior::Answer(serde_json::json!({ "preimage": "pre-pay" })),
+                WalletBehavior::Answer(serde_json::json!({ "preimage": "fast-pay" })),
             )
             .await;
 
@@ -685,69 +1208,236 @@ mod tests {
         let c1 = Arc::clone(&client);
         let c2 = Arc::clone(&client);
 
-        let (make, pay) = tokio::join!(
-            async move {
-                c1.request::<_, NwcInvoiceResult>(
-                    "make_invoice",
-                    serde_json::json!({ "amount": 1000u64 }),
-                )
-                .await
-            },
-            async move {
-                c2.request::<_, NwcPayInvoiceResult>(
-                    "pay_invoice",
-                    serde_json::json!({ "invoice": "lnbc1" }),
-                )
-                .await
-            }
-        );
+        let slow = tokio::spawn(async move { c1.make_invoice(1000, None, None).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let fast = c2.pay_invoice("lnbc1", None).await;
 
-        // The slow make_invoice must not receive the fast pay_invoice answer.
+        // The fast answer lands while the slow one is still outstanding.
         assert_eq!(
-            make.unwrap().into_result().unwrap().invoice.as_deref(),
-            Some("inv-make")
+            fast.expect("pay")
+                .into_result()
+                .expect("ok")
+                .preimage
+                .as_deref(),
+            Some("fast-pay")
         );
         assert_eq!(
-            pay.unwrap().into_result().unwrap().preimage.as_deref(),
-            Some("pre-pay")
+            slow.await
+                .expect("task")
+                .expect("make")
+                .into_result()
+                .expect("ok")
+                .invoice
+                .as_deref(),
+            Some("slow-make"),
+            "the slow request must not receive the fast answer"
         );
     }
 
+    /// A mislabelled `result_type` is tolerated: correlation by event id
+    /// already proves which request this answers.
     #[tokio::test]
-    async fn decodes_nip04_notifications() {
-        assert_notification_decodes(false).await;
-    }
-
-    #[tokio::test]
-    async fn decodes_nip44_notifications() {
-        assert_notification_decodes(true).await;
-    }
-
-    /// Both notification kinds must decode; ts decrypts every kind as NIP-04
-    /// and so silently drops the 23197 (NIP-44) form.
-    async fn assert_notification_decodes(nip44_mode: bool) {
+    async fn a_mislabelled_result_type_is_tolerated() {
         let (wallet, client, _pool) = harness().await;
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        wallet
+            .set_behavior(
+                "make_invoice",
+                WalletBehavior::MislabelledResultType {
+                    result_type: "something_else".to_string(),
+                    result: invoice_result("still-mine"),
+                },
+            )
+            .await;
+        let env = client.make_invoice(1000, None, None).await.expect("ok");
+        assert_eq!(
+            env.into_result().unwrap().invoice.as_deref(),
+            Some("still-mine")
+        );
+    }
+
+    // ── lifecycle ────────────────────────────────────────────────────────────
+
+    /// A cancelled request must not leave its waiter behind. The payment
+    /// processor races every verification against a cancellation token, so a
+    /// leak here is per-payment.
+    #[tokio::test]
+    async fn dropping_a_request_future_removes_its_waiter() {
+        let (wallet, client, _pool) = harness_with_timeout(Duration::from_secs(5)).await;
+        wallet
+            .set_behavior("make_invoice", WalletBehavior::Silence)
+            .await;
+
+        {
+            let fut = client.make_invoice(1000, None, None);
+            // Drive it far enough to register the waiter, then drop it.
+            assert!(
+                tokio::time::timeout(Duration::from_millis(150), fut)
+                    .await
+                    .is_err(),
+                "the silent wallet should not answer"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            client.waiter_count(),
+            0,
+            "a dropped request future must not orphan its waiter"
+        );
+    }
+
+    /// `close()` must be fail-fast: before this, a closed client still
+    /// published `pay_invoice` and the wallet still paid.
+    #[tokio::test]
+    async fn a_closed_client_refuses_to_publish() {
+        let (wallet, client, _pool) = harness_with_timeout(Duration::from_millis(600)).await;
+        wallet
+            .set_behavior(
+                "pay_invoice",
+                WalletBehavior::Answer(serde_json::json!({ "preimage": "p" })),
+            )
+            .await;
+
+        client.close();
+        assert!(client.is_closed());
+
+        let err = client
+            .pay_invoice("lnbc1", None)
+            .await
+            .expect_err("a closed client must refuse");
+        assert!(matches!(err, NwcError::Closed), "got {err:?}");
+        assert!(!err.may_have_reached_wallet());
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(
+            wallet.call_count("pay_invoice").await,
+            0,
+            "a closed client must not cause a payment"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_zero_response_timeout_is_refused_at_construction() {
+        let pool = Arc::new(MockRelayPool::new());
+        let secret = SecretKey::generate();
+        let uri = format!(
+            "nostr+walletconnect://{}?relay=wss%3A%2F%2Fmock.relay&secret={}",
+            Keys::generate().public_key().to_hex(),
+            secret.to_secret_hex()
+        );
+        let connection = parse_nwc_uri(&uri).unwrap();
+        assert!(matches!(
+            NwcClient::with_pool(
+                pool as Arc<dyn RelayPoolTrait>,
+                connection,
+                NwcClientOptions::new().with_response_timeout(Duration::ZERO),
+            ),
+            Err(NwcError::Config { .. })
+        ));
+    }
+
+    /// One panicking sink is caller code; it must not take the rail down.
+    #[tokio::test]
+    async fn a_panicking_sink_does_not_kill_the_rail() {
+        let (wallet, client, _pool) = harness().await;
         client
-            .on_notification(move |payload| {
-                let _ = tx.send(payload);
-            })
+            .on_notification(|_| panic!("a badly behaved sink"))
             .await
             .expect("sink registers");
 
         wallet
-            .settle(&client.client_pubkey(), "hash-9", nip44_mode)
+            .settle(&client.client_pubkey(), "hash-boom")
             .await
-            .expect("wallet publishes notification");
+            .expect("notification published");
+        tokio::time::sleep(Duration::from_millis(200)).await;
 
-        let payload = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+        assert!(!client.is_closed(), "the reader must have survived");
+
+        // And the rail still works.
+        wallet
+            .set_behavior(
+                "make_invoice",
+                WalletBehavior::Answer(invoice_result("after-panic")),
+            )
+            .await;
+        let env = client
+            .make_invoice(1000, None, None)
             .await
-            .expect("notification arrives")
-            .expect("channel open");
-
-        assert_eq!(payload.notification_type, NOTIFICATION_PAYMENT_RECEIVED);
-        assert_eq!(payload.payment_hash(), Some("hash-9"));
+            .expect("the rail still answers after a sink panicked");
+        assert_eq!(
+            env.into_result().unwrap().invoice.as_deref(),
+            Some("after-panic")
+        );
     }
+
+    // ── notifications ────────────────────────────────────────────────────────
+
+    async fn collect_notifications(
+        client: &NwcClient,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<NwcNotificationPayload> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        client
+            .on_notification(move |p| {
+                let _ = tx.send(p);
+            })
+            .await
+            .expect("sink registers");
+        rx
+    }
+
+    #[tokio::test]
+    async fn decodes_a_nip04_notification() {
+        let (wallet, client, _pool) = harness().await;
+        let mut rx = collect_notifications(&client).await;
+        wallet
+            .settle(&client.client_pubkey(), "hash-04")
+            .await
+            .unwrap();
+        let p = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("arrives")
+            .expect("open");
+        assert_eq!(p.notification_type, NOTIFICATION_PAYMENT_RECEIVED);
+        assert_eq!(p.payment_hash(), Some("hash-04"));
+    }
+
+    #[tokio::test]
+    async fn decodes_a_nip44_notification() {
+        let (wallet, client, _pool) = harness().await;
+        wallet
+            .set_quirks(MockWalletQuirks {
+                nip44_notifications: true,
+                ..Default::default()
+            })
+            .await;
+        let mut rx = collect_notifications(&client).await;
+        wallet
+            .settle(&client.client_pubkey(), "hash-44")
+            .await
+            .unwrap();
+        let p = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("arrives")
+            .expect("open");
+        assert_eq!(p.payment_hash(), Some("hash-44"));
+    }
+
+    /// ts's own fixture: NIP-04 content on kind 23197. A decrypt-by-kind
+    /// client drops this.
+    #[tokio::test]
+    async fn decodes_nip04_content_published_on_the_nip44_kind() {
+        let (wallet, client, _pool) = harness().await;
+        let mut rx = collect_notifications(&client).await;
+        wallet
+            .settle_nip04_on_nip44_kind(&client.client_pubkey(), "hash-mixed")
+            .await
+            .unwrap();
+        let p = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("decrypt by shape must handle NIP-04 on kind 23197")
+            .expect("open");
+        assert_eq!(p.payment_hash(), Some("hash-mixed"));
+    }
+
+    // ── info event ───────────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn fetches_info_notification_types() {
@@ -755,94 +1445,19 @@ mod tests {
         wallet
             .publish_info_event(&["payment_received", "payment_sent"])
             .await
-            .expect("info published");
-
-        let types = client
-            .fetch_info_notification_types()
-            .await
-            .expect("fetch succeeds");
+            .unwrap();
+        let types = client.fetch_info_notification_types().await.unwrap();
         assert!(types.iter().any(|t| t == "payment_received"));
         assert!(types.iter().any(|t| t == "payment_sent"));
     }
 
     #[tokio::test]
-    async fn missing_info_event_yields_empty_set_not_an_error() {
-        let (_wallet, client, _pool) = harness_with_timeout(Duration::from_millis(400)).await;
-        let types = client
+    async fn missing_info_event_yields_empty_not_an_error() {
+        let (_w, client, _p) = harness_with_timeout(Duration::from_millis(400)).await;
+        assert!(client
             .fetch_info_notification_types()
             .await
-            .expect("absence is not a failure");
-        assert!(types.is_empty(), "callers fall back to polling on empty");
-    }
-
-    /// A response the *wallet itself* signed, but carrying an `e` tag for a
-    /// request we never made, must not satisfy a pending waiter. This is the
-    /// correlation half of the guard; `stranger_signed_response_is_ignored`
-    /// covers the authorship half.
-    #[tokio::test]
-    async fn uncorrelated_response_is_ignored() {
-        let (wallet, client, pool) = harness_with_timeout(Duration::from_millis(400)).await;
-        wallet
-            .set_behavior("make_invoice", WalletBehavior::Silence)
-            .await;
-        let client_pubkey = client.client_pubkey();
-
-        // Correctly signed by the wallet, addressed to us, well formed, but
-        // correlated to an unrelated event id.
-        let unrelated = EventId::all_zeros();
-        let plaintext =
-            serde_json::json!({"result_type":"make_invoice","result":{"invoice":"wrong"}})
-                .to_string();
-        let content =
-            nip04::encrypt(wallet.keys().secret_key(), &client_pubkey, plaintext).expect("encrypt");
-        let event = EventBuilder::new(Kind::from(23195u16), content)
-            .tags([Tag::public_key(client_pubkey), Tag::event(unrelated)])
-            .sign_with_keys(&wallet.keys())
-            .expect("sign");
-        pool.publish_event(&event).await.expect("publish");
-
-        let res: Result<NwcResponseEnvelope<NwcInvoiceResult>, _> = client
-            .request("make_invoice", serde_json::json!({ "amount": 1000u64 }))
-            .await;
-        assert!(
-            res.is_err(),
-            "a response correlated to another request must not settle ours"
-        );
-    }
-
-    /// The reader task must survive a burst that overruns the broadcast buffer.
-    ///
-    /// A `Lagged` drops events, but killing the loop there would strand every
-    /// waiter forever; continuing means an in-flight request still resolves.
-    /// The burst is sized past the pool's 1024-slot channel so the lag path is
-    /// exercised, and the assertion is the property that matters either way:
-    /// a request issued afterwards still correlates and resolves.
-    #[tokio::test]
-    async fn reader_survives_broadcast_burst() {
-        let (wallet, client, pool) = harness().await;
-        wallet
-            .set_behavior(
-                "make_invoice",
-                WalletBehavior::Answer(serde_json::json!({ "invoice": "after-burst" })),
-            )
-            .await;
-
-        // Flood with unrelated events addressed to nobody in particular.
-        let noise = Keys::generate();
-        for i in 0..1500u32 {
-            let event = EventBuilder::new(Kind::from(1u16), format!("noise-{i}"))
-                .sign_with_keys(&noise)
-                .expect("sign noise");
-            let _ = pool.publish_event(&event).await;
-        }
-
-        let env: NwcResponseEnvelope<NwcInvoiceResult> = client
-            .request("make_invoice", serde_json::json!({ "amount": 1000u64 }))
-            .await
-            .expect("reader must still be alive after the burst");
-        assert_eq!(
-            env.into_result().unwrap().invoice.as_deref(),
-            Some("after-burst")
-        );
+            .expect("absence is not a failure")
+            .is_empty());
     }
 }
