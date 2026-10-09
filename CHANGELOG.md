@@ -151,6 +151,16 @@
   composes its tags exactly as the normal response path does: discovery tags and the
   effective-mode disclosure behind the same one-shot latches, and `cap` pricing tags on a
   capability-list result.
+- Discoverability publication (kind 10002 relay list and kind 0 profile metadata) failed
+  with `Transport error: relay not found` whenever the default bootstrap relays were part
+  of the publish set: the events were sent through the main relay pool, which rejects any
+  targeted send that includes a relay it isn't connected to, and the bootstrap relays are
+  never added to that pool. Publication now goes through a short-lived dedicated
+  connection to exactly the target relays (advertised + bootstrap), waits up to 10 s for
+  the first socket before the first send round, retries rounds that earn no acceptance
+  every 30 s for up to 5 minutes, and logs each refusing relay's own reason instead of
+  swallowing it. A round where at least one relay accepts is a success even if others
+  refused; total refusal now surfaces as an error instead of being reported as published.
 
 ### Changed
 

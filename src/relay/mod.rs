@@ -14,6 +14,15 @@ use nostr_sdk::prelude::*;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Log target for relay pool internals.
+const LOG_TARGET: &str = "contextvm_sdk::relay";
+
+/// How long `publish_to` waits for at least one socket before sending.
+const PUBLISH_TO_CONNECT_WAIT: Duration = Duration::from_secs(10);
+
+/// Poll interval while waiting for the first socket.
+const PUBLISH_TO_CONNECT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
 /// Trait abstracting relay pool operations, enabling dependency injection and testing.
 #[async_trait]
 pub trait RelayPoolTrait: Send + Sync {
@@ -142,13 +151,66 @@ impl RelayPool {
     }
 
     /// Sign and publish an event to specific relay URLs.
+    ///
+    /// Publishes through a short-lived dedicated connection to exactly these
+    /// relays — they do not need to be members of this pool. Waits up to
+    /// [`PUBLISH_TO_CONNECT_WAIT`] for at least one socket before sending, so a
+    /// still-connecting relay reports a real outcome instead of a silent
+    /// no-answer. Per-relay refusals are logged with the relay's own reason;
+    /// returns [`Error::Transport`] when no relay accepted the event.
     pub async fn publish_to(&self, urls: &[String], builder: EventBuilder) -> Result<EventId> {
-        let output = self
-            .client
-            .send_event_builder_to(urls, builder)
-            .await
-            .map_err(|e| Error::Transport(e.to_string()))?;
-        Ok(output.val)
+        let event = self.sign(builder).await?;
+        let client = Client::builder().build();
+        for url in urls {
+            client
+                .add_relay(url.as_str())
+                .await
+                .map_err(|e| Error::Transport(e.to_string()))?;
+        }
+        client.connect().await;
+
+        // Bounded wait for the first connected socket before the send round.
+        let deadline = tokio::time::Instant::now() + PUBLISH_TO_CONNECT_WAIT;
+        loop {
+            let relays = client.relays().await;
+            if relays.is_empty()
+                || relays
+                    .values()
+                    .any(|r| matches!(r.status(), RelayStatus::Connected))
+            {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(PUBLISH_TO_CONNECT_POLL_INTERVAL).await;
+        }
+
+        let result = async {
+            let output = client
+                .send_event_to(urls, &event)
+                .await
+                .map_err(|e| Error::Transport(e.to_string()))?;
+            for (url, reason) in &output.failed {
+                tracing::warn!(
+                    target: LOG_TARGET,
+                    relay = %url,
+                    reason = %reason,
+                    "Relay refused discoverability event"
+                );
+            }
+            if output.success.is_empty() {
+                return Err(Error::Transport(format!(
+                    "no relay accepted the event: {:?}",
+                    output.failed
+                )));
+            }
+            Ok(output.val)
+        }
+        .await;
+
+        client.disconnect().await;
+        result
     }
 
     /// Fetch events matching filters from connected relays.

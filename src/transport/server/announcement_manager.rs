@@ -23,6 +23,16 @@ const LOG_TARGET: &str = "contextvm_sdk::transport::server::announcement";
 #[cfg_attr(not(feature = "rmcp"), allow(dead_code))]
 const ANNOUNCEMENT_INIT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Interval between discoverability publish retry rounds.
+const DISCOVERABILITY_RETRY_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Overall deadline for discoverability publish retries; after this the
+/// publication gives up and says so. Periodic refresh is out of scope here.
+const DISCOVERABILITY_PUBLISH_DEADLINE: Duration = Duration::from_secs(300);
+
+/// Cap for a single discoverability publish round (connect + send + OKs).
+const DISCOVERABILITY_ROUND_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Manages tag composition and publishing for server announcements.
 ///
 /// Handles CEP-6 announcement event publishing (kinds 11316–11320) and
@@ -128,6 +138,104 @@ fn is_local_relay_url(url: &str) -> bool {
         }
     }
     false
+}
+
+/// Publish profile and relay-list builders to the discoverability relay set.
+///
+/// Each event is retried until accepted or until
+/// [`DISCOVERABILITY_PUBLISH_DEADLINE`] passes; failures are logged and the
+/// task completes either way.
+async fn publish_discoverability_events(
+    relay_pool: Arc<dyn RelayPoolTrait>,
+    target_urls: Vec<String>,
+    profile_event: Option<EventBuilder>,
+    relay_list_event: Option<EventBuilder>,
+) {
+    if let Some(builder) = profile_event {
+        match publish_with_retry(&relay_pool, &target_urls, builder).await {
+            Ok(id) => tracing::info!(
+                target: LOG_TARGET,
+                event_id = %id,
+                "Published profile metadata (kind 0)"
+            ),
+            Err(e) => tracing::warn!(
+                target: LOG_TARGET,
+                error = %e,
+                "Failed to publish profile metadata"
+            ),
+        }
+    }
+    if let Some(builder) = relay_list_event {
+        match publish_with_retry(&relay_pool, &target_urls, builder).await {
+            Ok(id) => tracing::info!(
+                target: LOG_TARGET,
+                event_id = %id,
+                "Published relay list (kind 10002)"
+            ),
+            Err(e) => tracing::warn!(
+                target: LOG_TARGET,
+                error = %e,
+                "Failed to publish relay list"
+            ),
+        }
+    }
+    tracing::info!(
+        target: LOG_TARGET,
+        "Discoverability event publishing complete"
+    );
+}
+
+/// Publish one event to the discoverability relay set with bounded retries.
+///
+/// Falls back to a pool-wide publish when `urls` is empty. A round that earns
+/// no acceptance from any relay is retried every
+/// [`DISCOVERABILITY_RETRY_INTERVAL`] until
+/// [`DISCOVERABILITY_PUBLISH_DEADLINE`] passes; one that earns an acceptance is
+/// done even if other relays refused (their reasons are logged by the pool).
+async fn publish_with_retry(
+    relay_pool: &Arc<dyn RelayPoolTrait>,
+    urls: &[String],
+    builder: EventBuilder,
+) -> Result<EventId> {
+    if urls.is_empty() {
+        return relay_pool.publish(builder).await;
+    }
+    let deadline = tokio::time::Instant::now() + DISCOVERABILITY_PUBLISH_DEADLINE;
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        // ponytail: a timed-out round drops the temp pool without disconnect;
+        // nostr-sdk relays tear down with their handles — revisit on leak reports.
+        let round = tokio::time::timeout(
+            DISCOVERABILITY_ROUND_TIMEOUT,
+            relay_pool.publish_to(urls, builder.clone()),
+        )
+        .await;
+        match round {
+            Ok(Ok(id)) => return Ok(id),
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    target: LOG_TARGET,
+                    attempt,
+                    error = %e,
+                    "Discoverability publish round failed"
+                );
+            }
+            Err(_) => {
+                tracing::warn!(
+                    target: LOG_TARGET,
+                    attempt,
+                    "Discoverability publish round timed out"
+                );
+            }
+        }
+        if tokio::time::Instant::now() + DISCOVERABILITY_RETRY_INTERVAL >= deadline {
+            return Err(Error::Transport(format!(
+                "gave up after {attempt} attempts: no relay accepted the event"
+            )));
+        }
+        tokio::time::sleep(DISCOVERABILITY_RETRY_INTERVAL).await;
+    }
 }
 
 impl AnnouncementManager {
@@ -548,19 +656,18 @@ impl AnnouncementManager {
     /// when the merged set is empty.
     #[cfg(test)]
     async fn publish_to_discoverability_relays(&self, builder: EventBuilder) -> Result<EventId> {
-        let urls = self.get_discoverability_publish_relay_urls();
-        if urls.is_empty() {
-            self.relay_pool.publish(builder).await
-        } else {
-            self.relay_pool.publish_to(&urls, builder).await
-        }
+        publish_with_retry(
+            &self.relay_pool,
+            &self.get_discoverability_publish_relay_urls(),
+            builder,
+        )
+        .await
     }
 
     /// Spawn a task to publish profile metadata and relay list.
     ///
     /// Unconditional — guards live inside the individual publish methods.
     /// Event-building logic mirrors `publish_relay_list()` and `publish_profile_metadata()`.
-    /// Duplication is intentional — `&self` can't be moved into a spawned task in Rust.
     #[cfg_attr(not(feature = "rmcp"), allow(dead_code))]
     pub(crate) fn spawn_publish_discoverability(&self) -> tokio::task::JoinHandle<()> {
         let relay_pool = Arc::clone(&self.relay_pool);
@@ -588,50 +695,12 @@ impl AnnouncementManager {
             None
         };
 
-        tokio::spawn(async move {
-            if let Some(builder) = profile_event {
-                let result = if target_urls.is_empty() {
-                    relay_pool.publish(builder).await
-                } else {
-                    relay_pool.publish_to(&target_urls, builder).await
-                };
-                match result {
-                    Ok(id) => tracing::info!(
-                        target: LOG_TARGET,
-                        event_id = %id,
-                        "Published profile metadata (kind 0)"
-                    ),
-                    Err(e) => tracing::warn!(
-                        target: LOG_TARGET,
-                        error = %e,
-                        "Failed to publish profile metadata"
-                    ),
-                }
-            }
-            if let Some(builder) = relay_list_event {
-                let result = if target_urls.is_empty() {
-                    relay_pool.publish(builder).await
-                } else {
-                    relay_pool.publish_to(&target_urls, builder).await
-                };
-                match result {
-                    Ok(id) => tracing::info!(
-                        target: LOG_TARGET,
-                        event_id = %id,
-                        "Published relay list (kind 10002)"
-                    ),
-                    Err(e) => tracing::warn!(
-                        target: LOG_TARGET,
-                        error = %e,
-                        "Failed to publish relay list"
-                    ),
-                }
-            }
-            tracing::info!(
-                target: LOG_TARGET,
-                "Discoverability event publishing complete"
-            );
-        })
+        tokio::spawn(publish_discoverability_events(
+            relay_pool,
+            target_urls,
+            profile_event,
+            relay_list_event,
+        ))
     }
 
     // ── Event loop support ─────────────────────────────────────────
@@ -1761,67 +1830,81 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use crate::relay::mock::MockRelayPool;
+
+    /// A relay pool whose `publish`/`publish_to` fail while `failures_before_ok`
+    /// calls remain; counts `publish_to` calls.
+    struct FailingPool {
+        inner: MockRelayPool,
+        failures_before_ok: AtomicU32,
+        calls: AtomicU32,
+    }
+
+    impl FailingPool {
+        /// Consume one pending failure; reports whether this call must fail.
+        fn should_fail(&self) -> bool {
+            self.failures_before_ok
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RelayPoolTrait for FailingPool {
+        async fn connect(&self, urls: &[String]) -> Result<()> {
+            self.inner.connect(urls).await
+        }
+        async fn disconnect(&self) -> Result<()> {
+            self.inner.disconnect().await
+        }
+        async fn publish_event(&self, event: &Event) -> Result<EventId> {
+            self.inner.publish_event(event).await
+        }
+        async fn publish(&self, builder: EventBuilder) -> Result<EventId> {
+            if self.should_fail() {
+                return Err(Error::Transport("injected publish failure".into()));
+            }
+            self.inner.publish(builder).await
+        }
+        async fn sign(&self, builder: EventBuilder) -> Result<Event> {
+            self.inner.sign(builder).await
+        }
+        async fn signer(&self) -> Result<Arc<dyn NostrSigner>> {
+            self.inner.signer().await
+        }
+        fn notifications(&self) -> tokio::sync::broadcast::Receiver<RelayPoolNotification> {
+            self.inner.notifications()
+        }
+        async fn public_key(&self) -> Result<PublicKey> {
+            self.inner.public_key().await
+        }
+        async fn subscribe(&self, filters: Vec<Filter>) -> Result<()> {
+            self.inner.subscribe(filters).await
+        }
+        async fn publish_to(&self, urls: &[String], builder: EventBuilder) -> Result<EventId> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.should_fail() {
+                return Err(Error::Transport("injected publish failure".into()));
+            }
+            self.inner.publish_to(urls, builder).await
+        }
+        async fn fetch_events(
+            &self,
+            filters: Vec<Filter>,
+            timeout: Duration,
+        ) -> Result<Vec<Event>> {
+            self.inner.fetch_events(filters, timeout).await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn publish_profile_metadata_publish_error_does_not_panic() {
-        use crate::relay::mock::MockRelayPool;
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        /// A relay pool that fails on publish when the flag is set.
-        struct FailingPool {
-            inner: MockRelayPool,
-            should_fail: AtomicBool,
-        }
-
-        #[async_trait::async_trait]
-        impl RelayPoolTrait for FailingPool {
-            async fn connect(&self, urls: &[String]) -> Result<()> {
-                self.inner.connect(urls).await
-            }
-            async fn disconnect(&self) -> Result<()> {
-                self.inner.disconnect().await
-            }
-            async fn publish_event(&self, event: &Event) -> Result<EventId> {
-                self.inner.publish_event(event).await
-            }
-            async fn publish(&self, builder: EventBuilder) -> Result<EventId> {
-                if self.should_fail.load(Ordering::SeqCst) {
-                    return Err(Error::Transport("injected publish failure".into()));
-                }
-                self.inner.publish(builder).await
-            }
-            async fn sign(&self, builder: EventBuilder) -> Result<Event> {
-                self.inner.sign(builder).await
-            }
-            async fn signer(&self) -> Result<Arc<dyn NostrSigner>> {
-                self.inner.signer().await
-            }
-            fn notifications(&self) -> tokio::sync::broadcast::Receiver<RelayPoolNotification> {
-                self.inner.notifications()
-            }
-            async fn public_key(&self) -> Result<PublicKey> {
-                self.inner.public_key().await
-            }
-            async fn subscribe(&self, filters: Vec<Filter>) -> Result<()> {
-                self.inner.subscribe(filters).await
-            }
-            async fn publish_to(&self, urls: &[String], builder: EventBuilder) -> Result<EventId> {
-                if self.should_fail.load(Ordering::SeqCst) {
-                    return Err(Error::Transport("injected publish failure".into()));
-                }
-                self.inner.publish_to(urls, builder).await
-            }
-            async fn fetch_events(
-                &self,
-                filters: Vec<Filter>,
-                timeout: Duration,
-            ) -> Result<Vec<Event>> {
-                self.inner.fetch_events(filters, timeout).await
-            }
-        }
-
         let pool: Arc<dyn RelayPoolTrait> = Arc::new(FailingPool {
             inner: MockRelayPool::new(),
-            should_fail: AtomicBool::new(true),
+            failures_before_ok: AtomicU32::new(u32::MAX),
+            calls: AtomicU32::new(0),
         });
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let metadata = ProfileMetadata::default().with_name("Err Server");
@@ -1843,6 +1926,53 @@ mod tests {
         assert!(
             result.is_ok(),
             "publish_profile_metadata should swallow publish errors"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn discoverability_publish_retries_until_accepted() {
+        let pool = Arc::new(FailingPool {
+            inner: MockRelayPool::new(),
+            failures_before_ok: AtomicU32::new(2),
+            calls: AtomicU32::new(0),
+        });
+        let builder = EventBuilder::new(Kind::Custom(0), "{}");
+
+        let result = publish_with_retry(
+            &(pool.clone() as Arc<dyn RelayPoolTrait>),
+            &["wss://relay.example.com".to_string()],
+            builder,
+        )
+        .await;
+
+        assert!(result.is_ok(), "third round should succeed: {result:?}");
+        assert_eq!(
+            pool.calls.load(Ordering::SeqCst),
+            3,
+            "two failures should be followed by exactly one more round"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn discoverability_publish_gives_up_after_deadline() {
+        let pool = Arc::new(FailingPool {
+            inner: MockRelayPool::new(),
+            failures_before_ok: AtomicU32::new(u32::MAX),
+            calls: AtomicU32::new(0),
+        });
+        let builder = EventBuilder::new(Kind::Custom(0), "{}");
+
+        let result = publish_with_retry(
+            &(pool.clone() as Arc<dyn RelayPoolTrait>),
+            &["wss://relay.example.com".to_string()],
+            builder,
+        )
+        .await;
+
+        assert!(result.is_err(), "publication must give up: {result:?}");
+        assert!(
+            pool.calls.load(Ordering::SeqCst) > 1,
+            "publication must have retried before giving up"
         );
     }
 
