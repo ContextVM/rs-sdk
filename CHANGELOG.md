@@ -6,6 +6,24 @@
 
 - CEP-8 capability pricing and payments (in progress; foundational pieces, not yet a
   usable payment flow):
+  - NIP-47 (Nostr Wallet Connect) client infrastructure, letting a server issue and a
+    client pay Lightning BOLT11 invoices through a Nostr Wallet Connect wallet, behind
+    the off-by-default `nwc` feature. Enabling it pulls in NIP-04 and so adds `aes`,
+    `cbc` and `cipher` to the dependency tree. `parse_nwc_uri` reads a
+    connection string in either shape wallets emit, including the
+    `nostr+walletconnect:<pubkey>?...` pathname form that
+    `NostrWalletConnectURI::parse` rejects and the ts-sdk accepts. `NwcClient` speaks
+    request/response and notifications over an injected `RelayPoolTrait`, so the same code
+    path runs against a scripted mock wallet in CI and a real wallet in production. Because
+    `RelayPoolTrait` has no unsubscribe, it holds one subscription and one reader task and
+    correlates responses in process by request event id, rather than the ts-sdk
+    subscription-per-request shape that would leak one live REQ per payment. Wallet
+    responses are parsed permissively field for field, so a missing or unknown optional
+    field cannot turn a paid invoice into a failed verification, and notifications are
+    decrypted by kind (23196 NIP-04, 23197 NIP-44) rather than always as NIP-04. A
+    `MockWallet` behind `test-utils` scripts answers, errors, silence, delays and malformed
+    replies over a linked `MockRelayPool`, and can publish a `payment_received`
+    notification to drive settlement.
   - Server-side payment-interaction negotiation and advertisement: the server transport
     now parses client `pmi` and `payment_interaction` tags, negotiates the effective
     session mode (`transparent` by default, `explicit_gating` when the server policy
