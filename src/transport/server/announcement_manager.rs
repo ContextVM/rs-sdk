@@ -1848,9 +1848,23 @@ mod tests {
     impl FailingPool {
         /// Consume one pending failure; reports whether this call must fail.
         fn should_fail(&self) -> bool {
-            self.failures_before_ok
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-                .is_ok()
+            // CAS loop: `fetch_update` is deprecated on new toolchains and its
+            // rename `try_update` does not exist on the MSRV.
+            let mut current = self.failures_before_ok.load(Ordering::SeqCst);
+            loop {
+                if current == 0 {
+                    return false;
+                }
+                match self.failures_before_ok.compare_exchange(
+                    current,
+                    current - 1,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                ) {
+                    Ok(_) => return true,
+                    Err(next) => current = next,
+                }
+            }
         }
     }
 
