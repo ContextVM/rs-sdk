@@ -6,6 +6,54 @@
 
 - CEP-8 capability pricing and payments (in progress; foundational pieces, not yet a
   usable payment flow):
+  - NIP-47 (Nostr Wallet Connect) client infrastructure, letting a server issue and a
+    client pay Lightning BOLT11 invoices through a Nostr Wallet Connect wallet, behind
+    the off-by-default `nwc` feature. Enabling it pulls in NIP-04 and so adds `aes`,
+    `cbc` and `cipher` to the dependency tree. `parse_nwc_uri` reads a
+    connection string in either shape wallets emit, including the
+    `nostr+walletconnect:<pubkey>?...` pathname form that
+    `NostrWalletConnectURI::parse` rejects and the ts-sdk accepts. `NwcClient` speaks
+    request/response and notifications over an injected `RelayPoolTrait`, so the same code
+    path runs against a scripted mock wallet in CI and a real wallet in production. Because
+    `RelayPoolTrait` has no unsubscribe, it holds one subscription and one reader task and
+    correlates responses in process by request event id, rather than the ts-sdk
+    subscription-per-request shape that would leak one live REQ per payment. Wallet
+    responses are parsed permissively field for field, so a missing or unknown optional
+    field cannot turn a paid invoice into a failed verification, and notifications are
+    decrypted by kind (23196 NIP-04, 23197 NIP-44) rather than always as NIP-04. A
+    `MockWallet` behind `test-utils` scripts answers, errors, silence, delays and malformed
+    replies over a linked `MockRelayPool`, and can publish a `payment_received`
+    notification to drive settlement.
+  - The NWC payment processor, `LnBolt11NwcPaymentProcessor`, the server side of the
+    Phase B Lightning rail for PMI `bitcoin-lightning-bolt11`, behind the same
+    off-by-default `nwc` feature. `create_payment_required` mints a BOLT11 invoice via
+    `make_invoice` in msats with an expiry, caches the invoice to `payment_hash` mapping,
+    and advertises the configured TTL rather than the wallet's own `expires_at`, which
+    providers return in non-standard forms. `verify_payment` waits for settlement either
+    by polling `lookup_invoice` on the ts backoff schedule, floored at the configured poll
+    interval and jittered, or by listening for a `payment_received` notification when the
+    wallet advertises one on its info event. Concurrent verifications of the same invoice
+    are deduplicated onto one shared future so duplicate delivery cannot multiply wallet
+    and relay load. A lagging wallet answering `NOT_FOUND` is treated as still pending
+    while every other wallet error is fatal, `expired` and `failed` are terminal, and an
+    invoice counts as settled on either `state == "settled"` or a positive `settled_at`.
+    Every wait selects on the middleware's cancellation token, and a cancelled
+    verification always returns an error, never an empty success that the middleware
+    would read as payment. Amounts are validated before any wallet call, and no tracing
+    call carries the invoice, which is a bearer payment request.
+  - The NWC payment handler, `LnBolt11NwcPaymentHandler`, the client side of the Phase B
+    Lightning rail, completing it. It pays an offered BOLT11 invoice with `pay_invoice`,
+    bounded by its own response timeout because the client engine gives `handle()`
+    neither a timeout nor a cancellation token, and leaves the spending decision with
+    `payment_policy` rather than adding a second gate. A wallet that answers with neither
+    a result nor an error is a failure, not a silent success. Note that the handler is
+    invoked automatically only in the transparent lifecycle; explicit gating routes
+    `-32042` to the `on_payment_required` callback, from which the handler can be driven
+    by hand. Both NWC option structs now carry `new()` and `with_*` builders, since
+    `#[non_exhaustive]` makes a struct literal unusable from a downstream crate.
+    `docs/payments.md` documents the rail, its options, which lifecycle invokes the
+    handler, and its operational notes, and no longer describes Phase B as deferred or
+    lists LNbits as planned.
   - Server-side payment-interaction negotiation and advertisement: the server transport
     now parses client `pmi` and `payment_interaction` tags, negotiates the effective
     session mode (`transparent` by default, `explicit_gating` when the server policy
