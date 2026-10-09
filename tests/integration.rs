@@ -1,6 +1,6 @@
 //! Local RMCP integration test (in-process duplex I/O, no relay required).
 //! Relay-dependent scenarios live in `examples/rmcp_integration_test.rs`
-//! and run via the `integration.yml` workflow against a local relay container.
+//! and run manually against a relay (e.g. `-- relay-rmcp wss://...`).
 
 #![cfg(feature = "rmcp")]
 

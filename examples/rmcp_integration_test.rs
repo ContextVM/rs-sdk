@@ -17,16 +17,18 @@
 //!   cargo run --example rmcp_integration_test --features rmcp -- all wss://relay.primal.net
 
 use anyhow::{anyhow, bail, Context, Result};
-use contextvm_sdk::core::constants::mcp_protocol_version;
+use contextvm_sdk::core::constants::{mcp_protocol_version, RELAY_LIST_METADATA_KIND};
 use contextvm_sdk::core::types::{
-    EncryptionMode, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest,
+    EncryptionMode, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, ProfileMetadata,
     ServerInfo as CtxServerInfo,
 };
 use contextvm_sdk::gateway::{GatewayConfig, NostrMCPGateway};
 use contextvm_sdk::proxy::{NostrMCPProxy, ProxyConfig};
+use contextvm_sdk::relay::RelayPool;
 use contextvm_sdk::signer;
 use contextvm_sdk::transport::client::NostrClientTransportConfig;
 use contextvm_sdk::transport::server::NostrServerTransportConfig;
+use nostr_sdk::prelude::{Filter, Kind, PublicKey};
 use rmcp::{
     handler::server::wrapper::Parameters, model::*, schemars, service::RequestContext, tool,
     tool_handler, tool_router, ClientHandler, RoleServer, ServerHandler, ServiceExt,
@@ -312,6 +314,10 @@ async fn run_hybrid_relay_case(relay_url: &str) -> Result<()> {
         return res.context("rmcp server task ended before client startup");
     }
 
+    assert_discoverability_published(relay_url, &server_pubkey_hex)
+        .await
+        .context("discoverability publication check failed")?;
+
     let outcome: Result<()> = async {
         println!("[relay-hybrid] stage: creating legacy proxy client");
 
@@ -479,6 +485,10 @@ async fn run_relay_rmcp_case(relay_url: &str) -> Result<()> {
         return res.context("rmcp server task ended before rmcp client startup");
     }
 
+    assert_discoverability_published(relay_url, &server_pubkey_hex)
+        .await
+        .context("discoverability publication check failed")?;
+
     let outcome: Result<()> = async {
         println!("[relay-rmcp] stage: starting rmcp relay client worker");
 
@@ -560,12 +570,50 @@ async fn run_relay_rmcp_case(relay_url: &str) -> Result<()> {
     Ok(())
 }
 
+/// Assert the discoverability events (kind 10002 + kind 0) are served by the
+/// relay after the server starts. Polls briefly: publication runs on its own
+/// task and the relay may still be warming up.
+async fn assert_discoverability_published(relay_url: &str, server_pubkey_hex: &str) -> Result<()> {
+    let server_pubkey = PublicKey::from_hex(server_pubkey_hex).context("invalid server pubkey")?;
+    let pool = RelayPool::new(signer::generate()).await?;
+    pool.connect(&[relay_url.to_string()]).await?;
+
+    let wanted = [Kind::Custom(RELAY_LIST_METADATA_KIND), Kind::Metadata];
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let filters = wanted
+            .iter()
+            .map(|kind| Filter::new().kind(*kind).author(server_pubkey))
+            .collect();
+        let events = pool.fetch_events(filters, Duration::from_secs(5)).await?;
+        if wanted.iter().all(|k| events.iter().any(|e| e.kind == *k)) {
+            println!("[{relay_url}] discoverability: kind 10002 and kind 0 served");
+            let _ = pool.disconnect().await;
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let served: Vec<String> = events.iter().map(|e| e.kind.to_string()).collect();
+            let _ = pool.disconnect().await;
+            bail!(
+                "discoverability events not served by {relay_url} after 30s \
+                 (served kinds: {served:?})"
+            );
+        }
+        sleep(Duration::from_secs(2)).await;
+    }
+}
+
 fn server_config(relay_url: &str) -> GatewayConfig {
     let nostr_config = NostrServerTransportConfig::default()
         .with_relay_urls(vec![relay_url.to_string()])
         .with_encryption_mode(EncryptionMode::Optional)
         .with_server_info(
             CtxServerInfo::default()
+                .with_name("rmcp-matrix-server")
+                .with_about("rmcp matrix coverage server"),
+        )
+        .with_profile_metadata(
+            ProfileMetadata::default()
                 .with_name("rmcp-matrix-server")
                 .with_about("rmcp matrix coverage server"),
         )
