@@ -610,18 +610,13 @@ impl AnnouncementManager {
             .map(|url| Tag::custom(TagKind::Custom(tags::RELAY.into()), vec![url.clone()]))
             .collect();
         let builder = EventBuilder::new(Kind::Custom(RELAY_LIST_METADATA_KIND), "").tags(tags);
-        match self.publish_to_discoverability_relays(builder).await {
-            Ok(id) => tracing::info!(
-                target: LOG_TARGET,
-                event_id = %id,
-                "Published relay list (kind 10002)"
-            ),
-            Err(e) => tracing::warn!(
-                target: LOG_TARGET,
-                error = %e,
-                "Failed to publish relay list"
-            ),
-        }
+        publish_one(
+            &self.relay_pool,
+            &self.get_discoverability_publish_relay_urls(),
+            Some(builder),
+            "relay list (kind 10002)",
+        )
+        .await;
         Ok(())
     }
 
@@ -637,34 +632,14 @@ impl AnnouncementManager {
         };
         let content = serde_json::to_string(metadata)?;
         let builder = EventBuilder::new(Kind::Custom(0), content);
-        match self.publish_to_discoverability_relays(builder).await {
-            Ok(id) => tracing::info!(
-                target: LOG_TARGET,
-                event_id = %id,
-                "Published profile metadata (kind 0)"
-            ),
-            Err(e) => tracing::warn!(
-                target: LOG_TARGET,
-                error = %e,
-                "Failed to publish profile metadata"
-            ),
-        }
-        Ok(())
-    }
-
-    /// Publish an event to the discoverability relay set.
-    ///
-    /// Uses `get_discoverability_publish_relay_urls()` for targeted publication
-    /// when bootstrap relays are configured. Falls back to pool-wide publish
-    /// when the merged set is empty.
-    #[cfg(test)]
-    async fn publish_to_discoverability_relays(&self, builder: EventBuilder) -> Result<EventId> {
-        publish_with_retry(
+        publish_one(
             &self.relay_pool,
             &self.get_discoverability_publish_relay_urls(),
-            builder,
+            Some(builder),
+            "profile metadata (kind 0)",
         )
-        .await
+        .await;
+        Ok(())
     }
 
     /// Spawn a task to publish profile metadata and relay list.
