@@ -14,7 +14,7 @@
 //! Prefer [`NwcClient::connect`], which builds a pool from the connection's own
 //! relays. [`NwcClient::with_pool`] exists for tests and for a caller that
 //! genuinely wants to share one, and it carries a sharp edge: on a real
-//! [`RelayPool`](crate::relay::RelayPool), `connect` *adds* the wallet's relays
+//! [`crate::relay::RelayPool`], `connect` *adds* the wallet's relays
 //! to whatever pool it is given, and the NIP-47 subscription is permanent
 //! because [`RelayPoolTrait`] has no unsubscribe. Handing it a transport's pool
 //! therefore publishes ContextVM traffic to the wallet's relays and leaves a
@@ -699,7 +699,7 @@ impl NwcClient {
     /// # Errors
     ///
     /// [`NwcError::InvalidAmount`] if `amount_msats` is zero; otherwise see
-    /// [`Self::request`].
+    /// the shared request path.
     pub async fn make_invoice(
         &self,
         amount_msats: u64,
@@ -726,7 +726,7 @@ impl NwcClient {
     /// # Errors
     ///
     /// [`NwcError::Config`] if neither identifier is given; otherwise see
-    /// [`Self::request`].
+    /// the shared request path.
     pub async fn lookup_invoice(
         &self,
         payment_hash: Option<&str>,
@@ -752,7 +752,7 @@ impl NwcClient {
     ///
     /// # Errors
     ///
-    /// See [`Self::request`]. On [`NwcError::Timeout`], check
+    /// See the shared request path. On [`NwcError::Timeout`], check
     /// [`NwcError::may_have_reached_wallet`] before retrying.
     pub async fn pay_invoice(
         &self,

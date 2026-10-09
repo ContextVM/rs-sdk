@@ -12,7 +12,7 @@
 //! * **Present but wrongly typed** fields also deserialize to `None`. That is
 //!   *not* what `#[serde(default)]` does: serde would fail the whole envelope,
 //!   losing a response whose other fields said `"state": "settled"`. Every
-//!   optional field below goes through [`lenient`] to get this.
+//!   optional field below goes through `lenient` to get this.
 //!
 //! Requests are still built with the upstream types, where strictness costs
 //! nothing because we control the value.
