@@ -84,12 +84,23 @@ impl RelayPoolTrait for TestRelayPool {
             tokio::time::sleep(self.publish_delay).await;
         }
         self.publish_attempts.fetch_add(1, Ordering::SeqCst);
-        let should_fail = self
-            .failures_remaining
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                remaining.checked_sub(1)
-            })
-            .is_ok();
+        // CAS loop: `fetch_update` is deprecated on new toolchains and its
+        // rename `try_update` does not exist on the MSRV.
+        let mut remaining = self.failures_remaining.load(Ordering::SeqCst);
+        let should_fail = loop {
+            if remaining == 0 {
+                break false;
+            }
+            match self.failures_remaining.compare_exchange(
+                remaining,
+                remaining - 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break true,
+                Err(next) => remaining = next,
+            }
+        };
 
         if should_fail {
             return Err(contextvm_sdk::Error::Transport(

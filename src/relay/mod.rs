@@ -14,6 +14,18 @@ use nostr_sdk::prelude::*;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Log target for relay pool internals.
+const LOG_TARGET: &str = "contextvm_sdk::relay";
+
+/// How long `publish_to` waits for at least one socket before sending.
+const PUBLISH_TO_CONNECT_WAIT: Duration = Duration::from_secs(10);
+
+/// Poll interval while waiting for the first socket.
+const PUBLISH_TO_CONNECT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// How long a send round waits for relay acknowledgements before giving up.
+const PUBLISH_TO_SEND_WAIT: Duration = Duration::from_secs(15);
+
 /// Trait abstracting relay pool operations, enabling dependency injection and testing.
 #[async_trait]
 pub trait RelayPoolTrait: Send + Sync {
@@ -142,13 +154,80 @@ impl RelayPool {
     }
 
     /// Sign and publish an event to specific relay URLs.
+    ///
+    /// Publishes through a short-lived dedicated connection to exactly these
+    /// relays — they do not need to be members of this pool. Waits up to 10
+    /// seconds for at least one socket before sending, so a still-connecting
+    /// relay reports a real outcome instead of a silent no-answer, and up to
+    /// 15 seconds for acknowledgements before giving up on the send. Per-relay
+    /// refusals are logged with the relay's own reason;
+    /// returns [`Error::Transport`] when no relay accepted the event.
     pub async fn publish_to(&self, urls: &[String], builder: EventBuilder) -> Result<EventId> {
-        let output = self
-            .client
-            .send_event_builder_to(urls, builder)
+        let event = self.sign(builder).await?;
+        let client = Client::builder().build();
+        for url in urls {
+            client
+                .add_relay(url.as_str())
+                .await
+                .map_err(|e| Error::Transport(e.to_string()))?;
+        }
+        client.connect().await;
+
+        // Bounded wait for the first connected socket before the send round.
+        let deadline = tokio::time::Instant::now() + PUBLISH_TO_CONNECT_WAIT;
+        loop {
+            let relays = client.relays().await;
+            if relays.is_empty()
+                || relays
+                    .values()
+                    .any(|r| matches!(r.status(), RelayStatus::Connected))
+            {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(PUBLISH_TO_CONNECT_POLL_INTERVAL).await;
+        }
+
+        // Bounded send: a relay that accepts the socket but never
+        // acknowledges cannot stall past the caller's round backstop, so the
+        // teardown below stays reachable on every path.
+        let result = async {
+            let output = match tokio::time::timeout(
+                PUBLISH_TO_SEND_WAIT,
+                client.send_event_to(urls, &event),
+            )
             .await
-            .map_err(|e| Error::Transport(e.to_string()))?;
-        Ok(output.val)
+            {
+                Ok(output) => output.map_err(|e| Error::Transport(e.to_string()))?,
+                Err(_) => {
+                    return Err(Error::Transport(format!(
+                        "no relay answered within {} seconds",
+                        PUBLISH_TO_SEND_WAIT.as_secs()
+                    )))
+                }
+            };
+            for (url, reason) in &output.failed {
+                tracing::warn!(
+                    target: LOG_TARGET,
+                    relay = %url,
+                    reason = %reason,
+                    "Relay refused discoverability event"
+                );
+            }
+            if output.success.is_empty() {
+                return Err(Error::Transport(format!(
+                    "no relay accepted the event: {:?}",
+                    output.failed
+                )));
+            }
+            Ok(output.val)
+        }
+        .await;
+
+        client.disconnect().await;
+        result
     }
 
     /// Fetch events matching filters from connected relays.
@@ -217,5 +296,85 @@ impl RelayPoolTrait for RelayPool {
 
     async fn fetch_events(&self, filters: Vec<Filter>, timeout: Duration) -> Result<Vec<Event>> {
         RelayPool::fetch_events(self, filters, timeout).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::StreamExt;
+
+    /// A relay that accepts TCP but never speaks WebSocket must not hang
+    /// `publish_to`: the connect-wait self-bounds and the failure surfaces
+    /// instead of being reported as success.
+    #[tokio::test(start_paused = true)]
+    async fn publish_to_self_bounds_when_relay_never_connects() {
+        // Black-hole relay: accept connections and hold them, never respond.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+
+        let pool = RelayPool::new(Keys::generate()).await.unwrap();
+        let url = format!("ws://{}", addr);
+
+        // 27 s: publish_to's own budget is 10 s connect-wait + 15 s send.
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(27),
+            pool.publish_to(&[url], EventBuilder::new(Kind::Custom(0), "{}")),
+        )
+        .await;
+
+        assert!(
+            outcome.is_ok(),
+            "publish_to must self-bound before the 30 s round backstop cancels it"
+        );
+        assert!(
+            outcome.unwrap().is_err(),
+            "a relay that never answers must not report success"
+        );
+    }
+
+    /// A relay that completes the WebSocket handshake but never acknowledges
+    /// events must not hang `publish_to`: the send self-bounds and the failure
+    /// surfaces instead of being reported as success. This pins the bound that
+    /// keeps `publish_to`'s teardown reachable before the round backstop.
+    #[tokio::test(start_paused = true)]
+    async fn publish_to_self_bounds_against_a_silent_relay() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                // Complete the handshake, then read forever and never reply.
+                tokio::spawn(async move {
+                    let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                        return;
+                    };
+                    while ws.next().await.is_some() {}
+                });
+            }
+        });
+
+        let pool = RelayPool::new(Keys::generate()).await.unwrap();
+        let url = format!("ws://{}", addr);
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(27),
+            pool.publish_to(&[url], EventBuilder::new(Kind::Custom(0), "{}")),
+        )
+        .await;
+
+        assert!(
+            outcome.is_ok(),
+            "publish_to must self-bound before the 30 s round backstop cancels it"
+        );
+        assert!(
+            outcome.unwrap().is_err(),
+            "a relay that never acknowledges must not report success"
+        );
     }
 }
