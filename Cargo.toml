@@ -120,6 +120,10 @@ required-features = ["rmcp", "test-utils"]
 [dev-dependencies]
 # `start_paused` deterministic-time tests (tokio's "full" does not include test-util).
 tokio = { version = "1", features = ["test-util"] }
+# Already in the tree via rmcp; used only for the relay self-bound test's
+# minimal WebSocket server.
+tokio-tungstenite = "0.26"
+futures-util = "0.3"
 tokio-test = "0.4"
 anyhow = "1"
 schemars = "0.8"

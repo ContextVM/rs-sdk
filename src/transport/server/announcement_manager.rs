@@ -207,8 +207,8 @@ async fn publish_with_retry(
     let mut attempt = 0u32;
     loop {
         attempt += 1;
-        // ponytail: a timed-out round drops the temp pool without disconnect;
-        // nostr-sdk relays tear down with their handles — revisit on leak reports.
+        // Backstop only: `publish_to` self-bounds to 25 s (10 s connect wait
+        // + 15 s send) and disconnects its temp pool on every path.
         let round = tokio::time::timeout(
             DISCOVERABILITY_ROUND_TIMEOUT,
             relay_pool.publish_to(urls, builder.clone()),
