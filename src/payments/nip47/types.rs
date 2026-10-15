@@ -116,10 +116,18 @@ impl NwcErrorBody {
     /// message is truncated and scrubbed of anything that looks like a BOLT11
     /// invoice, which is a bearer payment request.
     pub fn describe(&self) -> String {
-        let code = self.code.as_deref().unwrap_or("UNSPECIFIED");
+        // The code is wallet-controlled too, and nothing in NIP-47 bounds it
+        // or keeps an invoice out of it, so it gets the same treatment as the
+        // message rather than being copied through raw.
+        let code = self
+            .code
+            .as_deref()
+            .map(sanitize_wallet_text)
+            .filter(|c| !c.is_empty())
+            .unwrap_or_else(|| "UNSPECIFIED".to_string());
         match self.message.as_deref().map(sanitize_wallet_text) {
             Some(msg) if !msg.is_empty() => format!("{code}: {msg}"),
-            _ => code.to_string(),
+            _ => code,
         }
     }
 }
@@ -132,26 +140,47 @@ impl NwcErrorBody {
 pub(crate) fn sanitize_wallet_text(text: &str) -> String {
     let mut out = String::with_capacity(text.len().min(MAX_WALLET_TEXT));
     for word in text.split_whitespace() {
-        let lower = word.to_lowercase();
-        let looks_like_invoice = ["lnbc", "lntb", "lnbcrt", "lnsb"]
-            .iter()
-            .any(|p| lower.starts_with(p))
-            && word.len() > 20;
         if !out.is_empty() {
             out.push(' ');
         }
-        if looks_like_invoice {
+        if looks_like_invoice(word) {
             out.push_str("<redacted invoice>");
         } else {
             out.push_str(word);
         }
         if out.len() >= MAX_WALLET_TEXT {
-            out.truncate(MAX_WALLET_TEXT);
+            // Walk back to a character boundary. `truncate` panics mid
+            // character, and this text is wallet-controlled, so a "payment
+            // failed" message in any non-Latin script would otherwise bring
+            // the caller down on the pay path.
+            let mut cut = MAX_WALLET_TEXT;
+            while cut > 0 && !out.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            out.truncate(cut);
             out.push_str("...");
             break;
         }
     }
     out
+}
+
+/// Whether a whitespace-delimited token carries a BOLT11 invoice.
+///
+/// The prefix is looked for *anywhere* in the token, not just at the start.
+/// Wallets wrap invoices in punctuation and schemes, and `lightning:lnbc...`,
+/// `(lnbc...)`, `invoice=lnbc...` and quoted forms all sail past a
+/// `starts_with` test while still carrying the full payment hash.
+fn looks_like_invoice(word: &str) -> bool {
+    const PREFIXES: [&str; 4] = ["lnbcrt", "lnbc", "lntb", "lnsb"];
+    let lower = word.to_lowercase();
+    PREFIXES.iter().any(|prefix| {
+        lower
+            .match_indices(prefix)
+            // Enough payload after the prefix to be an invoice rather than a
+            // word that merely happens to contain it.
+            .any(|(at, _)| lower.len() - at > 20)
+    })
 }
 
 /// Result of `make_invoice` / `lookup_invoice`.
@@ -362,6 +391,73 @@ mod tests {
         let err = env.error.unwrap();
         assert_eq!(err.code_upper(), "SOMETHING_NEW");
         assert_eq!(err.describe(), "SOMETHING_NEW: nope");
+    }
+
+    /// (25). `truncate` panics mid character, and this text is
+    /// wallet-controlled, so a long non-Latin message is a remote panic on
+    /// the pay path.
+    #[test]
+    fn long_multibyte_wallet_text_does_not_panic() {
+        // Three bytes per character, so some cut at byte 120 lands inside one.
+        for n in 38..64 {
+            let text = "\u{652f}\u{4ed8}\u{5931}\u{8d25}".repeat(n);
+            let out = sanitize_wallet_text(&text);
+            assert!(out.len() <= MAX_WALLET_TEXT + 3, "{}", out.len());
+        }
+        // Every offset around the boundary, so the walk-back is exercised at
+        // each one rather than one lucky alignment.
+        for pad in 0..8 {
+            let text = format!("{}{}", "a".repeat(pad), "\u{20ac}".repeat(80));
+            let _ = sanitize_wallet_text(&text);
+        }
+    }
+
+    /// (26). `starts_with` on whitespace-split words lets every wrapped form
+    /// through, and the leak carries the full payment hash.
+    #[test]
+    fn wrapped_and_prefixed_invoices_are_redacted_too() {
+        let invoice = "lnbc210n1pjqqqqqpp5abcdefghijklmnopqrstuvwxyz0123456789";
+        for wrapped in [
+            format!("lightning:{invoice}"),
+            format!("({invoice})"),
+            format!("invoice={invoice}"),
+            format!("\"{invoice}\""),
+            format!("<{invoice}>"),
+            format!("[{invoice}]"),
+            format!("url=lightning:{invoice}&x=1"),
+        ] {
+            let out = sanitize_wallet_text(&format!("could not pay {wrapped} sorry"));
+            assert!(
+                !out.contains("abcdefghijklmnop"),
+                "payment hash survived in {out}"
+            );
+            assert!(out.contains("<redacted invoice>"), "{out}");
+        }
+    }
+
+    /// (26). The code is wallet-controlled as well, and was copied raw.
+    #[test]
+    fn describe_redacts_and_bounds_the_error_code_too() {
+        let invoice = "lnbc210n1pjqqqqqpp5abcdefghijklmnopqrstuvwxyz0123456789";
+        let err = NwcErrorBody {
+            code: Some(format!("FAILED {invoice}")),
+            message: None,
+        };
+        let described = err.describe();
+        assert!(!described.contains("abcdefghijklmnop"), "{described}");
+
+        let long = NwcErrorBody {
+            code: Some("X".repeat(10_000)),
+            message: None,
+        };
+        assert!(long.describe().len() <= MAX_WALLET_TEXT + 3);
+    }
+
+    /// A word that merely contains the prefix is not an invoice.
+    #[test]
+    fn ordinary_words_are_left_alone() {
+        let out = sanitize_wallet_text("lnbc is the prefix and lnbcrt is another");
+        assert_eq!(out, "lnbc is the prefix and lnbcrt is another");
     }
 
     /// A wallet message can name the invoice, and both middlewares log a

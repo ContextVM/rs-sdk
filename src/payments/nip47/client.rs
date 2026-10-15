@@ -50,7 +50,7 @@ use serde::Serialize;
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
 use tokio_util::sync::CancellationToken;
 
-use crate::payments::nip47::error::NwcError;
+use crate::payments::nip47::error::{Delivery, NwcError};
 use crate::payments::nip47::types::{
     sanitize_wallet_text, NwcInvoiceResult, NwcNotificationPayload, NwcPayInvoiceResult,
     NwcResponseEnvelope,
@@ -141,6 +141,9 @@ struct Inner {
     /// Set once any response has correlated. Until then the filter may be too
     /// narrow for the wallet in front of us.
     ever_correlated: AtomicBool,
+    /// Latch for [`NwcClient::widen_response_filter_once`]. The pool has no
+    /// unsubscribe, so the widened subscription may only ever be opened once.
+    widened: AtomicBool,
     /// Set by `close()`, by `Drop`, and when the reader exits.
     closed: AtomicBool,
 }
@@ -238,6 +241,7 @@ impl NwcClient {
                 waiters: Mutex::new(HashMap::new()),
                 notification_sinks: AsyncMutex::new(Vec::new()),
                 ever_correlated: AtomicBool::new(false),
+                widened: AtomicBool::new(false),
                 closed: AtomicBool::new(false),
             }),
             started: AsyncMutex::new(false),
@@ -273,30 +277,41 @@ impl NwcClient {
 
     /// Filters this client subscribes with.
     ///
-    /// `narrow` additionally requires the `p` tag addressed to us, which every
-    /// conformant wallet sets. The widened form drops it: see
-    /// [`Self::widen_filter_if_never_correlated`].
-    fn filters(&self, narrow: bool) -> Vec<Filter> {
+    /// Requires the `p` tag addressed to us, which every conformant wallet
+    /// sets. `since` keeps a relay that retains ephemeral events from
+    /// replaying this client's whole history on every start and reconnect.
+    fn filters(&self) -> Vec<Filter> {
         let since = Timestamp::now() - SUBSCRIPTION_LOOKBACK;
-        let base = Filter::new()
+        vec![Filter::new()
             .kinds([
                 Kind::from(KIND_RESPONSE),
                 Kind::from(KIND_NOTIFICATION_LEGACY),
                 Kind::from(KIND_NOTIFICATION),
             ])
             .author(self.connection.wallet_pubkey)
-            .since(since);
-        vec![if narrow {
-            base.pubkey(self.keys.public_key())
-        } else {
-            base
-        }]
+            .pubkey(self.keys.public_key())
+            .since(since)]
+    }
+
+    /// The widened filter: responses only, without the `p` tag.
+    ///
+    /// Deliberately narrower than dropping `#p` everywhere. Only a response
+    /// can prove the narrow filter is wrong, and leaving `#p` on the two
+    /// notification kinds keeps the permanent subscription from picking up
+    /// every notification the wallet sends any of its clients.
+    fn widened_response_filter(&self) -> Vec<Filter> {
+        vec![Filter::new()
+            .kind(Kind::from(KIND_RESPONSE))
+            .author(self.connection.wallet_pubkey)
+            .since(Timestamp::now() - SUBSCRIPTION_LOOKBACK)]
     }
 
     /// Connect, subscribe, and spawn the reader task. Idempotent.
     async fn ensure_started(&self) -> Result<(), NwcError> {
         if self.is_closed() {
-            return Err(NwcError::Closed);
+            return Err(NwcError::Closed {
+                delivery: Delivery::NotSent,
+            });
         }
         let mut started = self.started.lock().await;
         if *started {
@@ -315,7 +330,7 @@ impl NwcClient {
         let notifications = self.pool.notifications();
 
         self.pool
-            .subscribe(self.filters(true))
+            .subscribe(self.filters())
             .await
             .map_err(|e| NwcError::Subscribe {
                 reason: e.to_string(),
@@ -339,24 +354,35 @@ impl NwcClient {
         Ok(())
     }
 
-    /// Re-subscribe without the `p` tag.
+    /// Re-subscribe to responses without the `p` tag, at most once ever.
     ///
     /// Our filter requires `#p`, which every conformant wallet sets but which
     /// is stricter than ts (whose per-request REQ has no `#p` at all). A wallet
-    /// that omits it would be invisible forever. While nothing has *ever*
-    /// correlated, widen once so such a wallet still works; after the first
-    /// successful correlation the narrow filter is known good and this is never
-    /// attempted again.
-    async fn widen_filter_if_never_correlated(&self) {
+    /// that omits it would be invisible forever.
+    ///
+    /// Two conditions, both necessary. Nothing has ever correlated, so the
+    /// narrow filter has never been shown to work; and the caller has just
+    /// waited out a full deadline on a request that *did* reach a relay, so it
+    /// has now been shown to fail. Widening on "nothing has arrived yet" alone
+    /// would re-subscribe a conformant wallet's client before its first answer
+    /// could possibly land.
+    ///
+    /// The latch is what bounds it. [`RelayPoolTrait`] has no unsubscribe, so
+    /// every widened subscription is permanent; without the latch a wallet
+    /// that never answers would accumulate one per call.
+    async fn widen_response_filter_once(&self) {
         if self.inner.ever_correlated.load(Ordering::SeqCst) {
             return;
         }
-        tracing::debug!(
+        if self.inner.widened.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        tracing::warn!(
             target: LOG_TARGET,
-            "no NWC response has correlated yet; re-subscribing without the p-tag filter"
+            "no NWC response has ever correlated; re-subscribing to responses              without the p-tag filter. The wallet is not setting the p tag it              is required to set."
         );
-        if let Err(e) = self.pool.subscribe(self.filters(false)).await {
-            tracing::debug!(target: LOG_TARGET, error = %e, "widened NWC subscribe failed");
+        if let Err(e) = self.pool.subscribe(self.widened_response_filter()).await {
+            tracing::warn!(target: LOG_TARGET, error = %e, "widened NWC subscribe failed");
         }
     }
 
@@ -559,7 +585,9 @@ impl NwcClient {
         let timeout_ms = self.response_timeout.as_millis() as u64;
 
         if self.is_closed() {
-            return Err(NwcError::Closed);
+            return Err(NwcError::Closed {
+                delivery: Delivery::NotSent,
+            });
         }
 
         match tokio::time::timeout_at(deadline, self.ensure_started()).await {
@@ -568,9 +596,18 @@ impl NwcClient {
                 return Err(NwcError::Timeout {
                     method: method.to_string(),
                     timeout_ms,
-                    published: false,
+                    delivery: Delivery::NotSent,
                 })
             }
+        }
+
+        // Re-check: `close()` returns as soon as it has set the flag, so one
+        // that lands during start-up would otherwise still be followed by a
+        // publish. Nothing has gone out yet at this point.
+        if self.is_closed() {
+            return Err(NwcError::Closed {
+                delivery: Delivery::NotSent,
+            });
         }
 
         let body = serde_json::json!({ "method": method, "params": params });
@@ -624,7 +661,9 @@ impl NwcClient {
         // exit path, including this future being dropped mid-wait.
         let (tx, rx) = oneshot::channel();
         {
-            let mut map = self.inner.waiters.lock().map_err(|_| NwcError::Closed)?;
+            let mut map = self.inner.waiters.lock().map_err(|_| NwcError::Closed {
+                delivery: Delivery::NotSent,
+            })?;
             map.insert(request_id, tx);
         }
         let _guard = WaiterGuard {
@@ -632,20 +671,25 @@ impl NwcClient {
             id: request_id,
         };
 
-        let published =
+        let delivery =
             match tokio::time::timeout_at(deadline, self.pool.publish_event(&event)).await {
-                Ok(Ok(_)) => true,
+                Ok(Ok(_)) => Delivery::Sent,
+                // A relay that answered with an error did not accept the
+                // event, so this one really is a non-delivery.
                 Ok(Err(e)) => {
                     return Err(NwcError::Publish {
                         method: method.to_string(),
                         reason: e.to_string(),
                     })
                 }
+                // The deadline fell inside the publish. The pool writes the
+                // EVENT before it waits on the relay's OK, so the wallet may
+                // already have the request: this is unknown, not "never sent".
                 Err(_) => {
                     return Err(NwcError::Timeout {
                         method: method.to_string(),
                         timeout_ms,
-                        published: false,
+                        delivery: Delivery::Unknown,
                     })
                 }
             };
@@ -657,20 +701,22 @@ impl NwcClient {
             "NWC request published"
         );
 
-        // One chance to widen a too-narrow filter, while nothing has ever
-        // correlated. Only on the very first requests.
-        self.widen_filter_if_never_correlated().await;
-
         let plaintext = match tokio::time::timeout_at(deadline, rx).await {
             Ok(Ok(p)) => p,
-            // Sender dropped: the client closed, or the reader died.
-            Ok(Err(_)) => return Err(NwcError::Closed),
+            // Sender dropped: the client closed, or the reader died. The
+            // request is already out, so the delivery bit has to survive:
+            // a `close()` after a `pay_invoice` is not a safe retry.
+            Ok(Err(_)) => return Err(NwcError::Closed { delivery }),
             Err(_) => {
+                // The narrow filter has now demonstrably failed to deliver an
+                // answer to a request we know went out, which is the only
+                // evidence that would justify widening it.
+                self.widen_response_filter_once().await;
                 return Err(NwcError::Timeout {
                     method: method.to_string(),
                     timeout_ms,
-                    published,
-                })
+                    delivery,
+                });
             }
         };
 
@@ -685,7 +731,9 @@ impl NwcClient {
                 tracing::warn!(
                     target: LOG_TARGET,
                     method,
-                    result_type = kind,
+                    // Wallet-controlled, so it is scrubbed like any other
+                    // wallet string before it reaches a log line.
+                    result_type = %sanitize_wallet_text(kind),
                     "NWC result_type does not match the request method"
                 );
             }
@@ -899,8 +947,372 @@ mod tests {
         (wallet, client, client_pool)
     }
 
+    /// A pool that delegates to [`MockRelayPool`] while recording every
+    /// `subscribe` and optionally parking `connect`.
+    ///
+    /// Recording the filters lets the widening tests assert what the
+    /// subscriptions *match*, rather than their shape. Parking `connect` is
+    /// the only way to reach the window between the top-of-request closed
+    /// check and the publish.
+    struct SpyPool {
+        inner: Arc<MockRelayPool>,
+        connect_delay: Duration,
+        publish_delay: Duration,
+        subscribed: std::sync::Mutex<Vec<Vec<Filter>>>,
+    }
+
+    impl SpyPool {
+        fn new(inner: Arc<MockRelayPool>, connect_delay: Duration) -> Self {
+            Self {
+                inner,
+                connect_delay,
+                publish_delay: Duration::ZERO,
+                subscribed: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn with_publish_delay(mut self, delay: Duration) -> Self {
+            self.publish_delay = delay;
+            self
+        }
+
+        fn subscriptions(&self) -> Vec<Vec<Filter>> {
+            self.subscribed.lock().expect("not poisoned").clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RelayPoolTrait for SpyPool {
+        async fn connect(&self, relay_urls: &[String]) -> crate::Result<()> {
+            if !self.connect_delay.is_zero() {
+                tokio::time::sleep(self.connect_delay).await;
+            }
+            self.inner.connect(relay_urls).await
+        }
+        async fn disconnect(&self) -> crate::Result<()> {
+            self.inner.disconnect().await
+        }
+        async fn publish_event(&self, event: &Event) -> crate::Result<EventId> {
+            if !self.publish_delay.is_zero() {
+                tokio::time::sleep(self.publish_delay).await;
+            }
+            self.inner.publish_event(event).await
+        }
+        async fn publish(&self, builder: EventBuilder) -> crate::Result<EventId> {
+            self.inner.publish(builder).await
+        }
+        async fn sign(&self, builder: EventBuilder) -> crate::Result<Event> {
+            self.inner.sign(builder).await
+        }
+        async fn signer(&self) -> crate::Result<Arc<dyn NostrSigner>> {
+            self.inner.signer().await
+        }
+        fn notifications(&self) -> tokio::sync::broadcast::Receiver<RelayPoolNotification> {
+            self.inner.notifications()
+        }
+        async fn public_key(&self) -> crate::Result<PublicKey> {
+            self.inner.public_key().await
+        }
+        async fn subscribe(&self, filters: Vec<Filter>) -> crate::Result<()> {
+            self.subscribed
+                .lock()
+                .expect("not poisoned")
+                .push(filters.clone());
+            self.inner.subscribe(filters).await
+        }
+        async fn publish_to(
+            &self,
+            urls: &[String],
+            builder: EventBuilder,
+        ) -> crate::Result<EventId> {
+            self.inner.publish_to(urls, builder).await
+        }
+        async fn fetch_events(
+            &self,
+            filters: Vec<Filter>,
+            timeout: Duration,
+        ) -> crate::Result<Vec<Event>> {
+            self.inner.fetch_events(filters, timeout).await
+        }
+    }
+
+    /// Harness whose client talks through a [`SpyPool`].
+    async fn spy_harness(
+        response_timeout: Duration,
+        connect_delay: Duration,
+    ) -> (Arc<MockWallet>, NwcClient, Arc<SpyPool>) {
+        spy_harness_with(response_timeout, |pool| SpyPool::new(pool, connect_delay)).await
+    }
+
+    async fn spy_harness_with(
+        response_timeout: Duration,
+        build: impl FnOnce(Arc<MockRelayPool>) -> SpyPool,
+    ) -> (Arc<MockWallet>, NwcClient, Arc<SpyPool>) {
+        let wallet_pool = Arc::new(MockRelayPool::new());
+        let client_pool = Arc::new(wallet_pool.linked_with_keys(Keys::generate()));
+        let spy = Arc::new(build(client_pool));
+
+        let wallet = Arc::new(MockWallet::new(Arc::clone(&wallet_pool)));
+        wallet.start().await.expect("wallet starts");
+
+        let secret = SecretKey::generate();
+        let uri = format!(
+            "nostr+walletconnect://{}?relay=wss%3A%2F%2Fmock.relay&secret={}",
+            wallet.public_key().to_hex(),
+            secret.to_secret_hex()
+        );
+        let connection = parse_nwc_uri(&uri).expect("uri parses");
+        let client = NwcClient::with_pool(
+            Arc::clone(&spy) as Arc<dyn RelayPoolTrait>,
+            connection,
+            NwcClientOptions::new().with_response_timeout(response_timeout),
+        )
+        .expect("options valid");
+        (wallet, client, spy)
+    }
+
     fn invoice_result(invoice: &str) -> serde_json::Value {
         serde_json::json!({ "invoice": invoice, "state": "pending" })
+    }
+
+    // ── (3) widening, and (24) close ─────────────────────────────────────────
+
+    /// Build a wallet-signed event with no `p` tag, as a non-conformant
+    /// wallet emits, so a filter can be asked what it would match.
+    fn untagged_from(wallet: &MockWallet, kind: u16) -> Event {
+        EventBuilder::new(Kind::from(kind), "ciphertext")
+            .sign_with_keys(&wallet.keys())
+            .expect("signs")
+    }
+
+    /// (3). Widening must not run until the narrow filter has *failed*.
+    /// Running it right after the first publish re-subscribes a conformant
+    /// wallet's client before its first answer could possibly have landed.
+    #[tokio::test]
+    async fn a_conformant_wallet_never_triggers_the_widening() {
+        let (wallet, client, spy) = spy_harness(Duration::from_secs(5), Duration::ZERO).await;
+        wallet
+            .set_behavior(
+                "make_invoice",
+                WalletBehavior::Answer(invoice_result("lnbc210n1p")),
+            )
+            .await;
+
+        client
+            .make_invoice(1000, None, None)
+            .await
+            .expect("conformant wallet answers");
+
+        assert_eq!(
+            spy.subscriptions().len(),
+            1,
+            "a wallet that answers must never be re-subscribed"
+        );
+    }
+
+    /// (3). The pool has no unsubscribe, so every widened subscription is
+    /// permanent. A wallet that never answers must still produce exactly one.
+    #[tokio::test]
+    async fn widening_happens_at_most_once_however_many_requests_fail() {
+        let (wallet, client, spy) = spy_harness(Duration::from_millis(150), Duration::ZERO).await;
+        wallet
+            .set_behavior("make_invoice", WalletBehavior::Silence)
+            .await;
+
+        for _ in 0..4 {
+            let _ = client.make_invoice(1000, None, None).await;
+        }
+
+        let subs = spy.subscriptions();
+        assert_eq!(
+            subs.len(),
+            2,
+            "one initial narrow subscribe and exactly one widened, got {}",
+            subs.len()
+        );
+    }
+
+    /// (3). Only the response filter loses `#p`. Dropping it from the two
+    /// notification kinds as well would make the permanent subscription pick
+    /// up every notification the wallet sends any of its clients.
+    #[tokio::test]
+    async fn the_widened_filter_covers_responses_only() {
+        let (wallet, client, spy) = spy_harness(Duration::from_millis(150), Duration::ZERO).await;
+        wallet
+            .set_behavior("make_invoice", WalletBehavior::Silence)
+            .await;
+        let _ = client.make_invoice(1000, None, None).await;
+
+        let subs = spy.subscriptions();
+        assert_eq!(subs.len(), 2, "expected a widened subscribe");
+        let widened = &subs[1];
+
+        let response = untagged_from(&wallet, KIND_RESPONSE);
+        assert!(
+            widened
+                .iter()
+                .any(|f| f.match_event(&response, MatchEventOptions::default())),
+            "an untagged response must now match"
+        );
+
+        for kind in [KIND_NOTIFICATION_LEGACY, KIND_NOTIFICATION] {
+            let notification = untagged_from(&wallet, kind);
+            assert!(
+                !widened
+                    .iter()
+                    .any(|f| f.match_event(&notification, MatchEventOptions::default())),
+                "kind {kind} must keep its p-tag requirement"
+            );
+        }
+    }
+
+    /// (3). The point of the whole mechanism: a wallet that never sets `p` is
+    /// invisible to the narrow filter, and must become visible afterwards.
+    #[tokio::test]
+    async fn a_wallet_that_omits_the_p_tag_is_recovered_after_one_failure() {
+        let (wallet, client, _spy) = spy_harness(Duration::from_millis(400), Duration::ZERO).await;
+        wallet
+            .set_quirks(MockWalletQuirks {
+                omit_p_tag: true,
+                ..Default::default()
+            })
+            .await;
+        wallet
+            .set_behavior(
+                "make_invoice",
+                WalletBehavior::Answer(invoice_result("lnbc210n1p")),
+            )
+            .await;
+
+        let first = client.make_invoice(1000, None, None).await;
+        assert!(
+            matches!(first, Err(NwcError::Timeout { .. })),
+            "the narrow filter cannot see this wallet: {first:?}"
+        );
+
+        client
+            .make_invoice(1000, None, None)
+            .await
+            .expect("the widened filter must now see the answer");
+    }
+
+    /// (8a). The deadline falling inside the publish is unknowable, not a
+    /// definite non-delivery: the pool writes the EVENT before it waits on
+    /// the relay's OK. Reporting `NotSent` here tells a `pay_invoice` caller
+    /// that retrying is safe when it may not be.
+    #[tokio::test]
+    async fn a_deadline_inside_the_publish_reports_unknown_delivery() {
+        let (wallet, client, _spy) = spy_harness_with(Duration::from_millis(120), |pool| {
+            SpyPool::new(pool, Duration::ZERO).with_publish_delay(Duration::from_millis(600))
+        })
+        .await;
+        wallet
+            .set_behavior(
+                "pay_invoice",
+                WalletBehavior::Answer(serde_json::json!({ "preimage": "deadbeef" })),
+            )
+            .await;
+
+        let err = client
+            .pay_invoice("lnbc210n1p", None)
+            .await
+            .expect_err("the deadline falls inside the publish");
+
+        match err {
+            NwcError::Timeout { delivery, .. } => assert_eq!(
+                delivery,
+                Delivery::Unknown,
+                "an in-flight publish is unknown, not a non-delivery"
+            ),
+            other => panic!("expected a Timeout, got {other:?}"),
+        }
+        assert!(
+            err_may_reach(&err),
+            "the caller must not be told this is a safe retry"
+        );
+    }
+
+    /// (24). A `close()` landing after the request went out must keep the
+    /// delivery bit. Collapsing it to a bare `Closed` tells the caller a
+    /// `pay_invoice` that is already on the wire is safe to retry.
+    #[tokio::test]
+    async fn a_close_after_the_publish_keeps_the_delivery_bit() {
+        let (wallet, client, _spy) = spy_harness(Duration::from_secs(5), Duration::ZERO).await;
+        wallet
+            .set_behavior("pay_invoice", WalletBehavior::Silence)
+            .await;
+
+        let client = Arc::new(client);
+        let task = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.pay_invoice("lnbc210n1p", None).await })
+        };
+
+        // Long enough for the publish to have completed and the wait to have
+        // begun, well short of the 5 s deadline.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        client.close();
+
+        let err = task
+            .await
+            .expect("task joins")
+            .expect_err("closing releases the waiter");
+        assert!(
+            matches!(
+                err,
+                NwcError::Closed {
+                    delivery: Delivery::Sent
+                }
+            ),
+            "expected a sent Closed, got {err:?}"
+        );
+        assert!(
+            err_may_reach(&err),
+            "the wallet has the pay_invoice: this is not a safe retry"
+        );
+    }
+
+    /// (24). `close()` returns as soon as the flag is set, so one that lands
+    /// while start-up is still in flight used to be followed by a publish.
+    #[tokio::test]
+    async fn a_close_during_start_up_still_prevents_the_publish() {
+        let (wallet, client, _spy) =
+            spy_harness(Duration::from_secs(5), Duration::from_millis(300)).await;
+        wallet
+            .set_behavior(
+                "pay_invoice",
+                WalletBehavior::Answer(serde_json::json!({ "preimage": "deadbeef" })),
+            )
+            .await;
+
+        let client = Arc::new(client);
+        let task = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.pay_invoice("lnbc210n1p", None).await })
+        };
+
+        // Inside the parked connect, past the top-of-request closed check.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        client.close();
+
+        let err = task
+            .await
+            .expect("task joins")
+            .expect_err("a closed client must not pay");
+        assert!(
+            matches!(
+                err,
+                NwcError::Closed {
+                    delivery: Delivery::NotSent
+                }
+            ),
+            "expected a not-sent Closed, got {err:?}"
+        );
+        assert!(
+            wallet.calls().await.is_empty(),
+            "the wallet must not have been asked to pay: {:?}",
+            wallet.calls().await
+        );
     }
 
     // ── round trips ──────────────────────────────────────────────────────────
@@ -1052,13 +1464,13 @@ mod tests {
             .expect_err("silence must not resolve");
 
         match err {
-            NwcError::Timeout { published, .. } => {
-                assert!(published, "the request did reach the relay");
+            NwcError::Timeout { delivery, .. } => {
+                assert_eq!(delivery, Delivery::Sent, "the request did reach the relay");
                 assert!(
                     err_may_reach(&NwcError::Timeout {
                         method: "x".into(),
                         timeout_ms: 1,
-                        published: true
+                        delivery: Delivery::Sent
                     }),
                     "a published timeout must warn the caller"
                 );
@@ -1183,6 +1595,45 @@ mod tests {
         ));
     }
 
+    /// Kept alongside `an_answer_without_a_correlation_tag_is_ignored`,
+    /// which cannot see this: an answer with *no* `e` tag is dropped before
+    /// the correlation lookup is reached, so a fallback that accepted a
+    /// *mismatched* `e` tag would survive that test. This one carries a
+    /// well-formed `e` tag pointing at the wrong request.
+    #[tokio::test]
+    async fn an_answer_correlated_to_a_different_request_is_ignored() {
+        let (wallet, client, pool) = harness_with_timeout(Duration::from_millis(700)).await;
+        wallet
+            .set_behavior("make_invoice", WalletBehavior::Silence)
+            .await;
+        let client_pubkey = client.client_pubkey();
+
+        let client = Arc::new(client);
+        let caller = Arc::clone(&client);
+        let call = tokio::spawn(async move { caller.make_invoice(1000, None, None).await });
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        // A syntactically valid event id that is not the in-flight request's.
+        let other_request = EventId::from_slice(&[7u8; 32]).expect("valid id");
+        let plaintext =
+            serde_json::json!({"result_type":"make_invoice","result":{"invoice":"wrong"}})
+                .to_string();
+        let content =
+            nip04::encrypt(wallet.keys().secret_key(), &client_pubkey, plaintext).expect("encrypt");
+        let misdirected = EventBuilder::new(Kind::from(KIND_RESPONSE), content)
+            .tags([Tag::public_key(client_pubkey), Tag::event(other_request)])
+            .sign_with_keys(&wallet.keys())
+            .expect("sign");
+        pool.publish_event_unfiltered(&misdirected).await;
+
+        let result = call.await.expect("task");
+        assert!(
+            matches!(result, Err(NwcError::Timeout { .. })),
+            "an answer for another request must not satisfy this one, got {result:?}"
+        );
+    }
+
     /// Needs the mock to answer out of order, which requires per-request
     /// spawning: an inline wallet is strictly FIFO and this can never fail.
     #[tokio::test]
@@ -1304,7 +1755,15 @@ mod tests {
             .pay_invoice("lnbc1", None)
             .await
             .expect_err("a closed client must refuse");
-        assert!(matches!(err, NwcError::Closed), "got {err:?}");
+        assert!(
+            matches!(
+                err,
+                NwcError::Closed {
+                    delivery: Delivery::NotSent,
+                }
+            ),
+            "got {err:?}"
+        );
         assert!(!err.may_have_reached_wallet());
         tokio::time::sleep(Duration::from_millis(150)).await;
         assert_eq!(

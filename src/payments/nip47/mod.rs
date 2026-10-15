@@ -21,7 +21,7 @@ pub mod uri;
 pub mod mock_wallet;
 
 pub use client::{NwcClient, NwcClientOptions, DEFAULT_RESPONSE_TIMEOUT};
-pub use error::NwcError;
+pub use error::{Delivery, NwcError};
 pub use types::{
     sats_to_msats, NwcErrorBody, NwcInvoiceResult, NwcNotificationPayload, NwcPayInvoiceResult,
     NwcResponseEnvelope, NOTIFICATION_PAYMENT_RECEIVED,
