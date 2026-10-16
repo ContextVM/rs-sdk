@@ -23,6 +23,9 @@ pub mod canonical;
 pub mod client_payments;
 pub mod constants;
 pub mod errors;
+#[cfg(feature = "nwc")]
+pub mod nip47;
+pub mod processors;
 pub mod server_explicit_gating;
 pub mod server_payments;
 pub(crate) mod server_payments_utils;
@@ -44,6 +47,8 @@ pub use client_payments::{
     PaymentPolicyFn, PaymentRequiredCallbackParams,
 };
 pub use errors::PaymentError;
+#[cfg(feature = "nwc")]
+pub use processors::{LnBolt11NwcPaymentProcessor, LnBolt11NwcPaymentProcessorOptions};
 pub use server_explicit_gating::{
     create_explicit_gating_middleware, ExplicitGatingMiddlewareParams,
 };

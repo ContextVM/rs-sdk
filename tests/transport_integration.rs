@@ -84,12 +84,23 @@ impl RelayPoolTrait for TestRelayPool {
             tokio::time::sleep(self.publish_delay).await;
         }
         self.publish_attempts.fetch_add(1, Ordering::SeqCst);
-        let should_fail = self
-            .failures_remaining
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                remaining.checked_sub(1)
-            })
-            .is_ok();
+        // Decrement while non-zero, reporting whether this call consumed one of
+        // the injected failures. `Atomic::fetch_update` would say this in one
+        // line but is deprecated from 1.99, and its replacement `try_update` is
+        // only stable from 1.95, above the declared MSRV of 1.88.
+        let should_fail = loop {
+            let remaining = self.failures_remaining.load(Ordering::SeqCst);
+            let Some(next) = remaining.checked_sub(1) else {
+                break false;
+            };
+            if self
+                .failures_remaining
+                .compare_exchange(remaining, next, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                break true;
+            }
+        };
 
         if should_fail {
             return Err(contextvm_sdk::Error::Transport(
