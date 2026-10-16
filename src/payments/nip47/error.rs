@@ -300,6 +300,34 @@ mod tests {
         assert!(!raw.is_empty());
     }
 
+    /// The previous version built its error from `"{ not json"`, whose serde
+    /// message contains no payload, so anything that leaked one still passed.
+    /// This one makes serde quote a real invoice and then checks it is gone.
+    #[test]
+    fn a_parse_failure_on_wallet_json_never_reproduces_the_invoice() {
+        let invoice = "lnbc210n1pjqqqqqpp5abcdefghijklmnopqrstuvwxyz0123456789";
+        let raw = format!(r#"{{"amount":"{invoice}"}}"#);
+
+        #[derive(Debug, serde::Deserialize)]
+        struct Body {
+            #[allow(dead_code)]
+            amount: u64,
+        }
+        let err = serde_json::from_str::<Body>(&raw).expect_err("a wrong type");
+        assert!(
+            err.to_string().contains("lnbc"),
+            "precondition: serde is expected to quote the value, got {err}"
+        );
+
+        let text = NwcError::from_serde("pay_invoice", &err).to_string();
+        assert!(!text.contains(invoice), "{text}");
+        assert!(!text.contains("lnbc"), "{text}");
+        assert!(
+            text.contains("pay_invoice") && text.contains("line"),
+            "{text}"
+        );
+    }
+
     #[test]
     fn config_and_amount_errors_do_not_reach_the_wallet() {
         assert!(!NwcError::InvalidAmount { reason: "x".into() }.may_have_reached_wallet());

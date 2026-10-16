@@ -958,16 +958,45 @@ mod tests {
         inner: Arc<MockRelayPool>,
         connect_delay: Duration,
         publish_delay: Duration,
+        post_publish_delay: Duration,
+        fail_publish: bool,
         subscribed: std::sync::Mutex<Vec<Vec<Filter>>>,
+        /// The spy owns the stream the client reads, so a test can overflow
+        /// it (to force `Lagged`) or close it (to force a reader exit).
+        relay_tx: std::sync::Mutex<Option<tokio::sync::broadcast::Sender<RelayPoolNotification>>>,
+        forwarder: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     }
 
     impl SpyPool {
         fn new(inner: Arc<MockRelayPool>, connect_delay: Duration) -> Self {
+            Self::with_capacity(inner, connect_delay, 1024)
+        }
+
+        fn with_capacity(
+            inner: Arc<MockRelayPool>,
+            connect_delay: Duration,
+            capacity: usize,
+        ) -> Self {
+            let (relay_tx, _) = tokio::sync::broadcast::channel(capacity);
+            // Re-broadcast the real pool's stream through our own channel.
+            let mut upstream = inner.notifications();
+            let tx = relay_tx.clone();
+            let forwarder = tokio::spawn(async move {
+                while let Ok(n) = upstream.recv().await {
+                    if tx.send(n).is_err() {
+                        break;
+                    }
+                }
+            });
             Self {
                 inner,
                 connect_delay,
                 publish_delay: Duration::ZERO,
+                post_publish_delay: Duration::ZERO,
+                fail_publish: false,
                 subscribed: std::sync::Mutex::new(Vec::new()),
+                relay_tx: std::sync::Mutex::new(Some(relay_tx)),
+                forwarder: std::sync::Mutex::new(Some(forwarder)),
             }
         }
 
@@ -976,8 +1005,47 @@ mod tests {
             self
         }
 
+        /// Hold the caller inside `publish_event` *after* the event is on the
+        /// wire, so the answer provably lands before `publish` returns.
+        fn with_post_publish_delay(mut self, delay: Duration) -> Self {
+            self.post_publish_delay = delay;
+            self
+        }
+
+        fn with_failing_publish(mut self) -> Self {
+            self.fail_publish = true;
+            self
+        }
+
         fn subscriptions(&self) -> Vec<Vec<Filter>> {
             self.subscribed.lock().expect("not poisoned").clone()
+        }
+
+        /// Overflow the client's receiver. Called synchronously on a
+        /// current-thread runtime, the reader cannot drain in between, so it
+        /// is guaranteed to observe `Lagged`.
+        fn flood(&self, events: usize, filler: &Event) {
+            let guard = self.relay_tx.lock().expect("not poisoned");
+            let Some(tx) = guard.as_ref() else { return };
+            for _ in 0..events {
+                let _ = tx.send(RelayPoolNotification::Event {
+                    relay_url: RelayUrl::parse("wss://mock.relay").expect("url"),
+                    subscription_id: SubscriptionId::new("spy"),
+                    event: Box::new(filler.clone()),
+                });
+            }
+        }
+
+        /// Close the stream the reader is sitting on, as a dropped pool does.
+        ///
+        /// Both senders have to go: aborting the forwarder alone leaves our
+        /// own clone alive, and the receiver then simply waits forever rather
+        /// than seeing the channel close.
+        fn kill_stream(&self) {
+            if let Some(handle) = self.forwarder.lock().expect("not poisoned").take() {
+                handle.abort();
+            }
+            drop(self.relay_tx.lock().expect("not poisoned").take());
         }
     }
 
@@ -996,7 +1064,14 @@ mod tests {
             if !self.publish_delay.is_zero() {
                 tokio::time::sleep(self.publish_delay).await;
             }
-            self.inner.publish_event(event).await
+            if self.fail_publish {
+                return Err(crate::Error::Transport("injected publish failure".into()));
+            }
+            let id = self.inner.publish_event(event).await;
+            if !self.post_publish_delay.is_zero() {
+                tokio::time::sleep(self.post_publish_delay).await;
+            }
+            id
         }
         async fn publish(&self, builder: EventBuilder) -> crate::Result<EventId> {
             self.inner.publish(builder).await
@@ -1008,7 +1083,12 @@ mod tests {
             self.inner.signer().await
         }
         fn notifications(&self) -> tokio::sync::broadcast::Receiver<RelayPoolNotification> {
-            self.inner.notifications()
+            self.relay_tx
+                .lock()
+                .expect("not poisoned")
+                .as_ref()
+                .expect("stream not killed")
+                .subscribe()
         }
         async fn public_key(&self) -> crate::Result<PublicKey> {
             self.inner.public_key().await
@@ -1312,6 +1392,227 @@ mod tests {
             wallet.calls().await.is_empty(),
             "the wallet must not have been asked to pay: {:?}",
             wallet.calls().await
+        );
+    }
+
+    // GUARDS_ON_THE_MONEY_PATH
+
+    /// A lagging broadcast must not kill the reader. If it breaks the loop,
+    /// the exit path marks the client closed and every later request fails,
+    /// while requests already in flight can still have paid.
+    #[tokio::test]
+    async fn a_lagging_broadcast_does_not_kill_the_reader() {
+        let (wallet, client, spy) = spy_harness_with(Duration::from_secs(5), |pool| {
+            SpyPool::with_capacity(pool, Duration::ZERO, 4)
+        })
+        .await;
+        wallet
+            .set_behavior(
+                "make_invoice",
+                WalletBehavior::Answer(invoice_result("lnbc210n1p")),
+            )
+            .await;
+
+        client.make_invoice(1000, None, None).await.expect("first");
+
+        // Synchronous on a current-thread runtime: the reader cannot drain
+        // between sends, so it is certain to observe `Lagged`.
+        let filler = untagged_from(&wallet, KIND_RESPONSE);
+        spy.flood(32, &filler);
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert!(!client.is_closed(), "lagging must not close the client");
+        client
+            .make_invoice(1000, None, None)
+            .await
+            .expect("the reader must still be alive after lagging");
+    }
+
+    /// The waiter is registered before the publish so an instant answer
+    /// cannot arrive before anything is listening. Holding the caller inside
+    /// `publish_event` after the event is on the wire makes that window
+    /// deterministic rather than a race the test usually wins.
+    #[tokio::test]
+    async fn an_answer_arriving_during_the_publish_is_not_lost() {
+        let (wallet, client, _spy) = spy_harness_with(Duration::from_millis(900), |pool| {
+            SpyPool::new(pool, Duration::ZERO).with_post_publish_delay(Duration::from_millis(300))
+        })
+        .await;
+        wallet
+            .set_behavior(
+                "make_invoice",
+                WalletBehavior::Answer(invoice_result("lnbc210n1p")),
+            )
+            .await;
+
+        client
+            .make_invoice(1000, None, None)
+            .await
+            .expect("an answer landing during the publish must still correlate");
+    }
+
+    /// The guard removes the waiter on every exit, not only the happy one.
+    /// A leak is invisible from outside and accumulates one `EventId` and one
+    /// `oneshot::Sender` per cancelled verification.
+    #[tokio::test]
+    async fn the_waiter_is_removed_when_the_request_times_out() {
+        let (wallet, client, _spy) = spy_harness(Duration::from_millis(150), Duration::ZERO).await;
+        wallet
+            .set_behavior("make_invoice", WalletBehavior::Silence)
+            .await;
+
+        let _ = client.make_invoice(1000, None, None).await;
+        assert_eq!(client.waiter_count(), 0, "timeout path leaked a waiter");
+    }
+
+    #[tokio::test]
+    async fn the_waiter_is_removed_when_the_publish_fails() {
+        let (wallet, client, _spy) = spy_harness_with(Duration::from_secs(5), |pool| {
+            SpyPool::new(pool, Duration::ZERO).with_failing_publish()
+        })
+        .await;
+        wallet
+            .set_behavior("make_invoice", WalletBehavior::Silence)
+            .await;
+
+        let err = client
+            .make_invoice(1000, None, None)
+            .await
+            .expect_err("the publish fails");
+        assert!(matches!(err, NwcError::Publish { .. }), "{err:?}");
+        assert_eq!(
+            client.waiter_count(),
+            0,
+            "publish-failure path leaked a waiter"
+        );
+    }
+
+    /// The waiter is also dropped when the `request()` future is cancelled,
+    /// which is what the payment processor's `select!` does on every
+    /// cancelled verification.
+    #[tokio::test]
+    async fn the_waiter_is_removed_when_the_caller_is_cancelled() {
+        let (wallet, client, _spy) = spy_harness(Duration::from_secs(30), Duration::ZERO).await;
+        wallet
+            .set_behavior("make_invoice", WalletBehavior::Silence)
+            .await;
+
+        tokio::time::timeout(
+            Duration::from_millis(200),
+            client.make_invoice(1000, None, None),
+        )
+        .await
+        .expect_err("the caller gives up first");
+
+        assert_eq!(client.waiter_count(), 0, "a dropped future leaked a waiter");
+    }
+
+    /// When the reader exits it releases everyone waiting, rather than
+    /// leaving them to sit out a deadline that can be minutes long.
+    #[tokio::test]
+    async fn a_reader_exit_releases_the_waiting_caller() {
+        let (wallet, client, spy) = spy_harness(Duration::from_secs(30), Duration::ZERO).await;
+        wallet
+            .set_behavior("make_invoice", WalletBehavior::Silence)
+            .await;
+
+        let client = Arc::new(client);
+        let caller = Arc::clone(&client);
+        let started = tokio::time::Instant::now();
+        let call = tokio::spawn(async move { caller.make_invoice(1000, None, None).await });
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        spy.kill_stream();
+
+        let result = call.await.expect("task joins");
+        assert!(
+            matches!(result, Err(NwcError::Closed { .. })),
+            "expected Closed, got {result:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the caller sat out the deadline instead of being released: {:?}",
+            started.elapsed()
+        );
+        assert!(client.is_closed(), "a dead reader must close the client");
+    }
+
+    /// (15). Without `since`, a relay that retains ephemeral events replays
+    /// this client's whole history on every start and reconnect, and the
+    /// replayed notifications reach the sinks.
+    #[tokio::test]
+    async fn a_stale_notification_is_not_replayed_at_subscribe() {
+        let (wallet, client, _spy) = spy_harness(Duration::from_secs(5), Duration::ZERO).await;
+        let client_pubkey = client.client_pubkey();
+
+        let stale = Timestamp::now() - (SUBSCRIPTION_LOOKBACK + Duration::from_secs(600));
+        let payload = serde_json::json!({
+            "notification_type": NOTIFICATION_PAYMENT_RECEIVED,
+            "notification": { "invoice": "lnbc-old", "amount": 1000 }
+        })
+        .to_string();
+        let content =
+            nip04::encrypt(wallet.keys().secret_key(), &client_pubkey, payload).expect("encrypt");
+        let old_event = EventBuilder::new(Kind::from(KIND_NOTIFICATION_LEGACY), content)
+            .tags([Tag::public_key(client_pubkey)])
+            .custom_created_at(stale)
+            .sign_with_keys(&wallet.keys())
+            .expect("sign");
+
+        // Stored before the client ever subscribes, so only the filter decides
+        // whether it is replayed.
+        wallet.pool().inject_event(old_event.clone()).await;
+
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&seen);
+        client
+            .on_notification(move |_| {
+                counter.fetch_add(1, Ordering::SeqCst);
+            })
+            .await
+            .expect("sink registers");
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            0,
+            "a stale notification must not be replayed"
+        );
+    }
+
+    /// (18). The NIP-40 expiration is what stops a wallet acting on a
+    /// `pay_invoice` the caller has already given up on.
+    #[tokio::test]
+    async fn pay_invoice_carries_the_nip40_expiration_when_asked() {
+        let (wallet, client, _spy) = spy_harness(Duration::from_millis(250), Duration::ZERO).await;
+        wallet
+            .set_behavior("pay_invoice", WalletBehavior::Silence)
+            .await;
+
+        let _ = client
+            .pay_invoice("lnbc210n1p", Some(Duration::from_secs(60)))
+            .await;
+
+        let request = wallet
+            .pool()
+            .stored_events()
+            .await
+            .into_iter()
+            .find(|e| e.kind.as_u16() == KIND_REQUEST)
+            .expect("the request was published");
+        let expiration = request
+            .tags
+            .iter()
+            .find_map(|t| match t.as_slice() {
+                [name, value, ..] if name == "expiration" => value.parse::<u64>().ok(),
+                _ => None,
+            })
+            .expect("a NIP-40 expiration tag");
+        let now = Timestamp::now().as_secs();
+        assert!(
+            expiration > now && expiration <= now + 61,
+            "expiration {expiration} is not about 60s out from {now}"
         );
     }
 

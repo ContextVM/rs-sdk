@@ -121,6 +121,12 @@ impl MockWallet {
         self.keys.public_key()
     }
 
+    /// The relay pool this wallet publishes through, so a test can inspect
+    /// what reached the wire or seed the relay with a retained event.
+    pub fn pool(&self) -> &Arc<MockRelayPool> {
+        &self.pool
+    }
+
     /// The wallet's signing keys, so a test can forge an event that is
     /// genuinely wallet-signed.
     pub fn keys(&self) -> Keys {
