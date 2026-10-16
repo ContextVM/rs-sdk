@@ -154,6 +154,25 @@ impl MockRelayPool {
     pub async fn inject_event(&self, event: Event) {
         self.inner.lock().await.events.push(event);
     }
+
+    /// Deliver `event` to every subscriber **regardless of their filters**.
+    ///
+    /// Models a non-conformant relay: `nostr-relay-pool` verifies event
+    /// signatures but not that a delivered event actually matches the
+    /// subscription (`verify_subscriptions` is `false` by default), so a relay
+    /// that ignores `authors` or `#p` can hand a client something it never
+    /// asked for. Client-side guards that re-check authorship exist for
+    /// exactly that case, and a mock that always filters correctly can never
+    /// exercise them.
+    ///
+    /// Use this only to test such a guard; `publish_event` is the realistic path.
+    pub async fn publish_event_unfiltered(&self, event: &Event) {
+        let mut inner = self.inner.lock().await;
+        inner.events.push(event.clone());
+        for subscriber in inner.subscribers.values() {
+            let _ = subscriber.tx.send(make_notification(event.clone()));
+        }
+    }
 }
 
 impl Default for MockRelayPool {

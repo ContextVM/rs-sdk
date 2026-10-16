@@ -6,12 +6,16 @@ individual capabilities, and a client can pay for them either transparently
 explicit gating (the request is refused with a payment error until paid).
 This guide covers both sides of the wire as this SDK ships them.
 
-CEP-8 support ships in two phases. What ships today is Phase A: the full
-protocol machinery on both sides, with deterministic fakes
-(`FakePaymentProcessor` and `FakePaymentHandler`, behind the `test-utils`
-feature) standing in for real payment rails. Phase B is the rails themselves
-(Lightning over NWC/NIP-47, LNURL, LNbits), which plug into the same
+CEP-8 support ships in two phases. Phase A is the full protocol machinery on
+both sides, with deterministic fakes (`FakePaymentProcessor` and
+`FakePaymentHandler`, behind the `test-utils` feature) for testing without a
+wallet. Phase B is the real payment rails, which plug into the same
 `PaymentProcessor` / `PaymentHandler` traits without API changes.
+
+The first Phase B rail, Lightning BOLT11 over NWC (NIP-47), ships behind the
+off-by-default `nwc` feature and is documented under
+[The NWC rail](#the-nwc-rail-nip-47) below. NIP-57 zaps are still to come.
+LNbits, listed as a planned rail in earlier drafts, has been dropped.
 
 The protocol reference is the CEP-8 specification in the ContextVM
 documentation repository.
@@ -343,11 +347,131 @@ The `-32042` / `-32043` / `-32602` codes, the three notification methods,
 and the wire field orders are pinned by the conformance suite against the
 reference implementation.
 
-## Phase B: payment rails
+## The NWC rail (NIP-47)
 
-The `PaymentProcessor` (server: create and verify a payment request) and
-`PaymentHandler` (client: settle one) traits are the extension surface.
-Planned rails include Lightning BOLT11 via NWC (NIP-47), LNURL (NIP-57
-zaps), and LNbits REST; all are deliberately deferred, and the options
-structs are non-exhaustive so rails can add configuration without breaking
-changes.
+Lightning BOLT11 over Nostr Wallet Connect, for PMI
+`bitcoin-lightning-bolt11`. Enable the `nwc` feature, which is off by default
+and adds no new crate to the dependency tree (it only switches on an existing
+`nostr-sdk` NIP):
+
+```toml
+contextvm-sdk = { version = "0.2", features = ["nwc"] }
+```
+
+Two halves, each usable on its own. On the server,
+`LnBolt11NwcPaymentProcessor` mints an invoice with `make_invoice` and waits
+for settlement. On the client, `LnBolt11NwcPaymentHandler` pays one with
+`pay_invoice`.
+
+```rust,ignore
+use contextvm_sdk::payments::{
+    LnBolt11NwcPaymentProcessor, LnBolt11NwcPaymentProcessorOptions,
+    ServerPaymentsOptions, with_server_payments,
+};
+
+let processor = Arc::new(LnBolt11NwcPaymentProcessor::from_uri(
+    relay_pool.clone(),
+    "nostr+walletconnect://<wallet_pubkey>?relay=wss://relay.example&secret=<hex>",
+    LnBolt11NwcPaymentProcessorOptions::new()
+        .with_ttl(Duration::from_secs(300))
+        .with_poll_interval(Duration::from_millis(1500)),
+)?);
+
+with_server_payments(
+    &mut server_transport,
+    ServerPaymentsOptions::new(vec![processor], vec![priced_capability]),
+)?;
+```
+
+The connection string is accepted in both shapes wallets emit, including the
+`nostr+walletconnect:<pubkey>?...` form (pubkey in the path) that
+`NostrWalletConnectURI::parse` rejects.
+
+### Options
+
+| Processor option | Default | Meaning |
+| --- | --- | --- |
+| `ttl` | 300 s | TTL advertised on `payment_required` |
+| `invoice_expiry` | `ttl` | `make_invoice.expiry` |
+| `poll_interval` | 1500 ms | floor under the `lookup_invoice` backoff |
+| `response_timeout` | 60 s | per-request wallet response timeout |
+| `notification_verification` | auto | `Some(false)` always polls, `Some(true)` always listens, `None` detects once from the wallet's info event |
+| `max_in_flight_verifications` | 5000 | cap on deduplicated verifications |
+| `invoice_hash_cache_size` | 10000 | cap on cached invoice to payment-hash mappings |
+
+| Handler option | Default | Meaning |
+| --- | --- | --- |
+| `response_timeout` | 60 s | per-payment wallet response timeout |
+
+Both option structs are `#[non_exhaustive]`, so construct them with `new()`
+and the `with_*` builders rather than a struct literal.
+
+### Which lifecycle invokes the handler
+
+In the transparent lifecycle the client engine calls the handler
+automatically when `payment_required` arrives, gated by `payment_policy`.
+
+In explicit gating it does not: the engine routes `-32042` to the
+`on_payment_required` callback, and the handler is the transparent
+lifecycle's hook. To use this rail for gating, call the handler from inside
+that callback with the offered `PaymentOption`, then report
+`PaymentApproval { paid: true, .. }` so the engine retries. See
+`tests/payments_nwc_e2e.rs` for a worked example.
+
+### Operational notes
+
+**A late settlement is money out with no execution.** `verify_payment` stops
+when the middleware's payment TTL expires, but the invoice stays payable on
+the Lightning network until its own expiry. A payer who settles after the TTL
+has paid for a capability that will not run. Keep `invoice_expiry` at or
+below `ttl` so the rail's own invoice expires with the window, and treat
+reconciliation of late settlements as an operator concern: this SDK does not
+refund.
+
+**The wallet is a trust boundary.** The processor believes the wallet about
+settlement. A compromised or buggy wallet reporting `state: "settled"` causes
+the server to execute a paid capability for free. Point the processor at a
+wallet you control, not one a counterparty supplies.
+
+**Rate limiting is still upstream's job.** Every successful offer spawns one
+detached verification task, and with a real rail each holds a wallet
+connection and polls it. `max_pending_payments` and the authorization store
+caps bound state, not tasks.
+
+**Settlement is read generously, failure strictly.** An invoice counts as
+settled on `state == "settled"` *or* a positive `settled_at`, because wallets
+populate one or the other. `NOT_FOUND` is treated as still pending, since a
+lagging wallet that has not yet seen its own invoice has not refused it; every
+other wallet error code is fatal, as are `expired` and `failed`.
+
+**Nothing logs the invoice.** A BOLT11 string is a bearer payment request, so
+no tracing call in the rail binds `pay_req`, the invoice, or a preimage. Logs
+carry the request event id, the state, and booleans for field presence.
+
+### Testing against a real wallet
+
+CI gates on relay-level mocks, not a live wallet: `MockWallet` (behind
+`test-utils`) speaks the real NIP-47 wire protocol over a `MockRelayPool`, so
+the client's own encrypt, publish, correlate and decrypt paths run in CI.
+
+`tests/payments_nwc_real_wallet.rs` exercises a real wallet and is
+`#[ignore]`d and environment-gated. It needs two distinct wallets, because
+one side issues and the other pays:
+
+```sh
+export CONTEXTVM_NWC_SERVER_URI='nostr+walletconnect://...'
+export CONTEXTVM_NWC_CLIENT_URI='nostr+walletconnect://...'
+cargo test --features nwc,test-utils --test payments_nwc_real_wallet -- --ignored --nocapture
+```
+
+It moves real money. The amount is 1 sat unless `CONTEXTVM_NWC_AMOUNT_SATS`
+says otherwise, and nothing it does is reversible.
+
+## Other rails
+
+The `PaymentProcessor` and `PaymentHandler` traits are the extension surface,
+and the options structs are non-exhaustive so a rail can add configuration
+without a breaking change. NIP-57 zaps are the next rail planned, server side
+only: NIP-57 obliges the payer only to pay a BOLT11 invoice, and both rails
+issue `pmi: bitcoin-lightning-bolt11`, so a zap offer already routes to the
+NWC handler on the client.
