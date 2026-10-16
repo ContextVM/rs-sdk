@@ -23,6 +23,8 @@ pub mod canonical;
 pub mod client_payments;
 pub mod constants;
 pub mod errors;
+#[cfg(feature = "nwc")]
+pub mod nip47;
 pub mod server_explicit_gating;
 pub mod server_payments;
 pub(crate) mod server_payments_utils;
